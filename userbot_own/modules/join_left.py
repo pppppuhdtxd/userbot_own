@@ -160,7 +160,7 @@ from telethon.tl.types import (
     Chat,
     ChatInviteAlready,
     DialogFilter,
-    FolderPeer,
+    InputFolderPeer,
     InputNotifyPeer,
     InputPeerNotifySettings,
     InputPeerSelf,
@@ -359,7 +359,7 @@ async def _create_joined_folder(
         bots             = False,
         exclude_muted    = False,
         exclude_read     = False,
-        exclude_archived = False,
+        exclude_archived = True,
     )
 
     await client(UpdateDialogFilterRequest(id=new_id, filter=new_folder))
@@ -415,6 +415,14 @@ async def _add_single_peer_to_joined_folder(
                 return True  # already there
 
             folder.include_peers = list(folder.include_peers or []) + [ip]
+            # Fix: ensure existing joined folders also have exclude_archived=True
+            # so that UpdateDialogFilterRequest does not silently un-archive the chat.
+            if not folder.exclude_archived:
+                folder.exclude_archived = True
+                log.debug(
+                    "[Account%d] Patched '%s' folder to exclude_archived=True.",
+                    account_index, _JOINED_FOLDER_NAME,
+                )
             await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
             _invalidate_folder_cache(client, cache)
             log.debug(
@@ -724,7 +732,7 @@ async def _archive_chat(client: TelegramClient, entity, account_index: int) -> b
     try:
         input_peer = await client.get_input_entity(entity)
         await client(EditPeerFoldersRequest(
-            folder_peers=[FolderPeer(peer=input_peer, folder_id=1)],
+            folder_peers=[InputFolderPeer(peer=input_peer, folder_id=1)],
         ))
         log.debug(
             "[Account%d] Archived chat id=%s.",
@@ -737,7 +745,7 @@ async def _archive_chat(client: TelegramClient, entity, account_index: int) -> b
         try:
             input_peer = await client.get_input_entity(entity)
             await client(EditPeerFoldersRequest(
-                folder_peers=[FolderPeer(peer=input_peer, folder_id=1)],
+                folder_peers=[InputFolderPeer(peer=input_peer, folder_id=1)],
             ))
             return True
         except Exception:
@@ -1095,22 +1103,30 @@ class JoinLeft(Module):
         account_index: int,
     ) -> tuple[bool, bool, bool]:
         """
-        Req 3 + Req 4: Immediately after a successful join:
+        Req 3 + Req 4: Immediately after a successful join, in this exact order:
         1. Mute the chat
-        2. Archive the chat
-        3. Add to 'joined' folder (incremental)
-        4. Add to excluded_chats of all OTHER folders
+        2. Add to 'joined' folder (incremental, with exclude_archived=True patch)
+        3. Add to excluded_chats of all OTHER folders
+        4. Archive the chat (LAST — prevents folder operations from un-archiving)
+
+        Archive is deliberately last: UpdateDialogFilterRequest with
+        exclude_archived=False would silently move the chat back to folder_id=0.
+        By archiving after all folder operations are complete, no subsequent
+        Telegram-side side-effect can undo it.
 
         Returns (muted, archived, folder_added).
         """
-        muted, archived = await _mute_and_archive(client, entity, account_index)
-        folder_added    = await _add_single_peer_to_joined_folder(
+        # Step 1: mute
+        muted        = await _mute_chat(client, entity, account_index)
+        # Step 2: add to joined folder (patching exclude_archived=True if needed)
+        folder_added = await _add_single_peer_to_joined_folder(
             client, entity, account_index, self._folder_cache
         )
-        # Req 4 (v3.0.4): await exclusion synchronously for crash-safety.
-        # All 4 post-join actions are strictly sequential per chat so that
-        # a crash mid-run never leaves a chat partially processed.
+        # Step 3: exclusion — all 4 actions are strictly sequential per chat so
+        # that a crash mid-run never leaves a chat partially processed.
         await _add_to_all_other_folders_exclusion(client, entity, account_index, self._folder_cache)
+        # Step 4: archive last — no further folder operations follow that could undo this
+        archived     = await _archive_chat(client, entity, account_index)
         return muted, archived, folder_added
 
     # ── Dispatcher ────────────────────────────────────────────────────────────

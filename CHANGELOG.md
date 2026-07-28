@@ -5,6 +5,254 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.0.6] — 2026-07-28
+
+### Fix — Message Clearing Bugs (6 Issues Across `clearer.py` and `utils.py`)
+
+---
+
+#### Issue 1 — Primary Bug: No Chat-Type-Aware Sender Filtering in Groups/Channels
+
+**Root cause:** `_run_clear()` called `client.iter_messages(chat_id, limit=N)`
+without any `from_user` filter, fetching ALL messages from ALL members in groups
+and channels. For scopes `"all"` and `"self"`, this meant thousands of other
+members' messages were downloaded only to be silently skipped by Telegram during
+deletion (Telegram ignores delete requests for messages the caller doesn't own),
+while the bot falsely reported them as successfully deleted (Issue 6 below).
+
+**Technical detail:** Telethon's `iter_messages` supports a `from_user` parameter
+that maps to `from_id` in `messages.SearchRequest`. For groups, supergroups, and
+broadcast channels (non-PeerUser entities), Telegram filters server-side and only
+returns the specified user's messages. For private chats (PeerUser), Telegram
+ignores `from_id` and Telethon falls back to local filtering — but for private
+chats we intentionally want both sides of the conversation anyway.
+
+**Fix:** At the start of `_run_clear()`, `event.is_private` is checked:
+- `is_private = True` (PeerUser: person, bot, Saved Messages) → fetch all messages,
+  no `from_user`. Both sides of the conversation are processed as intended.
+- `is_private = False` (group, supergroup, channel) with scope `"all"` or `"self"`
+  → `from_user='me'` is added to `iter_messages`. Telegram does the filtering
+  server-side; only the user's own messages are returned. Efficient and correct.
+- scope `"bot"` → never uses `from_user='me'` (we want bot messages, not our own).
+
+---
+
+#### Issue 2 — Duplicate `_me_id` Machinery Not Migrated to `base._get_me_id`
+
+**Root cause:** `Clearer` maintained its own `self._me_id: int | None`,
+`self._me_id_task`, and `_cache_me_id()` coroutine (a 2-second delayed startup
+task to call `client.get_me()`). `base.Module` already provides `_get_me_id(client)`
+with a `WeakKeyDictionary` cache (`_me_cache`), shared across all modules and
+populated on first access. The `base.py` module-level docstring explicitly notes
+this consolidation; `Clearer` was the only module that had not been migrated.
+
+**Consequences:**
+1. A 2-second window at startup where `_me_id is None`, causing `clear self` to
+   silently skip all messages if run immediately after the bot started.
+2. A dangling `asyncio.Task` that had to be cancelled in `teardown()`.
+3. Duplicated logic that could drift out of sync with `base._get_me_id`.
+
+**Fix:** Removed `self._me_id`, `self._me_id_task`, `_cache_me_id()`, and the
+teardown cancellation block. `_matches_scope()` (now `_matches_scope(client, ...)`)
+calls `await self._get_me_id(client)` for scope `"self"`. `_matches_scope` is now
+`async` and receives `client` as a parameter; the call site in `_run_clear` awaits
+it accordingly. Note: with Issue 1's `from_user='me'` fix, the `"self"` scope check
+in `_matches_scope` is only needed for private chats (where server-side filtering is
+unavailable), so the `_get_me_id` call is infrequent in practice.
+
+---
+
+#### Issue 3 — `_bot_peer_cache` Missing: Hidden `get_entity()` Per Message
+
+**Root cause:** `_matches_scope` for scope `"bot"` accessed `msg.sender`, a lazy
+Telethon property. In groups/channels where full sender objects are not embedded in
+the message, accessing `msg.sender` triggers a `get_entity()` API call. With 2000
+messages in the scan loop and multiple bot senders, this produced dozens of hidden
+`GetUsersRequest` calls — a significant FloodWait risk at scale.
+
+**Fix:** Introduced `self._bot_peer_cache: dict[int, bool]` keyed on `sender_id`.
+The new `_is_bot_sender(client, msg)` helper checks the cache first; only the first
+message from a unique `sender_id` may trigger a `get_entity()` call. Subsequent
+messages from the same sender are resolved from the cache in O(1) with no API call.
+The cache is cleared in `teardown()` to prevent stale entries across hot-reloads.
+
+`_matches_scope` is now `async` and receives `client` to support the above.
+
+---
+
+#### Issue 4 — Fallback Message Not Auto-Deleted
+
+**Root cause:** When `status_msg.edit(result_text)` raised an exception (e.g. the
+status message was deleted by a third party), the code fell back to
+`client.send_message(chat_id, result_text)` — but then passed the **old**
+`status_msg` to `_track_delete_task()`. The fallback message was never scheduled
+for auto-deletion and lingered in the chat indefinitely.
+
+**Fix:** Introduced `report_msg = status_msg` before the try/except block. If
+`client.send_message()` succeeds in the fallback branch, `report_msg` is updated
+to the newly sent message. `_track_delete_task(report_msg, 6.0)` then correctly
+targets whichever message is actually visible.
+
+---
+
+#### Issue 5 — No `wait_time` on `iter_messages` (FloodWait Risk)
+
+**Root cause:** `client.iter_messages(chat_id, limit=2000)` was called without
+`wait_time`. Telethon's `_MessagesIter` only inserts an automatic 1-second pause
+when `limit > 3000`. At the default `history_limit = 2000`, requests were sent
+as fast as the network allowed, risking `FloodWait` from `GetHistoryRequest` on
+large or recently-active chats.
+
+**Fix:** Added `wait_time=1` to the `iter_messages` call. This inserts a 1-second
+pause every 100 messages, staying well within Telegram's rate limits for history
+fetching. The `wait_time` value matches what Telethon applies automatically at
+higher limits.
+
+---
+
+#### Issue 6 — `batch_delete` Overcounted Deletions (in `utils.py`)
+
+**Root cause:** `batch_delete` used `deleted += len(batch)` after a successful
+`client.delete_messages()` call. `delete_messages` returns a list of
+`messages.AffectedMessages` objects (one per 100-message internal chunk), each
+with a `pts_count` field indicating the number of messages Telegram actually
+deleted server-side. When the caller lacks permission to delete some messages in
+a group (e.g. other members' messages without admin rights), Telegram silently
+skips those IDs and returns a lower `pts_count`. The old code counted all IDs in
+the batch as deleted regardless, inflating the report.
+
+**Fix (`utils.py`):**
+- Added `from telethon.tl.types import messages as tl_msg_types` import.
+- Added `_pts_count(results) -> int` helper: sums `r.pts_count` over the list of
+  `tl_msg_types.AffectedMessages` returned by `delete_messages`. Falls back to
+  logging unexpected result types rather than crashing.
+- `batch_delete` now captures the return value of every `delete_messages` call
+  (including the FloodWait retry) and uses `_pts_count(results)` instead of
+  `len(batch)`. The one-by-one fallback path was already using `safe_delete`
+  which returns a bool per message, so it is correct and unchanged.
+
+---
+
+#### Files Changed
+
+- `userbot_own/modules/clearer.py` — Issues 1–5
+- `userbot_own/helpers/utils.py` — Issue 6 (`_pts_count` helper + `batch_delete` rewrite)
+- `userbot_own/__init__.py` — fallback version bumped to `3.0.6`
+- `VERSION` — bumped to `3.0.6`
+- `CHANGELOG.md` — this entry
+
+---
+
+## [3.0.5] — 2026-07-28
+
+### Fix — Archive-After-Join Never Working (5 Root Causes)
+
+This release resolves a silent, multi-layered bug that caused every post-join
+archive operation to silently fail. Chats were muted and added to the `joined`
+folder correctly, but remained visible in the main chat list indefinitely.
+
+---
+
+#### Issue 1 — Wrong TL Type: `FolderPeer` Instead of `InputFolderPeer`
+
+**Root cause:** `_archive_chat()` called `EditPeerFoldersRequest` with
+`FolderPeer(peer=input_peer, folder_id=1)`. `FolderPeer` (constructor
+`0xe9baa668`) is a **server→client** response type returned inside `Dialog`
+objects to describe which folder a chat belongs to. It is not a valid input
+type for a TL request.
+
+`EditPeerFoldersRequest` expects `InputFolderPeer` (constructor `0xfbd2c296`),
+which is the **client→server** input type. Telegram silently discards requests
+containing the wrong type — no exception is raised, no error is logged, and
+the chat is never archived.
+
+**Fix:** Replaced `FolderPeer` with `InputFolderPeer` at both call sites in
+`_archive_chat()` (primary call and FloodWait retry). Also replaced the
+`FolderPeer` import with `InputFolderPeer` in the module-level import block.
+
+---
+
+#### Issue 2 — `_create_joined_folder()` Sets `exclude_archived = False`
+
+**Root cause:** The `joined` folder was created with `exclude_archived=False`.
+This flag instructs Telegram: "do not show archived chats in this folder."
+As a side effect, whenever `UpdateDialogFilterRequest` is sent for a folder
+with `exclude_archived=False`, Telegram moves any newly-added peer to
+`folder_id=0` (un-archives it) to ensure it remains visible in the folder.
+
+This means even a correctly-formed `EditPeerFoldersRequest` (Issue 1 fixed)
+would have been immediately undone the moment the peer was added to the
+`joined` folder.
+
+**Fix:** Changed `exclude_archived=False` → `exclude_archived=True` in
+`_create_joined_folder()`. This tells Telegram "show archived chats in this
+folder," which is the intended behaviour and removes the un-archive side effect.
+
+---
+
+#### Issue 3 — Existing `joined` Folders Not Patched for `exclude_archived`
+
+**Root cause:** `_add_single_peer_to_joined_folder()` mutates and re-submits
+existing folder objects as-is without checking `exclude_archived`. Any
+`joined` folder created in a previous session (with `exclude_archived=False`)
+would silently un-archive chats on every subsequent peer addition, even after
+Issue 2 was fixed for newly-created folders.
+
+**Fix:** Added a check before `UpdateDialogFilterRequest`: if
+`folder.exclude_archived` is `False`, it is patched to `True` and logged
+before the request is sent. This ensures all existing folders are
+self-healing on their next update.
+
+---
+
+#### Issue 4 — Order of Operations: Archive Was Not Last
+
+**Root cause:** `_post_join_actions()` executed in this order:
+1. mute + archive (`_mute_and_archive`)
+2. add to `joined` folder (`_add_single_peer_to_joined_folder`)
+3. add to exclusion lists of other folders (`_add_to_all_other_folders_exclusion`)
+
+Step 2 (`UpdateDialogFilterRequest`) was called *after* the archive. Even
+with Issues 1–3 fixed, the `UpdateDialogFilterRequest` in step 2 would
+silently un-archive the chat if called after `EditPeerFoldersRequest`,
+because Telegram's server-side folder management treats explicit folder
+membership as overriding archive state.
+
+Archive must always be the **final** post-join operation so no subsequent
+Telegram API call can undo it.
+
+**Fix:** Decoupled `_mute_chat()` and `_archive_chat()` (see Issue 5), then
+reordered `_post_join_actions()` to:
+1. `_mute_chat()` — mute
+2. `_add_single_peer_to_joined_folder()` — folder-add (with exclude_archived patch)
+3. `_add_to_all_other_folders_exclusion()` — exclusion
+4. `_archive_chat()` — **archive last**
+
+---
+
+#### Issue 5 — `_mute_and_archive()` Coupled Mute and Archive
+
+**Root cause:** A single helper `_mute_and_archive()` called both `_mute_chat()`
+and `_archive_chat()` sequentially and returned a combined tuple. This coupling
+made it impossible to reorder archive to the final step (Issue 4) without
+refactoring.
+
+**Fix:** `_post_join_actions()` now calls `_mute_chat()` and `_archive_chat()`
+directly as separate sequential awaits. The `_mute_and_archive()` helper
+remains in the codebase (it is still called from other paths) but is no longer
+used by `_post_join_actions()`.
+
+---
+
+#### Files Changed
+
+- `userbot_own/modules/join_left.py` — all 5 fixes above
+- `userbot_own/__init__.py` — fallback version bumped to `3.0.5`
+- `VERSION` — bumped to `3.0.5`
+- `CHANGELOG.md` — this entry
+
+---
+
 ## [3.0.4] — 2026-07-28
 
 ### Task 1 — Remove Custom Restart Logic; Add SIGTERM Support

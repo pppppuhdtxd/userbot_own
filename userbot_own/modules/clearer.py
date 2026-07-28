@@ -20,13 +20,31 @@ Strict argument validation:
 - Any argument outside VALID_ARGS causes the command to be silently ignored.
 - This prevents false positives like `clear fvjnfvo` from triggering cleanup.
 
+Chat-type-aware sender filtering (v3.0.6):
+- In groups, supergroups and channels `iter_messages` is called with
+  `from_user='me'` for scope=="all" and scope=="self", so only the user's
+  own messages are fetched server-side. This is dramatically more efficient
+  (no wasted bandwidth) and also correct — other members' messages are never
+  collected, so the deletion count in the report is exact.
+- In private chats (PeerUser) and Saved Messages `from_user` is omitted;
+  Telegram's server ignores it there anyway (returns all messages). Telethon
+  would locally filter if we passed it, but for private conversations we want
+  to process messages from both sides.
+- scope=="bot" never uses `from_user='me'` since bot messages belong to other
+  senders, not the userbot account.
+
+Bot-sender cache (v3.0.6):
+- For scope=="bot", sender.bot is checked via a per-session
+  `_bot_peer_cache: dict[int, bool]` keyed on `msg.sender_id`. This avoids
+  the hidden `get_entity()` call that `msg.sender` previously triggered on
+  every uncached message, which was a FloodWait risk at scale.
+
 Permission handling:
 - The module does NOT pre-check permissions. It attempts to delete every
-  matching message via `batch_delete()`, which internally handles all
-  permission errors (MessageDeleteForbiddenError, ChatAdminRequiredError,
-  etc.) and counts them as "failed" in the final report.
-- This approach is simpler and more accurate than guessing permissions,
-  especially in bot chats where users can delete any message.
+  matching message via `batch_delete()`, which uses `AffectedMessages.pts_count`
+  (v3.0.6) for exact deletion counting. Messages the server silently skips
+  (e.g. other members' messages without admin rights) are now correctly
+  reported as "not deleted" rather than being falsely counted as successes.
 
 Message Classification System (v1.6.1+)
 ────────────────────────────────────────
@@ -94,39 +112,18 @@ class Clearer(Module):
 
     def __init__(self, context: ModuleContext) -> None:
         super().__init__(context)
-        self._me_id: int | None = None
-        self._me_id_task: asyncio.Task | None = None
+        # Per-session cache: sender_id → is_bot (bool).
+        # Populated lazily in _is_bot_sender() to avoid per-message
+        # get_entity() calls (which were a hidden FloodWait risk).
+        self._bot_peer_cache: dict[int, bool] = {}
 
     def setup(self, client: TelegramClient) -> None:
         self._add_handler(client, events.NewMessage(outgoing=True), self._on_command)
-
-        # Store the task reference so teardown() can cancel it on hot-reload,
-        # preventing it from calling client.get_me() on a stale/disconnected
-        # client and potentially overwriting _me_id on the new instance.
-        self._me_id_task = asyncio.create_task(
-            self._cache_me_id(client),
-            name=f"clearer_me_a{self.cfg.index}",
-        )
-
         self._log_info("Clearer ready.")
 
     def teardown(self, client: TelegramClient) -> None:
-        if self._me_id_task is not None and not self._me_id_task.done():
-            self._me_id_task.cancel()
-        self._me_id_task = None
+        self._bot_peer_cache.clear()
         super().teardown(client)
-
-    async def _cache_me_id(self, client: TelegramClient) -> None:
-        await asyncio.sleep(2)
-        try:
-            if client.is_connected():
-                me = await client.get_me()
-                if me:
-                    self._me_id = me.id
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            self._log_error("Failed to cache me_id: %s", exc)
 
     # ── Command dispatcher ─────────────────────────────────────────────────
 
@@ -190,10 +187,33 @@ class Clearer(Module):
         target_types: set[str],
         scope: str,
     ) -> None:
-        """Scan chat history and delete messages matching the filter."""
+        """Scan chat history and delete messages matching the filter.
+
+        Chat-type-aware sender filtering (v3.0.6)
+        ──────────────────────────────────────────
+        ``event.is_private`` is True when the chat is a PeerUser entity
+        (private chat with a person or bot, or Saved Messages).
+
+        - Private / Saved Messages → fetch all messages (no ``from_user``).
+          In private chats Telegram ignores ``from_user`` server-side anyway;
+          we also intentionally want both sides of the conversation for these.
+        - Groups / supergroups / channels (``is_private`` is False) with
+          scope "all" or "self" → add ``from_user='me'`` so Telegram filters
+          server-side. Only the user's own messages are returned, making the
+          scan efficient and the deletion count accurate.
+        - scope "bot" → no ``from_user`` ever (we want bot messages, not ours).
+        """
         chat_id = event.chat_id
         command_id = event.message.id
         history_limit = self.context.settings.history_limit
+
+        # Determine if this is a private/saved-messages chat.
+        # event.is_private is True for PeerUser (person, bot, Saved Messages).
+        is_private: bool = bool(event.is_private)
+
+        # Should we let Telegram filter by sender server-side?
+        # Yes for non-private chats when we only want our own messages.
+        use_from_user = (not is_private) and (scope in ("all", "self"))
 
         # Show progress
         type_label = self._format_type_label(target_types)
@@ -226,16 +246,24 @@ class Clearer(Module):
         start_time = time.monotonic()
 
         try:
-            async for msg in client.iter_messages(chat_id, limit=history_limit):
+            # wait_time=1: adds a 1-second pause every 100 messages to avoid
+            # hitting GetHistoryRequest FloodWait. Telethon only auto-applies
+            # this when limit > 3000; at the default 2000 we add it explicitly.
+            iter_kwargs: dict = dict(limit=history_limit, wait_time=1)
+            if use_from_user:
+                iter_kwargs["from_user"] = "me"
+
+            async for msg in client.iter_messages(chat_id, **iter_kwargs):
                 # Skip command and status message BEFORE counting
                 if msg.id in skip_ids:
                     continue
 
-                # Now count this message as scanned
+                # Count as scanned
                 scanned += 1
 
-                # Scope filter
-                if not self._matches_scope(msg, scope):
+                # Scope filter (client-side for "bot"; server-side already
+                # handled for "all"/"self" in non-private chats via from_user)
+                if not await self._matches_scope(client, msg, scope):
                     continue
 
                 # Type classification (uses shared classify_message helper)
@@ -259,7 +287,6 @@ class Clearer(Module):
                 f"• نوع: {type_label}\n"
                 f"• زمان: `{elapsed:.2f}s`"
             )
-            # Self-delete the result message after a short delay
             self._track_delete_task(status_msg, 6.0)
             return
 
@@ -270,9 +297,9 @@ class Clearer(Module):
             f"• اسکن شده: `{scanned}` پیام"
         )
 
-        # Batch delete — internally handles all permission errors and counts
-        # successful deletions accurately. Messages that fail due to permission
-        # are counted separately in the final report.
+        # Batch delete — uses AffectedMessages.pts_count (v3.0.6) for exact
+        # deletion counting. Messages the server silently skipped (no permission)
+        # are now correctly reflected in failed_count.
         deleted_count = await batch_delete(client, chat_id, to_delete, batch_size=100)
 
         elapsed = time.monotonic() - start_time
@@ -309,44 +336,88 @@ class Clearer(Module):
 
         result_text = "\n".join(report_lines)
 
-        # Try to edit status message; fall back to a new message if it was deleted
+        # Try to edit status message; fall back to a new message if it was
+        # deleted. Capture the fallback message so _track_delete_task targets
+        # the correct object (v3.0.6 bug fix — previously the fallback message
+        # was never auto-deleted because status_msg was passed instead).
+        report_msg = status_msg
         try:
             await status_msg.edit(result_text)
         except Exception:
             try:
-                await client.send_message(chat_id, result_text)
+                report_msg = await client.send_message(chat_id, result_text)
             except Exception as exc:
                 self._log_error("Failed to send result: %s", exc)
 
-        # Self-delete the result message after a short delay
-        self._track_delete_task(status_msg, 6.0)
+        # Auto-delete the result message after a short delay
+        self._track_delete_task(report_msg, 6.0)
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
-    def _matches_scope(self, msg, scope: str) -> bool:
-        """Check if a message matches the requested scope (all/self/bot)."""
+    async def _matches_scope(self, client: TelegramClient, msg, scope: str) -> bool:
+        """Check if a message matches the requested scope (all/self/bot).
+
+        For scope "all" and "self" in non-private chats, `from_user='me'`
+        is already applied at the iter_messages level (server-side), so this
+        method returns True unconditionally for those scopes — the filtering
+        was already done. For private chats with scope "self", we fall back to
+        a client-side sender_id check using base._get_me_id().
+
+        For scope "bot", sender.bot is checked via _is_bot_sender() which uses
+        a local cache (self._bot_peer_cache) to avoid a get_entity() call per
+        message.
+        """
         if scope == "all":
             return True
 
         if scope == "self":
-            if self._me_id is None:
+            me_id = await self._get_me_id(client)
+            if me_id is None:
                 return False
-            return getattr(msg, "sender_id", None) == self._me_id
+            return getattr(msg, "sender_id", None) == me_id
 
         if scope == "bot":
-            sender = None
-            try:
-                sender = getattr(msg, "sender", None)
-                if sender is None:
-                    return False
-            except Exception:
-                return False
-
-            if isinstance(sender, User):
-                return bool(getattr(sender, "bot", False))
-            return False
+            return await self._is_bot_sender(client, msg)
 
         return False
+
+    async def _is_bot_sender(self, client: TelegramClient, msg) -> bool:
+        """Return True if the message was sent by a bot.
+
+        Uses self._bot_peer_cache (keyed on sender_id) to avoid a
+        get_entity() call for every message. Only the first occurrence of a
+        given sender_id triggers an API call; subsequent messages from the
+        same sender use the cached result.
+
+        Falls back to False on any error to avoid crashing the scan loop.
+        """
+        sender_id = getattr(msg, "sender_id", None)
+        if sender_id is None:
+            return False
+
+        # Return cached result if available
+        if sender_id in self._bot_peer_cache:
+            return self._bot_peer_cache[sender_id]
+
+        # Try msg.sender first — it may already be populated (no API call)
+        try:
+            sender = getattr(msg, "sender", None)
+            if isinstance(sender, User):
+                result = bool(getattr(sender, "bot", False))
+                self._bot_peer_cache[sender_id] = result
+                return result
+        except Exception:
+            pass
+
+        # Fall back to an explicit get_entity() call (one per unique sender)
+        try:
+            entity = await client.get_entity(sender_id)
+            result = isinstance(entity, User) and bool(getattr(entity, "bot", False))
+            self._bot_peer_cache[sender_id] = result
+            return result
+        except Exception:
+            self._bot_peer_cache[sender_id] = False
+            return False
 
     @staticmethod
     def _format_type_label(target_types: set[str]) -> str:
@@ -373,9 +444,9 @@ class Clearer(Module):
 # ── Help Texts (در انتهای ماژول طبق قوانین) ─────────────────────────────────
 
 help_text = (
-    "• `clear` | پاک‌سازی پیش‌فرض (متن و لینک)\n"
-    "• `clear all` | پاک‌سازی همه پیام‌ها\n"
-    "• `clear media` | پاک‌سازی عکس، ویدیو و فایل\n"
+    "• `clear` | پاک‌سازی پیش‌فرض (متن و لینک) — فقط پیام‌های خودم در گروه‌ها\n"
+    "• `clear all` | پاک‌سازی همه پیام‌های خودم\n"
+    "• `clear media` | پاک‌سازی عکس، ویدیو و فایل (فقط پیام‌های خودم در گروه)\n"
     "• `clear pic` | فقط عکس‌ها\n"
     "• `clear vid` | فقط ویدیوها و GIF\n"
     "• `clear file` | فقط فایل‌های ضمیمه\n"
@@ -389,7 +460,7 @@ help_extra = (
     "پاک‌سازی دستی پیام‌ها\n\n"
     "دستورات اصلی:\n"
     "• `clear` | پاک‌سازی پیش‌فرض شامل متن و لینک\n"
-    "• `clear all` | پاک‌سازی همه پیام‌ها شامل استیکر، ویس و سایر\n"
+    "• `clear all` | پاک‌سازی همه پیام‌های خودم (گروه) یا همه پیام‌ها (چت خصوصی)\n"
     "• `clear media` | پاک‌سازی عکس، ویدیو و فایل بدون لینک\n\n"
     "فیلتر بر اساس نوع:\n"
     "• `clear pic` | فقط عکس‌ها\n"
@@ -400,6 +471,10 @@ help_extra = (
     "فیلتر بر اساس فرستنده:\n"
     "• `clear self` | فقط پیام‌های خودتان\n"
     "• `clear bot` | فقط پیام‌های ربات‌ها\n\n"
+    "رفتار در گروه‌ها و کانال‌ها (v3.0.6):\n"
+    "• در گروه، سوپرگروه و کانال: دستور `clear` (و همه حالت‌های آن به‌جز `clear bot`)\n"
+    "  فقط پیام‌های خودتان را پیدا و حذف می‌کند. پیام‌های سایر اعضا نادیده گرفته می‌شوند.\n"
+    "• در چت خصوصی و مکالمه با ربات: پیام‌های هر دو طرف پردازش می‌شوند.\n\n"
     "ترکیب دستور و scope:\n"
     "• `clear txt self` | فقط متن‌های خودم\n"
     "• `clear media bot` | فقط رسانه‌های ربات‌ها\n"
@@ -409,8 +484,8 @@ help_extra = (
     "• `clear pic vid` | عکس‌ها و ویدیوها با هم\n"
     "• `clear media link self` | رسانه + لینک، فقط پیام‌های خودم\n\n"
     "مثال‌ها:\n"
-    "• `clear` | حذف همه پیام‌های متنی و لینک‌ها\n"
-    "• `clear media` | حذف عکس‌ها، ویدیوها و فایل‌ها بدون لینک\n"
+    "• `clear` | حذف متن و لینک‌های خودم\n"
+    "• `clear media` | حذف عکس‌ها، ویدیوها و فایل‌های خودم در گروه\n"
     "• `clear self pic` | فقط عکس‌هایی که خودم فرستادم\n"
     "• `clear bot txt` | فقط متن‌های ربات‌ها\n\n"
     "سیستم طبقه‌بندی:\n"

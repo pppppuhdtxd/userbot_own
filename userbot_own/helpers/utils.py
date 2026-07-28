@@ -55,6 +55,7 @@ from telethon.tl.types import (
     MessageMediaWebPage,
     ReplyInlineMarkup,
 )
+from telethon.tl.types import messages as tl_msg_types
 
 from userbot_own.core.logging_setup import get_logger
 
@@ -138,6 +139,36 @@ async def safe_delete(
         return False
 
 
+def _pts_count(results) -> int:
+    """
+    Sum the ``pts_count`` fields from a list of ``messages.AffectedMessages``
+    returned by ``client.delete_messages()``.
+
+    ``pts_count`` is the number of messages Telegram actually deleted
+    server-side. This may be less than the number of IDs submitted when the
+    caller does not have permission to delete some (e.g. other members'
+    messages in a group without admin rights). Summing it gives an exact
+    deletion count rather than relying on ``len(batch)`` as a proxy.
+
+    Args:
+        results: Return value of ``client.delete_messages()`` — a list of
+                 ``messages.AffectedMessages`` objects (one per internal
+                 100-message chunk).
+
+    Returns:
+        Total number of messages deleted according to Telegram.
+    """
+    if not results:
+        return 0
+    total = 0
+    for r in results:
+        if isinstance(r, tl_msg_types.AffectedMessages):
+            total += r.pts_count
+        else:
+            log.debug("batch_delete: unexpected result type %s", type(r).__name__)
+    return total
+
+
 async def batch_delete(
     client,
     entity,
@@ -147,7 +178,15 @@ async def batch_delete(
     """
     Delete a list of message IDs in batches of *batch_size*.
 
-    Falls back to one-by-one deletion if a batch fails.
+    Uses ``messages.AffectedMessages.pts_count`` returned by
+    ``client.delete_messages()`` for an accurate deletion count.
+    Telegram's ``pts_count`` reflects the number of messages actually
+    removed server-side, which may be less than ``len(batch)`` when some
+    IDs belong to other users in a group where the caller lacks admin
+    delete rights.
+
+    Falls back to one-by-one deletion via ``safe_delete()`` if a batch
+    raises a non-FloodWait exception.
 
     Args:
         client:     Active ``TelegramClient``.
@@ -156,7 +195,8 @@ async def batch_delete(
         batch_size: Max IDs per API call (Telegram limit is 100).
 
     Returns:
-        Number of successfully deleted messages.
+        Number of messages actually deleted according to Telegram's
+        ``pts_count`` response field.
 
     Example:
         >>> deleted = await batch_delete(client, chat_id, [1, 2, 3, 4, 5])
@@ -167,14 +207,14 @@ async def batch_delete(
     for i in range(0, len(ids), batch_size):
         batch = ids[i : i + batch_size]
         try:
-            await client.delete_messages(entity, batch, revoke=True)
-            deleted += len(batch)
+            results = await client.delete_messages(entity, batch, revoke=True)
+            deleted += _pts_count(results)
         except errors.FloodWaitError as exc:
             log.warning("batch_delete: FloodWait %ds — waiting…", exc.seconds)
             await asyncio.sleep(exc.seconds)
             try:
-                await client.delete_messages(entity, batch, revoke=True)
-                deleted += len(batch)
+                results = await client.delete_messages(entity, batch, revoke=True)
+                deleted += _pts_count(results)
             except Exception as retry_exc:
                 log.error("batch_delete: retry failed — %s", retry_exc)
         except Exception as exc:

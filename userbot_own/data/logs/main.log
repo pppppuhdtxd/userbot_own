@@ -1,0 +1,41 @@
+2026-07-28 22:08:45 | INFO     | userbot_own.app.composition_root | =================================================================
+2026-07-28 22:08:45 | INFO     | userbot_own.app.composition_root | Multi-Account Userbot_own v3.0.6 starting…
+2026-07-28 22:08:45 | INFO     | userbot_own.app.composition_root | Accounts : 1
+2026-07-28 22:08:45 | INFO     | userbot_own.app.composition_root |   [1] phone=+989054717891     api_id=20337851
+2026-07-28 22:08:45 | INFO     | userbot_own.app.composition_root | Log dir  : D:\Desktop\New folder (3)\5\userbot\userbot_own\data\logs
+2026-07-28 22:08:45 | INFO     | userbot_own.app.composition_root | Shortcuts: Ctrl+C=exit | Ctrl+R=restart
+2026-07-28 22:08:45 | INFO     | userbot_own.app.composition_root | =================================================================
+2026-07-28 22:08:45 | INFO     | userbot_own.core.watcher | File watchers configured: accounts/ directory (account.json + new accounts).
+2026-07-28 22:08:45 | INFO     | userbot_own.app.composition_root | File watchers active.
+2026-07-28 22:08:46 | INFO     | _modules_a1.auto_clearer | [1] AutoClearer ready.
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] Loaded: auto_clearer
+2026-07-28 22:08:46 | INFO     | _modules_a1.auto_forwarder | [1] [Account1] AutoForwarder settings file not found, using defaults (all OFF).
+2026-07-28 22:08:46 | INFO     | _modules_a1.auto_forwarder | [1] [Account1] AutoForwarder ready.
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] Loaded: auto_forwarder
+2026-07-28 22:08:46 | INFO     | _modules_a1.clearer | [1] Clearer ready.
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] Loaded: clearer
+2026-07-28 22:08:46 | INFO     | _modules_a1.help_handler | [1] HelpHandler ready.
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] Loaded: help_handler
+2026-07-28 22:08:46 | INFO     | _modules_a1.info_handler | [1] InfoHandler ready.
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] Loaded: info_handler
+2026-07-28 22:08:46 | INFO     | _modules_a1.join_left | [1] JoinLeft ready (mode=safe).
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] Loaded: join_left
+2026-07-28 22:08:46 | INFO     | _modules_a1.reaction_commands | [1] Created default reactions.json
+2026-07-28 22:08:46 | INFO     | _modules_a1.reaction_commands | [1] Loaded 2 reaction mappings
+2026-07-28 22:08:46 | INFO     | _modules_a1.reaction_commands | [1] ReactionCommands ready (Funnel Architecture). 2 reactions configured.
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] Loaded: reaction_commands
+2026-07-28 22:08:46 | INFO     | _modules_a1.system | [1] SystemModule ready.
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] Loaded: system
+2026-07-28 22:08:46 | INFO     | _modules_a1.whois_handler | [1] WhoisHandler ready.
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] Loaded: whois_handler
+2026-07-28 22:08:46 | INFO     | loader.account1 | [Account1] 9 plugin(s) loaded.
+2026-07-28 22:08:47 | INFO     | userbot_own.app.composition_root | [Account1] Connected to Telegram.
+2026-07-28 22:08:48 | INFO     | loader.account1 | [Account1] File watcher active — modules_dir=modules, extra_dirs=0.
+2026-07-28 22:08:48 | INFO     | _modules_a1.reaction_commands | [1] Cached self ID: 5732825265
+2026-07-28 22:08:49 | INFO     | _modules_a1.reaction_commands | [1] Module marked as ready — processing new reactions.
+2026-07-28 22:09:32 | DEBUG    | _modules_a1.reaction_commands | [1] ✅ Reaction detected: emoji=👍, chat=6344145347, msg=174160, action=join
+2026-07-28 22:09:32 | DEBUG    | _modules_a1.reaction_commands | [1] Executing directly: join
+2026-07-28 22:09:32 | DEBUG    | _modules_a1.join_left | [1] [Account1] Invite cache MISS for hash HnnVkUvE..., calling CheckChatInviteRequest
+2026-07-28 22:09:33 | DEBUG    | _modules_a1.join_left | [1] [Account1] Invite check result for HnnVkUvE...: username=None (type=ChatInvite)
+2026-07-28 22:09:37 | DEBUG    | _modules_a1.join_left | [1] [Account1] Join completed: mode=safe, success=1, fail=0, flood=0, time=4.4s, final_mult=1.0
+2026-07-28 22:09:37 | DEBUG    | _modules_a1.reaction_commands | [1] ✅ Invoked join_left.join directly

@@ -1,0 +1,30 @@
+# Multi-Account Userbot — Python dependencies
+# Install: pip install -r requirements.txt
+#
+# Python >= 3.11 required
+
+# ── Core ──────────────────────────────────────────────────────
+
+# Telegram client (async MTProto)
+telethon>=1.36.0
+
+# Environment variable loading (.env files)
+python-dotenv>=1.0.0
+
+# File-system event watching (hot-reload modules)
+watchdog>=4.0.0
+
+# Jalali/Persian date support (used in modules)
+jdatetime>=4.1.0
+
+# ── Resilience & Retry ───────────────────────────────────────
+
+# Smart retry with exponential backoff for network failures
+# Used by core/reconnector.py for connection recovery
+tenacity>=8.2.0
+
+# ── Logging ──────────────────────────────────────────────────
+
+# Advanced structured logging with auto-rotation and filtering
+# Replaces stdlib logging for better debugging in unstable networks
+loguru>=0.7.0

@@ -1,0 +1,25 @@
+[project]
+name = "userbot_own"
+version = "3.0.7"
+description = "Multi-Account Telegram Userbot — hot-reload plugin architecture, connection resilience, and per-account settings."
+requires-python = ">=3.11"
+readme = "README.md"
+
+# Dependencies are installed via `pip install -r requirements.txt` (see the
+# README's Quick Start) — this [project] table exists for tooling (ruff,
+# editors, packaging metadata), not as an alternate install path.
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "E501",  # line length — Persian help-text strings and long f-strings
+             # routinely exceed any single reasonable limit; enforced loosely
+             # via line-length above instead of hard-failing on it.
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["userbot_own"]

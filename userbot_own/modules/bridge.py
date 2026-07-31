@@ -30,6 +30,25 @@ Design decisions (unchanged from the original _MockEvent):
   `join_left._collect_entities()` can extract entities from the
   command text exactly as it would from a real message.
 - `delete()` removes the progress message, if one was ever created.
+
+v3.0.8 fix: a real Telethon `NewMessage.Event` exposes `is_private` /
+`is_group` / `is_channel` (proxied through to the underlying `Message`
+via `ChatGetter`, itself resolved from `Message.peer_id`). `MockEvent`
+never had these at all — no attributes, and no `__getattr__` fallback
+the way the real event class has. `clearer.py`'s `_run_clear` reads
+`event.is_private` unconditionally, so every reaction-triggered `clear`
+command raised `AttributeError` inside the direct-invocation try block
+in `reaction_commands.py`, which silently fell back to `send_message`
+every single time — never actually exercising the "Direct Module
+Invocation" path the architecture was built around for this, the most
+commonly reaction-mapped command.
+
+Fix: the three flags are now constructor parameters, supplied by the
+caller (`reaction_commands.py`), which already classifies the chat
+type once per reaction event as part of its own scope-filtering gate
+(Gate 2) — so populating these costs no additional API calls beyond
+what the caller was already doing for its own purposes; MockEvent
+itself performs no classification and makes no network calls.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -66,6 +85,9 @@ class MockEvent:
         target_msg_id: int,
         raw_text: str,
         target_msg: Message | None = None,
+        is_private: bool = True,
+        is_group: bool = False,
+        is_channel: bool = False,
     ) -> None:
         self.client = client
         self.chat_id = chat_id
@@ -73,6 +95,17 @@ class MockEvent:
         self._target_msg_id = target_msg_id
         self._target_msg = target_msg
         self.is_reply = target_msg is not None
+
+        # v3.0.8: chat-type flags, mirroring the real NewMessage.Event /
+        # ChatGetter surface. Supplied by the caller (already classified
+        # for its own scope-filtering purposes — see module docstring),
+        # never computed here. Defaults lean toward "private", the
+        # least-consequential guess if a future call site ever omits
+        # these (clearer.py's `clear` — without scope filters — behaves
+        # the same for private chats regardless of self/bot).
+        self.is_private = is_private
+        self.is_group = is_group
+        self.is_channel = is_channel
 
         # Needed by join_left._collect_entities(), which reads
         # event.message.message for command-text entities.

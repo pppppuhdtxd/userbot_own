@@ -7,10 +7,13 @@ Architecture:
 - Push-Based Detection: Only UpdateMessageReactions + UpdateEditMessage
 - Zero Polling: No get_dialogs calls; Method 1 no longer calls
   get_messages() either as of v3.0.2 (see below)
-- Funnel Filtering: 5 gates with O(1) complexity
+- Funnel Filtering: 5 gates with O(1)/cached-lookup complexity
 - Post-Startup Only: Ignores reactions from before module start
 - Self-Only: Only processes reactions from the userbot account
-- Environment Toggles: Configurable per chat type (bots/users/groups/channels)
+- Dynamic Scope: Which chat types are processed is configurable at
+  runtime via the `.reaction_scope` command (see below) — persisted
+  per-account in reaction_scope.json, no source edits or restart
+  required. Replaces the old hardcoded ENABLE_FOR_* class attributes.
 
 Executes commands via Direct Module Invocation (compatible with clearer.py,
 join_left.py, info_handler.py, whois_handler.py) instead of send_message
@@ -24,7 +27,54 @@ Features:
 - Self-reaction only
 - Duplicate-delivery protection without permanently blocking re-triggers
   (see "Reaction state tracking" below)
-- Environment-aware filtering (bots/users/groups/channels)
+- Environment-aware filtering, user-configurable at runtime via
+  `.reaction_scope` (private chats / bot chats / groups+supergroups /
+  broadcast channels)
+
+v3.0.8 fixes:
+- `MockEvent` (modules/bridge.py) had no `is_private`/`is_group`/
+  `is_channel` attributes at all, unlike a real Telethon NewMessage
+  event. `clearer.py`'s `_run_clear` reads `event.is_private`
+  unconditionally, so every reaction-triggered `clear` command raised
+  AttributeError inside the direct-invocation attempt and silently
+  fell back to send_message every time — the most commonly
+  reaction-mapped command never actually used the "Direct Module
+  Invocation" path its architecture was built around. Fixed by having
+  `_execute_command_directly` classify the target chat once (via the
+  same peer-classification helper Gate 2 uses, so it's normally a
+  cache hit — no extra API calls in the common case) and pass the
+  three flags into MockEvent's constructor.
+- Environment scope was a set of four hardcoded class attributes
+  (ENABLE_FOR_BOTS/USERS/GROUPS/CHANNELS) requiring a source edit and
+  reload to change, despite the module's own former documentation
+  calling them "Environment Toggles" as if they were already
+  externally configurable. Replaced with `.reaction_scope <value>`
+  (private/bot/group/channel/all/none), persisted per-account in
+  reaction_scope.json, loaded at setup() exactly like reactions.json.
+- The old PeerChannel branch of the environment filter treated every
+  channel-type peer identically, silently lumping supergroups in with
+  broadcast channels (both are `PeerChannel` at the MTProto level; only
+  `entity.megagroup` tells them apart). A supergroup could never
+  actually be reached by the old "groups" toggle. Fixed via a new
+  `_classify_peer()` helper that resolves `entity.megagroup` for
+  PeerChannel peers (cached per channel_id, same pattern as the
+  existing bot/user cache), so `.reaction_scope group` now correctly
+  covers both legacy basic groups and supergroups, and
+  `.reaction_scope channel` means broadcast channels only.
+- `_active_reactions` (Gate 5's rising-edge dedup memory) was
+  unconditionally wiped in teardown(), which runs on every reconnect
+  via AccountReconnector.reattach() — not just on a genuine hot-reload.
+  Since reattach() reuses the same module instance (confirmed in
+  core/loader.py: "module instances themselves are reused — no
+  re-import needed"), clearing this dict there served no purpose for
+  reconnects and created a real duplicate-fire window: a reaction still
+  present on a message before a disconnect would look like a fresh
+  rising edge once catch_up redelivered it after reconnect, re-firing
+  its mapped command. teardown() no longer clears `_active_reactions`,
+  `_peer_is_bot_cache`, or the new `_channel_megagroup_cache` — a
+  genuine hot-reload gets a fresh instance (and therefore fresh, empty
+  dicts) via `create_module()` regardless, so this only changes
+  behavior for the reattach()/reconnect path, as intended.
 
 v3.0.2 fixes (see individual method docstrings for full detail):
 - Method 1 (_on_reaction_update) read event.peer_id and event.chat_id,
@@ -60,6 +110,9 @@ Commands (in Saved Messages):
 - `reaction add <emoji> <command>`   — add a reaction mapping
 - `reaction remove <emoji>`          — remove a reaction mapping
 - `reaction clear`         — remove all reactions
+- `.reaction_scope`                  — show which chat types are active
+- `.reaction_scope <value>`          — toggle a chat type on/off
+  (value: private | bot | group | channel | all | none)
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -102,17 +155,39 @@ class ReactionCommands(Module):
 
     name = "reaction_commands"
 
-    # ── Environment toggles (edit these to change scope) ──────────────────
-    ENABLE_FOR_BOTS: bool = True       # Private chats with bots
-    ENABLE_FOR_USERS: bool = False      # Private chats with regular users
-    ENABLE_FOR_GROUPS: bool = False    # Basic groups and supergroups
-    ENABLE_FOR_CHANNELS: bool = False  # Channels (broadcast)
+    # ── Dynamic scope (v3.0.8) ──────────────────────────────────────────────
+    # Replaces the old hardcoded ENABLE_FOR_BOTS/USERS/GROUPS/CHANNELS class
+    # attributes. Scope is now runtime-configurable via `.reaction_scope`
+    # and persisted per-account in reaction_scope.json — see
+    # _ensure_scope_file()/_load_scope()/_save_scope() and the module
+    # docstring's v3.0.8 fix notes.
+    #
+    # "group" deliberately covers BOTH legacy basic groups (PeerChat) and
+    # supergroups/megagroups (PeerChannel with megagroup=True) — see
+    # _classify_peer(). "channel" means broadcast channels only
+    # (PeerChannel with megagroup=False).
+    VALID_SCOPES: frozenset[str] = frozenset({"private", "bot", "group", "channel"})
+
+    #: Scope active on first run / if reaction_scope.json is missing.
+    #: Matches the pre-v3.0.8 hardcoded defaults exactly (ENABLE_FOR_BOTS
+    #: was the only one that defaulted to True), so upgrading an existing
+    #: install without reconfiguring changes nothing observable.
+    _DEFAULT_SCOPES: frozenset[str] = frozenset({"bot"})
 
     def __init__(self, context: ModuleContext) -> None:
         super().__init__(context)
         self._settings_file = self.cfg.settings_dir / "reactions.json"
         self._reactions: dict[str, str] = {}
         self._me_id: int | None = None
+
+        # ── Dynamic scope state (v3.0.8) ────────────────────────────────
+        self._scope_settings_file = self.cfg.settings_dir / "reaction_scope.json"
+        self._active_scopes: set[str] = set(self._DEFAULT_SCOPES)
+
+        # channel_id -> is this PeerChannel a supergroup/megagroup (True)
+        # or a broadcast channel (False)? Populated on first sight per
+        # channel, same caching pattern as _peer_is_bot_cache below.
+        self._channel_megagroup_cache: dict[int, bool] = {}
 
         # (chat_id, msg_id) -> currently-active self-reaction emojis, as of
         # the most recently processed update. Replaces the old permanent
@@ -140,6 +215,8 @@ class ReactionCommands(Module):
         self._client = client
         self._ensure_settings_file()
         self._load_settings()
+        self._ensure_scope_file()
+        self._load_scope()
 
         # Register command handler
         self._add_handler(client, events.NewMessage(outgoing=True), self._on_command)
@@ -162,8 +239,9 @@ class ReactionCommands(Module):
         )
 
         self._log_info(
-            "ReactionCommands ready (Funnel Architecture). %d reactions configured.",
-            len(self._reactions),
+            "ReactionCommands ready (Funnel Architecture). %d reactions configured. "
+            "Active scope: %s",
+            len(self._reactions), sorted(self._active_scopes) or "none",
         )
 
     def teardown(self, client: TelegramClient) -> None:
@@ -174,8 +252,19 @@ class ReactionCommands(Module):
         self._me_id_task = None
         self._ready_task = None
 
-        self._active_reactions.clear()
-        self._peer_is_bot_cache.clear()
+        # v3.0.8: _active_reactions (Gate 5 dedup state), _peer_is_bot_cache
+        # and _channel_megagroup_cache are deliberately NOT cleared here.
+        # teardown() runs on every AccountReconnector.reattach() call, not
+        # just on a genuine hot-reload — and reattach() reuses this exact
+        # instance (core/loader.py reattach()'s own docstring: "module
+        # instances themselves are reused — no re-import needed"). Clearing
+        # these on a routine reconnect served no purpose and caused a real
+        # duplicate-fire bug: a reaction still present on a message across
+        # a disconnect would look like a brand-new rising edge once
+        # catch_up redelivered its state after reconnect. A genuine
+        # hot-reload gets a fresh instance (and therefore fresh, empty
+        # dicts from __init__) via create_module() regardless of what
+        # happens here, so this change only affects the reconnect path.
         self._me_id = None
         self._is_ready = False
         self._client = None
@@ -219,41 +308,19 @@ class ReactionCommands(Module):
         Returns True if the environment is ENABLED (should process).
         Returns False if the environment is DISABLED (should drop).
 
-        Uses O(1) peer_id type check. For private chats (PeerUser), bot-vs-
-        user classification is cached locally per user_id (v3.0.2) — the
-        first reaction event from/about a given user pays for one
-        client.get_entity() call (itself often already cache-hit inside
-        Telethon), every subsequent one for that same user is a plain dict
-        lookup with no possibility of a network call at all.
+        v3.0.8: delegates classification to _classify_peer() (shared with
+        _execute_command_directly's MockEvent chat-type flags — see its
+        own docstring) and checks membership in the dynamically
+        configurable _active_scopes set instead of the old hardcoded
+        ENABLE_FOR_* booleans. Same caching characteristics as before:
+        the first reaction event from/about a given user or channel pays
+        for one client.get_entity() call, every subsequent one is a plain
+        dict lookup with no possibility of a network call at all.
         """
-        if isinstance(peer_id, PeerChannel):
-            # Channels and Supergroups
-            return self.ENABLE_FOR_CHANNELS
-
-        elif isinstance(peer_id, PeerChat):
-            # Basic Groups (legacy)
-            return self.ENABLE_FOR_GROUPS
-
-        elif isinstance(peer_id, PeerUser):
-            # Private chat — need to determine if bot or user
-            user_id = peer_id.user_id
-            is_bot = self._peer_is_bot_cache.get(user_id)
-            if is_bot is None:
-                try:
-                    entity = await client.get_entity(user_id)
-                    is_bot = bool(getattr(entity, 'bot', False))
-                except Exception:
-                    # If we can't determine, assume user (safer default).
-                    # Deliberately NOT cached: a transient failure here
-                    # shouldn't permanently freeze this user's classification
-                    # as "not a bot" — retry on the next reaction instead.
-                    return self.ENABLE_FOR_USERS
-                self._peer_is_bot_cache[user_id] = is_bot
-
-            return self.ENABLE_FOR_BOTS if is_bot else self.ENABLE_FOR_USERS
-
-        # Unknown peer type — drop
-        return False
+        kind = await self._classify_peer(peer_id, client)
+        if not kind:
+            return False  # Unknown peer type — drop
+        return kind in self._active_scopes
 
     # ── Settings I/O ──────────────────────────────────────────────────────
 
@@ -289,6 +356,48 @@ class ReactionCommands(Module):
             return False
         return True
 
+    # ── Scope settings I/O (v3.0.8) ─────────────────────────────────────────
+
+    def _ensure_scope_file(self) -> None:
+        if not self._scope_settings_file.exists():
+            default_data = {"active_scopes": sorted(self._DEFAULT_SCOPES)}
+            err = write_json_file_atomic(self._scope_settings_file, default_data, indent=2)
+            if err is not None:
+                self._log_error("Failed to create reaction_scope.json: %s", err)
+            else:
+                self._log_info("Created default reaction_scope.json (scope: bot)")
+
+    def _load_scope(self) -> None:
+        data, err = read_json_file(self._scope_settings_file)
+        if err is not None:
+            self._log_error("Failed to load reaction_scope.json: %s", err)
+            self._active_scopes = set(self._DEFAULT_SCOPES)
+            return
+        if data is None:
+            self._active_scopes = set(self._DEFAULT_SCOPES)
+            return
+
+        raw_scopes = data.get("active_scopes", [])
+        if not isinstance(raw_scopes, list):
+            self._log_warning("reaction_scope.json: 'active_scopes' is not a list — using default.")
+            self._active_scopes = set(self._DEFAULT_SCOPES)
+            return
+
+        # Silently drop any value that isn't currently valid (e.g. a stale
+        # value from a future/older format) rather than failing to load —
+        # same defensive spirit as _load_settings' str()-coercion above.
+        self._active_scopes = {v for v in raw_scopes if v in self.VALID_SCOPES}
+        self._log_info("Loaded reaction scope: %s", sorted(self._active_scopes) or "none")
+
+    def _save_scope(self) -> bool:
+        """Atomically persist the active scope set (see _save_settings)."""
+        data = {"active_scopes": sorted(self._active_scopes)}
+        err = write_json_file_atomic(self._scope_settings_file, data, indent=2)
+        if err is not None:
+            self._log_error("Failed to save reaction_scope.json: %s", err)
+            return False
+        return True
+
     # ── Command handler ───────────────────────────────────────────────────
 
     async def _on_command(self, event) -> None:
@@ -300,7 +409,7 @@ class ReactionCommands(Module):
 
         cmd = parts[0].lower()
 
-        if cmd in ("reactions", "reaction"):
+        if cmd in ("reactions", "reaction", ".reaction_scope"):
             if not await self._is_saved_messages(event):
                 return
 
@@ -314,6 +423,9 @@ class ReactionCommands(Module):
                 await self._cmd_remove(event, subcmd[1].strip())
             elif subcmd[0].lower() == "clear":
                 await self._cmd_clear(event)
+        elif cmd == ".reaction_scope":
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            await self._cmd_scope(event, arg)
 
     async def _cmd_list(self, event) -> None:
         if not self._reactions:
@@ -402,6 +514,115 @@ class ReactionCommands(Module):
             )
         else:
             await self._safe_edit(event, "❌ خطا در ذخیره تنظیمات.")
+
+    async def _cmd_scope(self, event, arg: str) -> None:
+        """
+        `.reaction_scope`            — show currently active chat types.
+        `.reaction_scope <value>`    — toggle one of private/bot/group/channel
+                                        on or off (add if absent, remove if
+                                        present — so running the same command
+                                        twice is a clean on/off switch).
+        `.reaction_scope all`        — activate every chat type.
+        `.reaction_scope none`       — deactivate every chat type.
+        """
+        if not arg:
+            await self._safe_edit(
+                event,
+                "📋 **Scope فعال ری‌اکشن‌ها:**\n\n"
+                f"{self._format_scope_lines()}\n\n"
+                "💡 برای تغییر: `.reaction_scope <private|bot|group|channel|all|none>`"
+            )
+            return
+
+        value = arg.lower()
+
+        if value == "all":
+            self._active_scopes = set(self.VALID_SCOPES)
+        elif value == "none":
+            self._active_scopes = set()
+        elif value in self.VALID_SCOPES:
+            if value in self._active_scopes:
+                self._active_scopes.discard(value)
+            else:
+                self._active_scopes.add(value)
+        else:
+            await self._safe_edit(
+                event,
+                f"❌ مقدار نامعتبر: `{arg}`\n\n"
+                "**مقادیر مجاز:** `private`, `bot`, `group`, `channel`, `all`, `none`"
+            )
+            return
+
+        if self._save_scope():
+            await self._safe_edit(
+                event,
+                "✅ **Scope به‌روزرسانی شد!**\n\n"
+                f"{self._format_scope_lines()}"
+            )
+        else:
+            await self._safe_edit(event, "❌ خطا در ذخیره تنظیمات scope.")
+
+    def _format_scope_lines(self) -> str:
+        labels = {
+            "private": "چت خصوصی (کاربران)",
+            "bot":     "چت خصوصی (ربات‌ها)",
+            "group":   "گروه و سوپرگروه",
+            "channel": "کانال (broadcast)",
+        }
+        lines = []
+        for value in ("private", "bot", "group", "channel"):
+            mark = "✅" if value in self._active_scopes else "◻️"
+            lines.append(f"{mark} `{value}` — {labels[value]}")
+        return "\n".join(lines)
+
+    # ── Peer classification (v3.0.8) ────────────────────────────────────────
+
+    async def _classify_peer(self, peer_id, client: TelegramClient) -> str:
+        """
+        Classify a peer into one of the four scope buckets: "private",
+        "bot", "group", "channel". Returns "" if the peer type is
+        unrecognized (caller should treat that as "drop").
+
+        - PeerUser: "bot" or "private", via the existing bot/user cache
+          (unchanged from the pre-v3.0.8 _check_environment_filter logic).
+        - PeerChat: always "group" (legacy basic groups are unambiguous).
+        - PeerChannel: "group" if the channel is a supergroup/megagroup,
+          "channel" if it's a broadcast channel — resolved via
+          client.get_entity() on first sight per channel_id, then cached
+          (same shape as the bot/user cache; see _channel_megagroup_cache
+          in __init__). A transient lookup failure is NOT cached — same
+          reasoning as the existing bot/user classification fallback
+          below — and defaults to "channel" (the more restrictive,
+          off-by-default bucket) rather than guessing "group".
+        """
+        if isinstance(peer_id, PeerUser):
+            user_id = peer_id.user_id
+            is_bot = self._peer_is_bot_cache.get(user_id)
+            if is_bot is None:
+                try:
+                    entity = await client.get_entity(user_id)
+                    is_bot = bool(getattr(entity, 'bot', False))
+                except Exception:
+                    return "private"  # safer default; not cached (retry next time)
+                self._peer_is_bot_cache[user_id] = is_bot
+            return "bot" if is_bot else "private"
+
+        elif isinstance(peer_id, PeerChat):
+            return "group"
+
+        elif isinstance(peer_id, PeerChannel):
+            channel_id = peer_id.channel_id
+            is_megagroup = self._channel_megagroup_cache.get(channel_id)
+            if is_megagroup is None:
+                try:
+                    entity = await client.get_entity(peer_id)
+                    is_megagroup = bool(getattr(entity, 'megagroup', False))
+                except Exception:
+                    return "channel"  # safer/off-by-default guess; not cached
+                self._channel_megagroup_cache[channel_id] = is_megagroup
+            return "group" if is_megagroup else "channel"
+
+        return ""
 
     # ── Method 1: UpdateMessageReactions (Primary Push Route) ─────────────
 
@@ -694,12 +915,32 @@ class ReactionCommands(Module):
         command_name = command_parts[0].lower()
         self._log_debug("Executing directly: %s", command_text)
 
+        # v3.0.8: resolve is_private/is_group/is_channel for MockEvent.
+        # telethon_utils.resolve_id() is a pure local computation on the
+        # marked chat_id integer (no API call) that reconstructs the peer
+        # type; _classify_peer() then resolves bot-vs-user /
+        # supergroup-vs-channel, hitting the same caches Gate 2 already
+        # warmed for this chat a moment earlier in the common case — see
+        # both methods' docstrings. This normally costs zero extra API
+        # calls; a cache miss (first time this chat is ever seen) costs
+        # at most one client.get_entity() call, same as Gate 2 would have
+        # already paid.
+        real_id, peer_cls = telethon_utils.resolve_id(chat_id)
+        chat_kind = await self._classify_peer(peer_cls(real_id), client)
+        mock_is_private = chat_kind in ("private", "bot")
+        mock_is_group = chat_kind == "group"
+        mock_is_channel = chat_kind == "channel"
+
         # ── clear (compatible with clearer.py) ────────────────────────────
         if command_name == "clear":
             clearer_instance = loader.get_module("clearer")
             if clearer_instance is not None:
                 try:
-                    mock_event = MockEvent(client, chat_id, target_msg_id, command_text)
+                    mock_event = MockEvent(
+                        client, chat_id, target_msg_id, command_text,
+                        is_private=mock_is_private, is_group=mock_is_group,
+                        is_channel=mock_is_channel,
+                    )
                     await clearer_instance._on_command(mock_event)
                     self._log_debug("✅ Invoked clearer directly")
                     return
@@ -717,7 +958,9 @@ class ReactionCommands(Module):
 
                     mock_event = MockEvent(
                         client, chat_id, target_msg_id, command_text,
-                        target_msg=target_msg
+                        target_msg=target_msg,
+                        is_private=mock_is_private, is_group=mock_is_group,
+                        is_channel=mock_is_channel,
                     )
                     # Call _dispatch which routes to _handle_join or _handle_left
                     await join_left_instance._dispatch(mock_event)
@@ -735,7 +978,9 @@ class ReactionCommands(Module):
                         target_msg = await client.get_messages(chat_id, ids=target_msg_id)
                     mock_event = MockEvent(
                         client, chat_id, target_msg_id, command_text,
-                        target_msg=target_msg
+                        target_msg=target_msg,
+                        is_private=mock_is_private, is_group=mock_is_group,
+                        is_channel=mock_is_channel,
                     )
                     await info_instance._on_command(mock_event)
                     self._log_debug("✅ Invoked info_handler directly")
@@ -752,7 +997,9 @@ class ReactionCommands(Module):
                         target_msg = await client.get_messages(chat_id, ids=target_msg_id)
                     mock_event = MockEvent(
                         client, chat_id, target_msg_id, command_text,
-                        target_msg=target_msg
+                        target_msg=target_msg,
+                        is_private=mock_is_private, is_group=mock_is_group,
+                        is_channel=mock_is_channel,
                     )
                     await whois_instance._on_command(mock_event)
                     self._log_debug("✅ Invoked whois_handler directly")
@@ -783,6 +1030,7 @@ help_text = (
     "• `reaction add <emoji> <command>` | افزودن mapping\n"
     "• `reaction remove <emoji>` | حذف یک mapping\n"
     "• `reaction clear` | حذف همه mapping ها\n"
+    "• `.reaction_scope` | نمایش/تغییر محدوده فعال (چت خصوصی/ربات/گروه/کانال)\n"
 )
 
 # Bug fix (this refactor): the previous help_extra claimed a "Method 3 |
@@ -800,6 +1048,19 @@ help_extra = (
     "• `reaction add <emoji> <command>` | افزودن mapping جدید\n"
     "• `reaction remove <emoji>` | حذف یک mapping\n"
     "• `reaction clear` | حذف همه mapping ها\n\n"
+    "محدوده فعال (Scope) — از نسخه ۳.۰.۸:\n"
+    "دیگر نیازی به ویرایش فایل ماژول نیست؛ محدوده چت‌هایی که ری‌اکشن در آن‌ها\n"
+    "پردازش می‌شود کاملاً از طریق دستور زیر و در زمان اجرا قابل تنظیم است:\n"
+    "• `.reaction_scope` | نمایش وضعیت فعلی محدوده\n"
+    "• `.reaction_scope private` | فعال/غیرفعال‌سازی چت خصوصی با کاربران\n"
+    "• `.reaction_scope bot` | فعال/غیرفعال‌سازی چت خصوصی با ربات‌ها\n"
+    "• `.reaction_scope group` | فعال/غیرفعال‌سازی گروه‌ها **و سوپرگروه‌ها**\n"
+    "• `.reaction_scope channel` | فعال/غیرفعال‌سازی کانال‌های broadcast\n"
+    "• `.reaction_scope all` | فعال‌سازی همه محدوده‌ها\n"
+    "• `.reaction_scope none` | غیرفعال‌سازی همه محدوده‌ها\n"
+    "هر بار اجرای دستور با یک مقدار، همان مقدار را toggle می‌کند (روشن↔خاموش).\n"
+    "پیش‌فرض کارخانه‌ای: فقط `bot` فعال است. تنظیمات در `reaction_scope.json`\n"
+    "(به‌ازای هر اکانت، جدا از `reactions.json`) ذخیره می‌شود.\n\n"
     "روش‌های تشخیص ری‌اکشن:\n"
     "این ماژول از ۲ روش push-based استفاده می‌کند (بدون polling):\n"
     "• Method 1 | `UpdateMessageReactions` برای پیام‌های خودتان\n"
@@ -816,11 +1077,12 @@ help_extra = (
     "• `reaction add 🔍 info` | نمایش اطلاعات پیام با 🔍\n"
     "• `reaction add 👤 whois` | نمایش اطلاعات فرستنده با 👤\n"
     "• `reaction remove 👌` | حذف mapping 👌\n"
-    "• `reaction clear` | حذف همه mapping ها\n\n"
+    "• `reaction clear` | حذف همه mapping ها\n"
+    "• `.reaction_scope group` | فعال‌سازی ری‌اکشن در گروه‌ها/سوپرگروه‌ها\n\n"
     "نکات مهم:\n"
     "• فقط ری‌اکشن‌های خودتان (self-reaction) تشخیص داده می‌شوند\n"
-    "• تنظیمات در `reactions.json` ذخیره می‌شوند\n"
-    "• Loop prevention از اجرای تکراری جلوگیری می‌کند\n"
+    "• تنظیمات mapping در `reactions.json` و scope در `reaction_scope.json` ذخیره می‌شوند\n"
+    "• Loop prevention از اجرای تکراری جلوگیری می‌کند — حتی پس از قطعی و اتصال مجدد شبکه\n"
     "• اگر اجرای مستقیم ممکن نباشد، به `send_message` fallback می‌شود\n"
 )
 

@@ -5,6 +5,101 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.0.8] — 2026-07-31
+
+### Fix — `reaction_commands.py`: Direct `clear` Invocation Always Fell Back to `send_message`
+
+**Root cause:** `MockEvent` (`modules/bridge.py`), the shim used to invoke other
+modules' command handlers directly from a reaction without going through a
+real Telegram message, had no `is_private` / `is_group` / `is_channel`
+attributes at all — unlike a real Telethon `NewMessage.Event`, which exposes
+these via its `Message`'s `ChatGetter` mixin. `clearer.py`'s `_run_clear`
+reads `event.is_private` unconditionally. Every reaction mapped to a `clear`
+command therefore raised `AttributeError` inside the direct-invocation
+attempt in `reaction_commands.py`, which silently caught the exception and
+fell through to the `send_message` fallback path — every single time. The
+"Direct Module Invocation" architecture (built specifically to avoid an
+extra network round trip and the event-loop race conditions that come with
+posting a real message and having it re-enter the event loop) was
+consequently never actually exercised for `clear`, the single most commonly
+reaction-mapped command.
+
+**Fix:** `MockEvent` now accepts `is_private`/`is_group`/`is_channel` as
+constructor parameters. `reaction_commands.py` resolves them once per
+command execution via a new shared `_classify_peer()` helper (see below) —
+normally a cache hit, since Gate 2's environment filter already classified
+the same chat moments earlier — and passes them into every `MockEvent` it
+constructs (`clear`, `join`/`left`, `info`, `whois`), so this fix requires
+zero additional API calls in the common case.
+
+### Fix — Supergroups Were Silently Treated as "Channels", Not "Groups"
+
+**Root cause:** Both supergroups and broadcast channels are represented as
+`PeerChannel` at the MTProto level; only the entity's `megagroup` flag tells
+them apart. The old environment filter treated every `PeerChannel` as a
+"channel," so the `ENABLE_FOR_GROUPS` toggle could never actually apply to a
+supergroup — only to legacy basic groups (`PeerChat`).
+
+**Fix:** New `_classify_peer()` resolves `entity.megagroup` for `PeerChannel`
+peers on first sight, cached per `channel_id` (same pattern as the existing
+bot/user cache), so supergroups are now correctly classified as `"group"`
+and only genuine broadcast channels are classified as `"channel"`.
+
+### Feature — Runtime-Configurable Reaction Scope (`.reaction_scope`)
+
+**Problem:** Which chat types `reaction_commands.py` processes reactions in
+was four hardcoded class attributes (`ENABLE_FOR_BOTS/USERS/GROUPS/CHANNELS`)
+— changing scope required editing the module's source and reloading it.
+
+**Fix:** New `.reaction_scope` command (Saved Messages only, matching the
+existing `reaction`/`reactions` commands' gating):
+- `.reaction_scope` — show which of `private`/`bot`/`group`/`channel` are
+  currently active.
+- `.reaction_scope <value>` — toggle that value on/off (run it again to
+  flip it back).
+- `.reaction_scope all` / `.reaction_scope none` — activate/deactivate
+  everything at once.
+
+Persisted per-account in a new `reaction_scope.json` (alongside
+`reactions.json`, same atomic read/write helpers, same load-at-`setup()`
+pattern). Default on first run is `["bot"]` — identical to the previous
+hardcoded default, so existing installs see no behavior change until they
+explicitly reconfigure.
+
+### Fix — Duplicate Command Execution After Reconnect
+
+**Root cause:** `_active_reactions` (Gate 5's rising-edge dedup memory) was
+unconditionally cleared in `teardown()`. `AccountReconnector.reattach()`
+calls `teardown()` then `setup()` on every reconnect — and reuses the exact
+same module instance rather than recreating it (`core/loader.py`:
+*"module instances themselves are reused — no re-import needed"*). Clearing
+the dedup map on a routine reconnect therefore made any reaction still
+present on a message look like a brand-new rising edge once Telegram's
+`catch_up` redelivered its state after reconnect, re-firing its mapped
+command a second time.
+
+**Fix:** `teardown()` no longer clears `_active_reactions`,
+`_peer_is_bot_cache`, or the new `_channel_megagroup_cache`. A genuine
+hot-reload (module file changed) still gets a fresh instance — and
+therefore fresh, empty dicts — via `create_module()` regardless, so this
+only changes behavior for the reconnect path, as intended. Verified with an
+isolated `teardown()`→`setup()` simulation.
+
+### Testing
+
+All four fixes verified with isolated functional tests (no live Telegram
+connection required): peer classification (bot/user/basic-group/supergroup/
+broadcast-channel) and its caches; scope persistence round-trip through
+`reaction_scope.json`; the full `.reaction_scope` command surface (status
+view, toggle, `all`/`none`, invalid-value handling) through `_on_command`;
+`clearer.py`'s real `_run_clear` invoked end-to-end through a `MockEvent`
+confirming the original `AttributeError` no longer occurs; and a simulated
+`AccountReconnector.reattach()` cycle confirming dedup/classification state
+now survives it. Full-project `py_compile` pass confirms no regressions
+elsewhere.
+
+---
+
 ## [3.0.7] — 2026-07-29
 
 ### Fix — Installer: Eliminated `userbot.sh` File Dependency (Termux-First Rewrite)

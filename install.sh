@@ -6,6 +6,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash
 #
 # Idempotent: re-running updates code and deps without touching accounts/, .env, or data/.
+# Any pull failure is a hard stop — this script never reports success after
+# a failed or skipped update.
 
 set -euo pipefail
 
@@ -25,9 +27,9 @@ else
 fi
 
 log()  { printf "%b[install]%b %s\n" "$C" "$R" "$1"; }
-ok()   { printf "%b[ ok ]%b %s\n"    "$G" "$R" "$1"; }
-warn() { printf "%b[warn]%b %s\n"    "$Y" "$R" "$1"; }
-die()  { printf "%b[fail]%b %s\n"    "$E" "$R" "$1"; exit 1; }
+ok()   { printf "%b[ OK ]%b %s\n"    "$G" "$R" "$1"; }
+warn() { printf "%b[WARN]%b %s\n"    "$Y" "$R" "$1"; }
+die()  { printf "%b[FAIL]%b %s\n"    "$E" "$R" "$1"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 1. Platform detection
@@ -110,17 +112,47 @@ log "Using interpreter: ${PYTHON_BIN} (Python ${PY_VERSION})"
 
 # ---------------------------------------------------------------------------
 # 3. Clone or update the repository
+#    A failed pull is a HARD STOP, never a silent warn-and-continue.
 # ---------------------------------------------------------------------------
+VERSION_FILE="${INSTALL_DIR}/VERSION"
+read_version() { [ -f "$VERSION_FILE" ] && cat "$VERSION_FILE" || echo "unknown"; }
+
+OLD_VERSION="unknown"
+OLD_SHA="none (fresh install)"
+
 if [ -d "${INSTALL_DIR}/.git" ]; then
-  log "Existing installation found at ${INSTALL_DIR}. Updating..."
-  git -C "${INSTALL_DIR}" pull --ff-only \
-    || warn "git pull failed or had local changes; leaving existing code as-is."
+  OLD_VERSION="$(read_version)"
+  OLD_SHA="$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+
+  log "Existing installation found at ${INSTALL_DIR}. Checking for local changes..."
+  DIRTY_FILES="$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null || true)"
+  if [ -n "$DIRTY_FILES" ]; then
+    warn "Local changes detected:"
+    echo "$DIRTY_FILES" | sed 's/^/       /'
+    die "Refusing to pull over local changes. Resolve them first, e.g.:
+    git -C ${INSTALL_DIR} stash
+  then re-run this installer."
+  fi
+
+  log "Pulling latest code..."
+  git -C "${INSTALL_DIR}" fetch --quiet origin \
+    || die "git fetch failed. Check your network connection and try again."
+  git -C "${INSTALL_DIR}" pull --ff-only --quiet \
+    || die "git pull --ff-only failed — local branch has diverged from origin.
+  Resolve manually:
+    cd ${INSTALL_DIR}
+    git status
+    git log --oneline -5
+    git log --oneline origin/main -5"
 elif [ -e "${INSTALL_DIR}" ]; then
   die "${INSTALL_DIR} exists but is not a git repo. Move it aside and re-run."
 else
   log "Cloning repository into ${INSTALL_DIR}..."
   git clone "${REPO_URL}" "${INSTALL_DIR}" || die "git clone failed."
 fi
+
+NEW_VERSION="$(read_version)"
+NEW_SHA="$(git -C "${INSTALL_DIR}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
 ok "Repository ready at ${INSTALL_DIR}"
 
 # ---------------------------------------------------------------------------
@@ -138,7 +170,17 @@ do
 done
 
 # ---------------------------------------------------------------------------
-# 5. Create venv and install dependencies
+# 5. Clear stale bytecode before (re)installing dependencies.
+#    Prevents a rare-but-real class of bug where an old .pyc from a prior
+#    install lingers alongside freshly pulled .py source.
+# ---------------------------------------------------------------------------
+log "Clearing stale bytecode caches..."
+find "$INSTALL_DIR" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+find "$INSTALL_DIR" -type f -name '*.pyc' -delete 2>/dev/null || true
+ok "Bytecode caches cleared."
+
+# ---------------------------------------------------------------------------
+# 6. Create venv and install dependencies
 # ---------------------------------------------------------------------------
 VENV_DIR="${INSTALL_DIR}/.venv"
 if [ ! -x "${VENV_DIR}/bin/python" ]; then
@@ -153,7 +195,7 @@ VENV_PY="${VENV_DIR}/bin/python"
 VENV_PIP="${VENV_DIR}/bin/pip"
 
 log "Upgrading pip inside the virtual environment..."
-"$VENV_PY" -m pip install --upgrade pip >/dev/null \
+"$VENV_PY" -m pip install --upgrade pip >/dev/null 2>&1 \
   || warn "pip self-upgrade failed; continuing with existing pip."
 
 REQUIREMENTS_FILE="${INSTALL_DIR}/requirements.txt"
@@ -174,8 +216,21 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Generate the launcher script directly via heredoc
-#    Hardcoded paths — no config file, no guessing.
+# 7. Post-install/update sanity check
+# ---------------------------------------------------------------------------
+log "Running sanity check (py_compile)..."
+CODE_ROOT="${INSTALL_DIR}"
+[ -d "${INSTALL_DIR}/userbot" ] && CODE_ROOT="${INSTALL_DIR}/userbot"
+if "$VENV_PY" -m compileall -q "$CODE_ROOT"; then
+  ok "All Python files compile cleanly."
+else
+  warn "One or more files failed to compile. Review the error above before running the bot."
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Generate the launcher script directly via heredoc
+#    Hardcoded paths — no config file, no guessing. Shows current version
+#    in the interactive menu header.
 # ---------------------------------------------------------------------------
 mkdir -p "$BIN_DIR"
 LAUNCHER_DEST="${BIN_DIR}/${LAUNCHER_NAME}"
@@ -206,17 +261,24 @@ VENV_PY="\${INSTALL_DIR}/.venv/bin/python"
 MAIN_PY="${MAIN_PY}"
 ADD_ACCOUNT_PY="${ADD_ACCOUNT_PY}"
 RUN_DIR="${RUN_DIR}"
+VERSION_FILE="\${INSTALL_DIR}/VERSION"
+
+G="\033[32m"; Y="\033[33m"; E="\033[31m"; B="\033[1m"; R="\033[0m"
+
+current_version() {
+  [ -f "\$VERSION_FILE" ] && cat "\$VERSION_FILE" || echo "unknown"
+}
 
 # Sanity check — clear error instead of a cryptic Python traceback
 if [ ! -d "\$INSTALL_DIR" ]; then
-  printf '\033[31m[fail]\033[0m Installation directory not found: %s\n' "\$INSTALL_DIR"
-  printf 'Re-run the installer:\n  curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash\n'
+  printf "\${E}[fail]\${R} Installation directory not found: %s\n" "\$INSTALL_DIR"
+  printf "Re-run the installer:\n  curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash\n"
   exit 1
 fi
 
 if [ ! -x "\$VENV_PY" ]; then
-  printf '\033[31m[fail]\033[0m Virtual environment not found: %s\n' "\$VENV_PY"
-  printf 'Re-run the installer:\n  curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash\n'
+  printf "\${E}[fail]\${R} Virtual environment not found: %s\n" "\$VENV_PY"
+  printf "Re-run the installer:\n  curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash\n"
   exit 1
 fi
 
@@ -233,25 +295,29 @@ case "\${1:-}" in
   update)
     exec bash -c 'curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash'
     ;;
+  version)
+    printf "userbot_own version %s\n" "\$(current_version)"
+    exit 0
+    ;;
   "")
     # Interactive menu
-    printf '\n\033[1m=== userbot_own ===\033[0m\n'
-    printf '1) Run bot\n'
-    printf '2) Manage accounts\n'
-    printf '3) Update\n'
-    printf '4) Quit\n'
-    printf 'Select an option: '
+    printf "\n\${B}=== userbot_own — v%s ===\${R}\n" "\$(current_version)"
+    printf "1) Run bot\n"
+    printf "2) Manage accounts\n"
+    printf "3) Update\n"
+    printf "4) Quit\n"
+    printf "Select an option: "
     read -r choice
     case "\$choice" in
       1) cd "\$RUN_DIR" && exec "\$VENV_PY" "\$MAIN_PY" ;;
       2) cd "\$RUN_DIR" && exec "\$VENV_PY" "\$ADD_ACCOUNT_PY" ;;
       3) exec bash -c 'curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash' ;;
       4) exit 0 ;;
-      *) printf 'Invalid option.\n'; exit 1 ;;
+      *) printf "Invalid option.\n"; exit 1 ;;
     esac
     ;;
   *)
-    printf 'Usage: userbot [run|add|update]\n'
+    printf "Usage: userbot [run|add|update|version]\n"
     exit 1
     ;;
 esac
@@ -261,8 +327,14 @@ chmod +x "$LAUNCHER_DEST"
 ok "Launcher generated and installed at ${LAUNCHER_DEST}"
 
 # ---------------------------------------------------------------------------
-# 7. PATH sanity check (Linux only)
+# 9. PATH sanity check (Linux only)
 # ---------------------------------------------------------------------------
+echo
+printf "%b%s%b\n" "$B" "──────────────────────────────────────────" "$R"
+printf "  Version:  %s (%s)  →  %s (%s)\n" "$OLD_VERSION" "$OLD_SHA" "$NEW_VERSION" "$NEW_SHA"
+printf "%b%s%b\n" "$B" "──────────────────────────────────────────" "$R"
+echo
+
 case ":$PATH:" in
   *":$BIN_DIR:"*)
     ok "Install complete! Type '${LAUNCHER_NAME}' to get started."

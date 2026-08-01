@@ -70,23 +70,19 @@ fi
 ok "Working tree clean (untracked files, if any, are not a blocker)."
 
 # ---------------------------------------------------------------------------
-# 2. Pull — and actually check whether it worked, not just whether the
-#    git command exited. A failed pull is a hard stop, not a warning.
+# 2. Sync to origin. This device is a deployment target, not a place code
+#    is developed — origin is always authoritative. We already confirmed
+#    the tracked working tree is clean (step 1), so a hard reset to origin
+#    cannot lose any uncommitted work; it can only discard local commits
+#    that were never pushed, which should not exist on a deployment target.
 # ---------------------------------------------------------------------------
 log "Fetching latest code..."
 git -C "$INSTALL_DIR" fetch --quiet origin \
   || die "git fetch failed. Check your network connection and try again."
 
-if ! git -C "$INSTALL_DIR" pull --ff-only --quiet; then
-  die "git pull --ff-only failed. Your local branch has diverged from origin
-  (e.g. a manual commit, checkout, or reset was made here previously).
-  This must be resolved manually — automatically discarding history is not
-  something this script will do without your explicit confirmation:
-    cd ${INSTALL_DIR}
-    git status
-    git log --oneline -5
-    git log --oneline origin/main -5"
-fi
+BRANCH="$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+git -C "$INSTALL_DIR" reset --hard "origin/${BRANCH}" --quiet \
+  || die "git reset --hard origin/${BRANCH} failed. Check the error above."
 
 NEW_SHA="$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
 NEW_VERSION="$(read_version)"

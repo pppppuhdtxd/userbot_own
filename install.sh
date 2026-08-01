@@ -141,13 +141,9 @@ if [ -d "${INSTALL_DIR}/.git" ]; then
   log "Pulling latest code..."
   git -C "${INSTALL_DIR}" fetch --quiet origin \
     || die "git fetch failed. Check your network connection and try again."
-  git -C "${INSTALL_DIR}" pull --ff-only --quiet \
-    || die "git pull --ff-only failed — local branch has diverged from origin.
-  Resolve manually:
-    cd ${INSTALL_DIR}
-    git status
-    git log --oneline -5
-    git log --oneline origin/main -5"
+  BRANCH="$(git -C "${INSTALL_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+  git -C "${INSTALL_DIR}" reset --hard "origin/${BRANCH}" --quiet \
+    || die "git reset --hard origin/${BRANCH} failed. Check the error above."
 elif [ -e "${INSTALL_DIR}" ]; then
   die "${INSTALL_DIR} exists but is not a git repo. Move it aside and re-run."
 else
@@ -297,6 +293,18 @@ case "\${1:-}" in
     exec "\$VENV_PY" "\$ADD_ACCOUNT_PY"
     ;;
   update)
+    # Fast path: run the lightweight updater already on disk (git sync +
+    # deps + cache clear), NOT the full installer. Falls back to the full
+    # installer only if update.sh is missing (e.g. a very old install).
+    if [ -f "\${INSTALL_DIR}/update.sh" ]; then
+      exec bash "\${INSTALL_DIR}/update.sh"
+    else
+      exec bash -c 'curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash'
+    fi
+    ;;
+  reinstall)
+    # Full reinstall: re-checks Python/git/venv from scratch. Slower —
+    # use this only if something is actually broken, not for routine updates.
     exec bash -c 'curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash'
     ;;
   version)
@@ -315,13 +323,19 @@ case "\${1:-}" in
     case "\$choice" in
       1) cd "\$RUN_DIR" && exec "\$VENV_PY" "\$MAIN_PY" ;;
       2) cd "\$RUN_DIR" && exec "\$VENV_PY" "\$ADD_ACCOUNT_PY" ;;
-      3) exec bash -c 'curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash' ;;
+      3)
+        if [ -f "\${INSTALL_DIR}/update.sh" ]; then
+          exec bash "\${INSTALL_DIR}/update.sh"
+        else
+          exec bash -c 'curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash'
+        fi
+        ;;
       4) exit 0 ;;
       *) printf "Invalid option.\n"; exit 1 ;;
     esac
     ;;
   *)
-    printf "Usage: userbot [run|add|update|version]\n"
+    printf "Usage: userbot [run|add|update|reinstall|version]\n"
     exit 1
     ;;
 esac

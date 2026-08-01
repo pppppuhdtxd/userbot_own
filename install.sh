@@ -125,9 +125,13 @@ if [ -d "${INSTALL_DIR}/.git" ]; then
   OLD_SHA="$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
 
   log "Existing installation found at ${INSTALL_DIR}. Checking for local changes..."
-  DIRTY_FILES="$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null || true)"
+  # -uno: ignore untracked files. accounts/ and data/ are expected to be
+  # untracked (or gitignored) and must never block an update on that basis
+  # alone — only modifications to already-tracked files can break a
+  # fast-forward pull.
+  DIRTY_FILES="$(git -C "$INSTALL_DIR" status --porcelain -uno 2>/dev/null || true)"
   if [ -n "$DIRTY_FILES" ]; then
-    warn "Local changes detected:"
+    warn "Local changes to tracked files detected:"
     echo "$DIRTY_FILES" | sed 's/^/       /'
     die "Refusing to pull over local changes. Resolve them first, e.g.:
     git -C ${INSTALL_DIR} stash

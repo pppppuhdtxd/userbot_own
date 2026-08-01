@@ -55,16 +55,19 @@ OLD_SHA="$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unk
 #    a modified/untracked file the update script itself doesn't own.
 # ---------------------------------------------------------------------------
 log "Checking repository state..."
-DIRTY_FILES="$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null || true)"
+# -uno: ignore untracked files. Untracked files (e.g. accounts/, data/ if not
+# yet gitignored) can never block a fast-forward pull, so they must never
+# trigger this check — only modifications to files git already tracks can.
+DIRTY_FILES="$(git -C "$INSTALL_DIR" status --porcelain -uno 2>/dev/null || true)"
 if [ -n "$DIRTY_FILES" ]; then
-  warn "Local changes detected in the install directory:"
+  warn "Local changes to tracked files detected:"
   echo "$DIRTY_FILES" | sed 's/^/         /'
   die "Cannot safely fast-forward with local changes present. Resolve or discard
   them (e.g. 'git -C ${INSTALL_DIR} stash') and re-run update. Refusing to
   guess at a merge, since that risks your account data if it lives inside
   the tracked tree."
 fi
-ok "Working tree clean."
+ok "Working tree clean (untracked files, if any, are not a blocker)."
 
 # ---------------------------------------------------------------------------
 # 2. Pull — and actually check whether it worked, not just whether the

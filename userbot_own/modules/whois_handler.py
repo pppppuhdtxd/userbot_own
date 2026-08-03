@@ -16,8 +16,33 @@ Features:
 - Bot detection with bot-specific details
 - Premium / Verified / Scam / Fake flags
 - Online status with last seen time
-- Profile photo count
+- Restriction reasons (e.g. platform-specific content restrictions), if any
+- Single most recent profile photo attached as the message media, with the
+  whois text as its caption — when publicly available under the entity's
+  own privacy settings
 - Public link (t.me/username) when available
+- Data Center (DC) ID, when available
+
+Photo attachment design (v3.0.10):
+Telegram does not allow editing a text-only message into one carrying
+media, so the "🔍 در حال دریافت..." placeholder (the outgoing `whois`
+command message itself) is deleted and replaced with a single fresh
+`send_file(..., caption=info_text)` call whenever a photo is available —
+one final message containing both the photo and the full text, rather than
+two separate messages. If no photo is available (hidden by privacy
+settings, or simply not set), the placeholder is edited to the text-only
+result exactly as before — no extra message is created either way.
+
+The `Photo` object returned by `get_profile_photos_safe()` is passed
+directly as `send_file`'s `file` argument. This is a server-side file
+reference, not raw bytes — Telethon/Telegram handle it like a forward, so
+no image data is downloaded to or re-uploaded from this device.
+
+Privacy note: this module only ever displays what Telethon's normal
+`get_entity` / `get_profile_photos` calls return under the target's own
+privacy settings. If a user has hidden their profile photo or last-seen
+status, the API returns null/empty and the corresponding detail is simply
+omitted — no attempt is made to bypass or circumvent those settings.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -31,15 +56,24 @@ from telethon.tl.types import (
     Chat,
     User,
     UserProfilePhoto,
-    UserStatusOffline,
-    UserStatusOnline,
-    UserStatusRecently,
 )
 
 from userbot_own.core.context import ModuleContext
+from userbot_own.helpers.utils import (
+    format_user_flags,
+    format_user_status,
+    get_profile_photos_safe,
+    truncate,
+)
 from userbot_own.modules.base import Module
 
 # Logging is provided by Module._log_* helpers; no module-level logger needed.
+
+# Telegram's caption limit for media messages is 1024 characters. If the
+# built whois text would exceed this, attaching it as a photo caption would
+# either fail or silently truncate server-side — safer to fall back to the
+# existing text-only message in that case than to lose information.
+_CAPTION_LIMIT = 1024
 
 
 # ── Module ──────────────────────────────────────────────────────────────────
@@ -69,20 +103,20 @@ class WhoisHandler(Module):
             # `whois` with argument
             if len(parts) == 2:
                 identifier = parts[1].strip()
-                info_text = await self._whois_by_identifier(client, identifier)
-                await self._safe_edit(event, info_text)
+                info_text, entity = await self._whois_by_identifier(client, identifier)
+                await self._finalize(event, client, info_text, entity)
                 return
 
             # `whois` with reply
             reply = await event.get_reply_message()
             if reply is not None:
-                info_text = await self._whois_by_sender(client, reply)
-                await self._safe_edit(event, info_text)
+                info_text, entity = await self._whois_by_sender(client, reply)
+                await self._finalize(event, client, info_text, entity)
                 return
 
             # `whois` without args or reply → current chat
-            info_text = await self._whois_current_chat(client, event.chat_id)
-            await self._safe_edit(event, info_text)
+            info_text, entity = await self._whois_current_chat(client, event.chat_id)
+            await self._finalize(event, client, info_text, entity)
 
         except errors.FloodWaitError as exc:
             wait_msg = f"⏳ درخواست بیش از حد — لطفاً {exc.seconds} ثانیه صبر کنید."
@@ -94,7 +128,7 @@ class WhoisHandler(Module):
 
     # ── By identifier (@username or numeric ID) ──────────────────────────
 
-    async def _whois_by_identifier(self, client: TelegramClient, identifier: str) -> str:
+    async def _whois_by_identifier(self, client: TelegramClient, identifier: str):
         """Resolve identifier (username or numeric ID) and fetch info."""
         # Normalize username
         if identifier.startswith("@"):
@@ -109,18 +143,19 @@ class WhoisHandler(Module):
         try:
             entity = await client.get_entity(target)
         except Exception as exc:
-            return f"❌ **یافت نشد:** `{identifier}`\n\nخطا: `{exc}`"
+            return f"❌ **یافت نشد:** `{identifier}`\n\nخطا: `{exc}`", None
 
-        return await self._build_entity_info(client, entity)
+        info_text = await self._build_entity_info(client, entity)
+        return info_text, entity
 
     # ── By reply sender ──────────────────────────────────────────────────
 
-    async def _whois_by_sender(self, client: TelegramClient, reply_msg) -> str:
+    async def _whois_by_sender(self, client: TelegramClient, reply_msg):
         """Fetch info about the sender of the replied message."""
         try:
             sender = await reply_msg.get_sender()
         except Exception as exc:
-            return f"❌ خطا در دریافت فرستنده: `{exc}`"
+            return f"❌ خطا در دریافت فرستنده: `{exc}`", None
 
         if sender is None:
             # Try using sender_id
@@ -129,23 +164,25 @@ class WhoisHandler(Module):
                 try:
                     sender = await client.get_entity(sender_id)
                 except Exception as exc:
-                    return f"❌ خطا در دریافت فرستنده: `{exc}`"
+                    return f"❌ خطا در دریافت فرستنده: `{exc}`", None
 
         if sender is None:
-            return "❌ فرستنده پیام یافت نشد."
+            return "❌ فرستنده پیام یافت نشد.", None
 
-        return await self._build_entity_info(client, sender)
+        info_text = await self._build_entity_info(client, sender)
+        return info_text, sender
 
     # ── Current chat ─────────────────────────────────────────────────────
 
-    async def _whois_current_chat(self, client: TelegramClient, chat_id: int) -> str:
+    async def _whois_current_chat(self, client: TelegramClient, chat_id: int):
         """Fetch info about the current chat."""
         try:
             entity = await client.get_entity(chat_id)
         except Exception as exc:
-            return f"❌ خطا در دریافت اطلاعات چت: `{exc}`"
+            return f"❌ خطا در دریافت اطلاعات چت: `{exc}`", None
 
-        return await self._build_entity_info(client, entity)
+        info_text = await self._build_entity_info(client, entity)
+        return info_text, entity
 
     # ── Entity info builder (dispatcher) ─────────────────────────────────
 
@@ -159,6 +196,65 @@ class WhoisHandler(Module):
             return await self._build_chat_info(client, entity)
         else:
             return f"❌ نوع موجودیت ناشناخته: `{type(entity).__name__}`"
+
+    # ── Restriction reasons (shared across User/Channel) ──────────────────
+
+    @staticmethod
+    def _format_restriction_reasons(entity) -> str | None:
+        """
+        Build a single formatted line summarizing `entity.restriction_reason`
+        (a list of `RestrictionReason` objects Telegram attaches when content
+        is restricted on specific platforms/regions), or None if absent.
+        This is standard metadata already returned by `get_entity` — not
+        anything requiring extra privileged access.
+        """
+        reasons = getattr(entity, "restriction_reason", None)
+        if not reasons:
+            return None
+        parts = []
+        for r in reasons:
+            platform = getattr(r, "platform", None) or "?"
+            reason_text = getattr(r, "reason", None) or ""
+            parts.append(f"{platform}: {reason_text}" if reason_text else platform)
+        return " | ".join(parts)
+
+    # ── Finalize: single-message photo+caption, or text-only fallback ─────
+
+    async def _finalize(self, event, client: TelegramClient, info_text: str, entity) -> None:
+        """
+        Attach the single most recent profile photo (if publicly available)
+        to the whois result as one combined photo+caption message, replacing
+        the placeholder. Falls back to editing the placeholder to a
+        text-only message if no photo is available, the caption would
+        exceed Telegram's length limit, or the photo send itself fails.
+        """
+        photo = None
+        if entity is not None:
+            try:
+                photos = await get_profile_photos_safe(client, entity, limit=1)
+                photo = photos[0] if photos else None
+            except errors.FloodWaitError:
+                raise
+            except Exception as exc:
+                self._log_debug("get_profile_photos_safe failed for %s: %s", entity, exc)
+                photo = None
+
+        if photo is not None and len(info_text) <= _CAPTION_LIMIT:
+            try:
+                chat = await event.get_chat()
+                await event.delete()
+                await client.send_file(chat, file=photo, caption=info_text)
+                return
+            except errors.FloodWaitError:
+                raise
+            except Exception as exc:
+                # The placeholder may already be deleted at this point; if
+                # so _safe_edit below will simply fail silently (it swallows
+                # edit errors), which is an acceptable degrade — the info
+                # was already lost from view, but the command doesn't crash.
+                self._log_debug("Photo attach failed for %s: %s", entity, exc)
+
+        await self._safe_edit(event, info_text)
 
     # ── User info ────────────────────────────────────────────────────────
 
@@ -188,23 +284,8 @@ class WhoisHandler(Module):
         if phone:
             lines.append(f"• **شماره:** `{phone}`")
 
-        # Flags
-        flags = []
-        if getattr(user, "bot", False):
-            flags.append("🤖 Bot")
-        if getattr(user, "verified", False):
-            flags.append("✅ Verified")
-        if getattr(user, "premium", False):
-            flags.append("⭐ Premium")
-        if getattr(user, "scam", False):
-            flags.append("⚠️ Scam")
-        if getattr(user, "fake", False):
-            flags.append("⚠️ Fake")
-        if getattr(user, "deleted", False):
-            flags.append("🗑 Deleted")
-        if getattr(user, "self", False):
-            flags.append("👤 خودتان")
-
+        # Flags (shared helper — includes "خودتان" for self)
+        flags = format_user_flags(user, include_self=True)
         if flags:
             lines.append(f"• **وضعیت:** {', '.join(flags)}")
         else:
@@ -215,40 +296,24 @@ class WhoisHandler(Module):
         if lang:
             lines.append(f"• **زبان:** `{lang}`")
 
-        # Profile photo count
+        # Restriction reasons, if any
+        restriction = self._format_restriction_reasons(user)
+        if restriction:
+            lines.append(f"• **محدودیت:** `{restriction}`")
+
+        # Profile photo count + DC ID
         photo = getattr(user, "photo", None)
         if isinstance(photo, UserProfilePhoto):
             photo_count = getattr(photo, "photo_count", None)
             if photo_count:
                 lines.append(f"• **عکس‌های پروفایل:** `{photo_count}`")
+            dc_id = getattr(photo, "dc_id", None)
+            if dc_id:
+                lines.append(f"• **DC ID:** `{dc_id}`")
 
-        # Online status
-        status = getattr(user, "status", None)
-        if status:
-            if isinstance(status, UserStatusOnline):
-                lines.append("• **وضعیت آنلاین:** 🟢 آنلاین")
-                expires = getattr(status, "expires", None)
-                if expires:
-                    try:
-                        exp_str = expires.strftime("%Y-%m-%d %H:%M:%S UTC")
-                        lines.append(f"  - تا: `{exp_str}`")
-                    except Exception:
-                        pass
-            elif isinstance(status, UserStatusOffline):
-                was_online = getattr(status, "was_online", None)
-                if was_online:
-                    try:
-                        was_str = was_online.strftime("%Y-%m-%d %H:%M:%S UTC")
-                        lines.append(f"• **آخرین بازدید:** `{was_str}`")
-                    except Exception:
-                        pass
-                else:
-                    lines.append("• **آخرین بازدید:** نامشخص")
-            elif isinstance(status, UserStatusRecently):
-                lines.append("• **آخرین بازدید:** اخیراً")
-            else:
-                status_name = type(status).__name__.replace("UserStatus", "")
-                lines.append(f"• **وضعیت:** {status_name}")
+        # Online status (shared helper)
+        status_lines = format_user_status(getattr(user, "status", None))
+        lines.extend(status_lines)
 
         # Try to fetch full user info (bio, etc.).
         # Re-raise FloodWaitError so the top-level handler surfaces it to the
@@ -261,13 +326,17 @@ class WhoisHandler(Module):
             # Bio / About
             about = getattr(full, "about", None)
             if about:
-                about_preview = about[:200] + ("…" if len(about) > 200 else "")
-                lines.append(f"• **بیو:** `{about_preview}`")
+                lines.append(f"• **بیو:** `{truncate(about, 200)}`")
 
             # Common chats count
             common_count = getattr(full, "common_chats_count", None)
             if common_count:
                 lines.append(f"• **چت‌های مشترک:** `{common_count}`")
+
+            # Contact / mutual-contact status — standard fields already
+            # exposed on the full-user object, no extra privileged lookup.
+            if getattr(full, "contact", False):
+                lines.append("• **مخاطب:** ✅ در لیست مخاطبین شما")
 
         except errors.FloodWaitError:
             raise
@@ -322,6 +391,11 @@ class WhoisHandler(Module):
         if flags:
             lines.append(f"• **وضعیت:** {', '.join(flags)}")
 
+        # Restriction reasons, if any
+        restriction = self._format_restriction_reasons(channel)
+        if restriction:
+            lines.append(f"• **محدودیت:** `{restriction}`")
+
         # Creation date
         creation_date = getattr(channel, "date", None)
         if creation_date:
@@ -336,6 +410,12 @@ class WhoisHandler(Module):
         if participants_count:
             lines.append(f"• **تعداد اعضا:** `{participants_count:,}`")
 
+        # DC ID from the channel's own photo stub, if present
+        channel_photo = getattr(channel, "photo", None)
+        dc_id = getattr(channel_photo, "dc_id", None) if channel_photo else None
+        if dc_id:
+            lines.append(f"• **DC ID:** `{dc_id}`")
+
         # Try to fetch full channel info for extra details.
         # Re-raise FloodWaitError so the caller can surface it to the user.
         try:
@@ -345,8 +425,7 @@ class WhoisHandler(Module):
             # About / Description
             about = getattr(full, "about", None)
             if about:
-                about_preview = about[:200] + ("…" if len(about) > 200 else "")
-                lines.append(f"• **توضیحات:** `{about_preview}`")
+                lines.append(f"• **توضیحات:** `{truncate(about, 200)}`")
 
             # Accurate participants count from full info
             full_participants = getattr(full, "participants_count", None)
@@ -438,6 +517,12 @@ class WhoisHandler(Module):
         if flags:
             lines.append(f"• **وضعیت:** {', '.join(flags)}")
 
+        # DC ID from the chat's own photo stub, if present
+        chat_photo = getattr(chat, "photo", None)
+        dc_id = getattr(chat_photo, "dc_id", None) if chat_photo else None
+        if dc_id:
+            lines.append(f"• **DC ID:** `{dc_id}`")
+
         # Try to fetch full chat info for extra details.
         # Re-raise FloodWaitError so the caller can surface it to the user.
         try:
@@ -447,8 +532,7 @@ class WhoisHandler(Module):
             # About / Description
             about = getattr(full, "about", None)
             if about:
-                about_preview = about[:200] + ("…" if len(about) > 200 else "")
-                lines.append(f"• **توضیحات:** `{about_preview}`")
+                lines.append(f"• **توضیحات:** `{truncate(about, 200)}`")
 
             # Admins count
             admins_count = getattr(full, "admins_count", None)
@@ -495,6 +579,9 @@ help_extra = (
     "• نام کامل، یوزرنیم، ID\n"
     "• وضعیت | Bot / Verified / Premium / Scam / Fake / Deleted\n"
     "• بیو (Bio) تا ۲۰۰ کاراکتر\n"
+    "• وضعیت مخاطب (در لیست مخاطبین شما یا خیر)\n"
+    "• محدودیت‌های محتوایی (در صورت وجود)\n"
+    "• DC ID (در صورت وجود عکس پروفایل)\n"
     "• تعداد عکس‌های پروفایل\n"
     "• وضعیت آنلاین / آخرین بازدید\n"
     "• لینک عمومی (t.me/username)\n"
@@ -506,12 +593,21 @@ help_extra = (
     "• لینک دعوت\n"
     "• تاریخ ساخت\n"
     "• لینک چت Discussion (در صورت وجود)\n"
-    "• وضعیت Verified / Scam / Fake\n\n"
+    "• وضعیت Verified / Scam / Fake\n"
+    "• محدودیت‌های محتوایی (در صورت وجود)\n\n"
     "اطلاعات گروه‌ها:\n"
     "• عنوان، ID\n"
     "• تعداد اعضا\n"
     "• نوع | Basic Group یا Supergroup\n"
     "• لینک (در صورت وجود)\n\n"
+    "عکس پروفایل:\n"
+    "• در صورتی که به‌صورت عمومی در دسترس باشد، آخرین عکس پروفایل به‌همراه "
+    "کل متن اطلاعات در قالب یک پیام واحد (عکس + کپشن) ارسال می‌شود\n"
+    "• ارسال عکس کاملاً سمت سرور تلگرام انجام می‌شود؛ دانلود یا آپلود "
+    "مجدد فایل روی دستگاه شما انجام نمی‌شود\n"
+    "• اگر کاربر عکس پروفایل خود را مخفی کرده یا عکسی نداشته باشد، یا "
+    "متن اطلاعات بیش از حد مجاز کپشن تلگرام باشد، فقط متن اطلاعات "
+    "نمایش داده می‌شود (بدون هیچ تلاشی برای دور زدن تنظیمات حریم خصوصی)\n\n"
     "مثال‌ها:\n"
     "• `whois` در یک کانال | نمایش اطلاعات کانال\n"
     "• `whois @durov` | اطلاعات Pavel Durov\n"
@@ -522,6 +618,8 @@ help_extra = (
     "• بیو و توضیحات تا ۲۰۰ کاراکتر نمایش داده می‌شوند\n"
     "• برای کانال‌های خصوصی، برخی اطلاعات ممکن است در دسترس نباشد\n"
     "• وضعیت آنلاین دقیق فقط برای مخاطبین قابل مشاهده است\n"
+    "• عکس پروفایل فقط در صورتی نمایش داده می‌شود که تنظیمات حریم "
+    "خصوصی هدف اجازه دهد\n"
 )
 
 WhoisHandler.help_text = help_text

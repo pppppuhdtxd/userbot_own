@@ -75,8 +75,10 @@ from telethon.tl.types import (
 from userbot_own.core.context import ModuleContext
 from userbot_own.helpers.utils import (
     classify_message,
+    format_user_flags,
     get_file_extension,
     get_file_size,
+    truncate,
 )
 from userbot_own.modules.base import Module
 
@@ -401,10 +403,9 @@ class InfoHandler(Module):
                 if wp.site_name:
                     lines.append(f"• Site: `{wp.site_name}`")
                 if wp.title:
-                    lines.append(f"• Title: `{wp.title[:100]}{'…' if len(wp.title) > 100 else ''}`")
+                    lines.append(f"• Title: `{truncate(wp.title, 100)}`")
                 if wp.description:
-                    desc = wp.description[:150] + ("…" if len(wp.description) > 150 else "")
-                    lines.append(f"• Description: `{desc}`")
+                    lines.append(f"• Description: `{truncate(wp.description, 150)}`")
                 if wp.duration:
                     lines.append(f"• Duration: `{wp.duration}s`")
                 if wp.author:
@@ -475,9 +476,7 @@ class InfoHandler(Module):
         elif isinstance(media, MessageMediaPoll):
             lines.append("• نوع: **Poll**")
             if media.poll:
-                question = media.poll.question
-                q_trunc = question[:100] + ("…" if len(question) > 100 else "")
-                lines.append(f"• Question: `{q_trunc}`")
+                lines.append(f"• Question: `{truncate(media.poll.question, 100)}`")
                 if media.results and media.results.total_voters is not None:
                     lines.append(f"• Votes: `{media.results.total_voters}`")
 
@@ -576,20 +575,7 @@ class InfoHandler(Module):
 
             lines.append(f"• ID: `{sender.id}`")
 
-            flags = []
-            if getattr(sender, 'bot', False):
-                flags.append("🤖 Bot")
-            if getattr(sender, 'verified', False):
-                flags.append("✅ Verified")
-            if getattr(sender, 'premium', False):
-                flags.append("⭐ Premium")
-            if getattr(sender, 'scam', False):
-                flags.append("⚠️ Scam")
-            if getattr(sender, 'fake', False):
-                flags.append("⚠️ Fake")
-            if getattr(sender, 'deleted', False):
-                flags.append("🗑 Deleted")
-
+            flags = format_user_flags(sender, include_self=False)
             if flags:
                 lines.append(f"• وضعیت: {', '.join(flags)}")
             else:
@@ -603,8 +589,24 @@ class InfoHandler(Module):
                         was_str = sender.status.was_online.strftime("%Y-%m-%d %H:%M")
                         lines.append(f"• آخرین بازدید: `{was_str}`")
 
-        elif isinstance(sender, (Channel, Chat)):
-            lines.append("• نوع: Group/Channel")
+        elif isinstance(sender, Channel):
+            # v3.0.10 fix: previously always printed the generic
+            # "Group/Channel" label for anonymous channel-admin posts /
+            # linked-channel posts, unlike _get_chat_section below, which
+            # already distinguishes Channel vs. Supergroup for the same
+            # underlying entity type. Now uses the same labeling.
+            if sender.broadcast:
+                lines.append("• نوع: 📢 Channel")
+            elif sender.megagroup:
+                lines.append("• نوع: 👥 Supergroup")
+            else:
+                lines.append("• نوع: 📢 Channel/Group")
+            if hasattr(sender, "title"):
+                lines.append(f"• Title: `{sender.title}`")
+            lines.append(f"• ID: `{sender.id}`")
+
+        elif isinstance(sender, Chat):
+            lines.append("• نوع: 👥 Group (Basic)")
             if hasattr(sender, "title"):
                 lines.append(f"• Title: `{sender.title}`")
             lines.append(f"• ID: `{sender.id}`")
@@ -691,8 +693,7 @@ class InfoHandler(Module):
 
         preview = (reply.text or reply.message or "")
         if preview:
-            preview = preview[:100] + ("…" if len(preview) > 100 else "")
-            preview = preview.replace("\n", " ")
+            preview = truncate(preview, 100).replace("\n", " ")
             lines.append(f"• Preview: `{preview}`")
 
         return "\n".join(lines)
@@ -714,7 +715,8 @@ help_extra = (
     "• آمار | بازدید و فوروارد (برای کانال‌ها)\n"
     "• محتوا | نوع پیام بر اساس سیستم طبقه‌بندی\n"
     "• Entities | Bold, Italic, Code, URL, Mention و غیره\n"
-    "• فرستنده | نام، یوزرنیم، ID، وضعیت (Bot/Verified/Premium)\n"
+    "• فرستنده | نام، یوزرنیم، ID، وضعیت (Bot/Verified/Premium)، "
+    "نوع Channel/Supergroup/Group برای فرستنده‌های ناشناس\n"
     "• چت | نوع چت، عنوان، لینک عمومی، تعداد اعضا\n"
     "• Reply | اطلاعات پیام reply شده\n\n"
     "جزئیات اختصاصی هر نوع:\n"

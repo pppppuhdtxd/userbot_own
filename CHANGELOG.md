@@ -5,6 +5,116 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.0.10] — 2026-08-03
+
+**Source:** AI (whois_handler / info_handler UX and DRY pass)
+
+### Added — `whois_handler.py`: Single-Message Profile Photo Attachment
+
+**What:** `whois` now attaches the entity's single most recent profile
+photo — for `User`, `Channel`, and `Chat` entities alike — as one combined
+photo+caption message, replacing the placeholder outright, instead of a
+text-only message.
+
+**Design history:** An earlier draft of this release sent the text info
+first and then a *separate* follow-up message with up to 3 photos as an
+album. That was reworked before release for a cleaner single-message UX:
+Telegram doesn't allow editing a text-only message into one carrying media,
+so the placeholder (the outgoing `whois` command message itself) is now
+deleted and replaced with a single `send_file(chat, file=photo,
+caption=info_text)` call whenever a photo is available. The result is
+exactly one final message per `whois` invocation, containing both the
+photo and the full text — never two. The album/carousel logic (limit=3,
+media-group send, single-photo fallback) was dropped entirely in favor of
+fetching just the single most recent photo (`limit=1`).
+
+**Fallback behavior (all in one message or none):**
+- Photo available, caption text ≤ Telegram's 1024-character caption limit
+  → single photo+caption message.
+- No photo available (hidden by privacy settings, or none set), caption
+  text too long for a caption, or the photo send itself fails for any
+  reason → falls back to editing the placeholder to the original
+  text-only result, exactly as before this feature existed. No follow-up
+  or partial message is ever left behind.
+
+**Zero-download server-side attachment:** the `Photo` object returned by
+`get_profile_photos_safe()` is passed directly as `send_file`'s `file`
+argument. This is a server-side file reference, not raw bytes — Telegram
+handles it the same way it handles a forward, so no image data is
+downloaded to or re-uploaded from this device. Only an explicit
+`download_media()` call would pull bytes locally, and nothing in this path
+does that.
+
+This never attempts to access anything beyond what `client.get_profile_photos`
+already returns under the entity's own privacy settings — an empty result is
+treated as final (text-only fallback), not retried or worked around.
+
+### Added — `whois_handler.py`: DC ID, Restriction Reasons, and Contact Status
+
+- `_build_user_info` now surfaces the account's Data Center ID (`dc_id`)
+  when available from the profile photo stub, and `_build_channel_info` /
+  `_build_chat_info` do the same from the channel's/chat's own photo stub.
+- All three builders now surface `restriction_reason` (Telegram's own
+  platform-specific content restriction metadata), when present — standard
+  data already returned by `get_entity`, not anything requiring extra
+  privileged access.
+- `_build_user_info` now shows whether the target is in the account's own
+  contact list (`full_user.contact`), a standard field on the existing
+  `GetFullUserRequest` response that was already being fetched but not
+  displayed.
+
+### Changed — `whois_handler.py` / `info_handler.py`: Extracted Shared Formatting Helpers
+
+**Root cause:** `whois_handler._build_user_info` and
+`info_handler._get_sender_section` each independently built near-identical
+flag badge lists (Bot / Verified / Premium / Scam / Fake / Deleted) and
+independently formatted `UserStatusOnline` / `UserStatusOffline` /
+`UserStatusRecently` objects, with small, easy-to-drift inconsistencies
+between the two (e.g. only `whois_handler` showed the "خودتان" self flag or
+expiry time on online status). Both modules also each had their own
+`text[:n] + ("…" if len(text) > n else "")` truncation one-liner repeated
+several times.
+
+**Fix:** Extracted `format_user_flags()`, `format_user_status()`, and
+`truncate()` into `helpers/utils.py`; both modules now call the shared
+versions. No behavioral change to existing output beyond the two
+inconsistencies above now being resolved the same way in both modules.
+
+### Added — `helpers/utils.py`: `get_profile_photos_safe()`
+
+New shared helper wrapping `client.get_profile_photos(entity, limit=1)`
+(default limit reduced from an earlier `3` once the album approach above
+was dropped in favor of a single photo). Follows this codebase's
+established FloodWait convention (see the 3.0.9 `whois_handler.py` /
+`info_handler.py` entries below): explicitly re-raises
+`errors.FloodWaitError` before any generic fallback, so a rate limit hit
+while fetching photos surfaces the normal "please wait N seconds" message
+instead of silently degrading to text-only.
+
+### Fix — `info_handler.py`: Anonymous Channel/Group Sender Missing Broadcast/Megagroup Distinction
+
+**Root cause:** `_get_sender_section`'s `Channel`/`Chat` branch (for
+messages sent by an anonymous channel admin or linked-channel post) only
+ever printed the generic "Group/Channel" label, unlike `_get_chat_section`,
+which already distinguishes Channel vs. Supergroup vs. basic Group for the
+*chat* itself. The two sections could disagree in wording for the same
+underlying entity type.
+
+**Fix:** `_get_sender_section`'s Channel/Chat branch now uses the same
+broadcast/megagroup/basic-group labeling as `_get_chat_section`.
+
+### Changed — `whois_handler.py` / `info_handler.py`: Help Text Updated
+
+`help_text` / `help_extra` in `whois_handler.py` now document the final
+single-message photo+caption behavior (one combined message when a photo
+is available and fits the caption limit, text-only otherwise — never an
+album, never two messages), plus the new restriction-reason and
+contact-status fields. No functional changes to `info_handler.py`'s help
+text beyond noting the shared-helper refactor did not change its
+documented behavior.
+
+---
+
 ## [3.0.9] — 2026-08-02
 
 Applied from a full 12-module review (clearer, auto_clearer, auto_forwarder,

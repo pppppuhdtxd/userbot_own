@@ -54,6 +54,9 @@ from telethon.tl.types import (
     MessageMediaPhoto,
     MessageMediaWebPage,
     ReplyInlineMarkup,
+    UserStatusOffline,
+    UserStatusOnline,
+    UserStatusRecently,
 )
 from telethon.tl.types import messages as tl_msg_types
 
@@ -89,6 +92,11 @@ __all__ = [
     # JSON settings persistence
     "read_json_file",
     "write_json_file_atomic",
+    # Entity/user formatting (v3.0.10)
+    "format_user_flags",
+    "format_user_status",
+    "truncate",
+    "get_profile_photos_safe",
 ]
 
 
@@ -685,3 +693,169 @@ def write_json_file_atomic(
         return None
     except OSError as exc:
         return exc
+
+
+# ── Entity/user formatting (v3.0.10) ─────────────────────────────────────────
+#
+# Extracted from whois_handler.py's `_build_user_info` and info_handler.py's
+# `_get_sender_section`, which each independently built near-identical flag
+# badge lists and status text, with small inconsistencies between the two
+# (e.g. only whois_handler showed the "خودتان" self-flag or the online-status
+# expiry time). Both call sites now use these shared versions.
+
+def truncate(text: str, n: int) -> str:
+    """
+    Truncate *text* to at most *n* characters, appending an ellipsis (…) if
+    it was actually cut. Safe for ``None``/empty input.
+
+    Example:
+        >>> truncate("hello world", 5)
+        'hello…'
+        >>> truncate("hi", 5)
+        'hi'
+    """
+    if not text:
+        return text or ""
+    return text[:n] + ("…" if len(text) > n else "")
+
+
+def format_user_flags(user, *, include_self: bool = False) -> list[str]:
+    """
+    Build the standard list of badge strings (Bot / Verified / Premium /
+    Scam / Fake / Deleted / …) for a Telethon ``User`` entity, based only on
+    the boolean flags the API already exposes on that entity.
+
+    Args:
+        user:         A Telethon ``User`` object (or any object exposing the
+                      same boolean attributes via ``getattr``).
+        include_self: If ``True``, appends "👤 خودتان" when ``user.self`` is
+                      set (whois_handler's behavior). info_handler's sender
+                      section does not show this, so it defaults to ``False``.
+
+    Returns:
+        List of human-readable flag strings, in a fixed, consistent order.
+        Empty list if no flags apply.
+
+    Example:
+        >>> format_user_flags(bot_user)
+        ['🤖 Bot']
+    """
+    flags: list[str] = []
+    if getattr(user, "bot", False):
+        flags.append("🤖 Bot")
+    if getattr(user, "verified", False):
+        flags.append("✅ Verified")
+    if getattr(user, "premium", False):
+        flags.append("⭐ Premium")
+    if getattr(user, "scam", False):
+        flags.append("⚠️ Scam")
+    if getattr(user, "fake", False):
+        flags.append("⚠️ Fake")
+    if getattr(user, "deleted", False):
+        flags.append("🗑 Deleted")
+    if include_self and getattr(user, "self", False):
+        flags.append("👤 خودتان")
+    return flags
+
+
+def format_user_status(status) -> list[str]:
+    """
+    Format a Telethon ``UserStatus*`` object into display-ready lines
+    (already prefixed with "• **...**" bullet markup, matching this
+    codebase's existing whois/info output style).
+
+    Handles ``UserStatusOnline`` (with expiry, if present),
+    ``UserStatusOffline`` (with last-seen time, if the target's privacy
+    settings expose it), ``UserStatusRecently``, and falls back to a generic
+    label for any other/unknown status type. Returns an empty list for
+    ``None`` — this is the normal "status hidden by privacy settings" case
+    and is not treated as an error anywhere that calls this helper.
+
+    Example:
+        >>> format_user_status(None)
+        []
+        >>> format_user_status(some_online_status)
+        ['• **وضعیت آنلاین:** 🟢 آنلاین']
+    """
+    if status is None:
+        return []
+
+    lines: list[str] = []
+
+    if isinstance(status, UserStatusOnline):
+        lines.append("• **وضعیت آنلاین:** 🟢 آنلاین")
+        expires = getattr(status, "expires", None)
+        if expires:
+            try:
+                exp_str = expires.strftime("%Y-%m-%d %H:%M:%S UTC")
+                lines.append(f"  - تا: `{exp_str}`")
+            except Exception:
+                pass
+    elif isinstance(status, UserStatusOffline):
+        was_online = getattr(status, "was_online", None)
+        if was_online:
+            try:
+                was_str = was_online.strftime("%Y-%m-%d %H:%M:%S UTC")
+                lines.append(f"• **آخرین بازدید:** `{was_str}`")
+            except Exception:
+                pass
+        else:
+            lines.append("• **آخرین بازدید:** نامشخص")
+    elif isinstance(status, UserStatusRecently):
+        lines.append("• **آخرین بازدید:** اخیراً")
+    else:
+        status_name = type(status).__name__.replace("UserStatus", "")
+        lines.append(f"• **وضعیت:** {status_name}")
+
+    return lines
+
+
+async def get_profile_photos_safe(client, entity, limit: int = 1) -> list:
+    """
+    Fetch up to *limit* of *entity*'s most recent profile photos via
+    ``client.get_profile_photos()``. Defaults to ``limit=1`` — callers that
+    only need the single most recent photo (the common case) get back a
+    list of at most one ``Photo`` object.
+
+    This only ever returns what Telegram's API is willing to expose under
+    the target's own privacy settings — if photos are hidden or none are
+    set, ``get_profile_photos`` itself returns an empty list (not an error),
+    and that is passed through unchanged here. No attempt is made to work
+    around or bypass that.
+
+    Zero-download note: the ``Photo`` objects returned here carry a server
+    file reference only — no image bytes are downloaded by this call. A
+    caller that passes one of these ``Photo`` objects straight into
+    ``client.send_file(chat, file=photo, ...)`` gets a server-side
+    copy/forward (Telegram MTProto handles it entirely on their end), not a
+    download-then-reupload round trip. Only calling something like
+    ``client.download_media(photo)`` would pull bytes locally — this helper
+    never does that.
+
+    ``FloodWaitError`` is deliberately re-raised (not swallowed) so callers
+    can surface a "please wait N seconds" message, matching the FloodWait
+    convention used everywhere else in this codebase. Any other exception is
+    logged and treated as "no photos available" — a fetch failure should
+    degrade to text-only output, not crash the calling command.
+
+    Args:
+        client: Active ``TelegramClient``.
+        entity: The user/channel/chat entity to fetch photos for.
+        limit:  Max number of photos to return (default 1).
+
+    Returns:
+        List of ``Photo`` objects (possibly empty), most-recent-first.
+
+    Example:
+        >>> photos = await get_profile_photos_safe(client, user)
+        >>> if photos:
+        ...     await client.send_file(chat, file=photos[0], caption=info_text)
+    """
+    try:
+        photos = await client.get_profile_photos(entity, limit=limit)
+        return list(photos) if photos else []
+    except errors.FloodWaitError:
+        raise
+    except Exception as exc:
+        log.debug("get_profile_photos_safe failed for %s: %s", entity, exc)
+        return []

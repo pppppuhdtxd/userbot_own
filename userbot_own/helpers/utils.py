@@ -204,24 +204,48 @@ async def batch_delete(
         Deleted 5 messages
     """
     deleted = 0
+    _MAX_BATCH_FW_RETRIES = 5
     for i in range(0, len(ids), batch_size):
         batch = ids[i : i + batch_size]
-        try:
-            results = await client.delete_messages(entity, batch, revoke=True)
-            deleted += _pts_count(results)
-        except errors.FloodWaitError as exc:
-            log.warning("batch_delete: FloodWait %ds — waiting…", exc.seconds)
-            await asyncio.sleep(exc.seconds)
+
+        # v3.0.9: small proactive pacing between batches (mirrors the
+        # wait_time mitigation already used on iter_messages scans) so a
+        # large clear doesn't fire many delete_messages calls back-to-back
+        # — the burst pattern most likely to trigger FloodWait in the
+        # first place, rather than just reacting to it after the fact.
+        if i > 0:
+            await asyncio.sleep(0.5)
+
+        attempt = 0
+        while True:
             try:
                 results = await client.delete_messages(entity, batch, revoke=True)
                 deleted += _pts_count(results)
-            except Exception as retry_exc:
-                log.error("batch_delete: retry failed — %s", retry_exc)
-        except Exception as exc:
-            log.error("batch_delete: batch failed (%s) — one-by-one fallback.", exc)
-            for mid in batch:
-                if await safe_delete(client, entity, mid):
-                    deleted += 1
+                break
+            except errors.FloodWaitError as exc:
+                attempt += 1
+                if attempt > _MAX_BATCH_FW_RETRIES:
+                    # v3.0.9: previously gave up silently after exactly one
+                    # retry regardless of the new wait time — a second
+                    # consecutive FloodWait on the same batch would drop
+                    # its deletions with no further attempt. Now retries
+                    # up to a cap, honoring each new exc.seconds.
+                    log.error(
+                        "batch_delete: FloodWait retry cap (%d) exceeded — "
+                        "skipping remaining batch.", _MAX_BATCH_FW_RETRIES,
+                    )
+                    break
+                log.warning(
+                    "batch_delete: FloodWait %ds (attempt %d/%d) — waiting…",
+                    exc.seconds, attempt, _MAX_BATCH_FW_RETRIES,
+                )
+                await asyncio.sleep(exc.seconds)
+            except Exception as exc:
+                log.error("batch_delete: batch failed (%s) — one-by-one fallback.", exc)
+                for mid in batch:
+                    if await safe_delete(client, entity, mid):
+                        deleted += 1
+                break
     return deleted
 
 

@@ -24,7 +24,7 @@ _version_file = Path(__file__).parent.parent / "VERSION"
 # or empty). Kept in sync with the actual VERSION file content so a
 # missing/corrupted VERSION file doesn't silently report a stale,
 # multiple-versions-old number.
-_FALLBACK_VERSION = "3.0.8"
+_FALLBACK_VERSION = "3.0.9"
 
 try:
     __version__ = _version_file.read_text(encoding="utf-8").strip() or _FALLBACK_VERSION

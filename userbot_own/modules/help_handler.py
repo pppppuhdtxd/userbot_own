@@ -109,9 +109,12 @@ class HelpHandler(Module):
         visible_modules = 0
 
         # Group modules by category
-        grouped: dict[str, list[tuple[str, str, str]]] = {
-            cat: [] for cat, _ in CATEGORIES
-        }
+        # v3.0.9 fix: previously `{cat: [] for cat, _ in CATEGORIES}` and
+        # indexed directly with `grouped[cat_key]` — a future MODULE_MAP
+        # entry whose category string didn't exactly match one in
+        # CATEGORIES would raise an unhandled KeyError and crash the whole
+        # `help` command. setdefault() makes this defensive instead.
+        grouped: dict[str, list[tuple[str, str, str]]] = {}
 
         for stem in loaded_stems:
             if stem not in MODULE_MAP:
@@ -129,44 +132,68 @@ class HelpHandler(Module):
             if not help_text.strip():
                 continue
 
-            grouped[cat_key].append((stem, desc, help_text.strip()))
+            grouped.setdefault(cat_key, []).append((stem, desc, help_text.strip()))
             visible_modules += 1
             total_commands += help_text.count("•")
 
         # Build output
-        lines: list[str] = []
+        header_lines: list[str] = [
+            "راهنمای Userbot",
+            "━" * 20,
+            f"ماژول‌ها: {visible_modules} | دستورات: {total_commands}",
+            "",
+        ]
+        footer_lines: list[str] = [
+            "━" * 20,
+            "برای جزئیات: `help <نام ماژول>`",
+            "مثال: `help clearer` یا `help join_left`",
+        ]
 
-        # Header
-        lines.append("راهنمای Userbot")
-        lines.append("━" * 20)
-        lines.append(f"ماژول‌ها: {visible_modules} | دستورات: {total_commands}")
-        lines.append("")
-
-        # Categories
+        # Categories, each rendered as its own block so a length-based
+        # split (below) can never cut one in half.
+        category_blocks: list[str] = []
         for cat_key, cat_label in CATEGORIES:
             items = grouped.get(cat_key, [])
             if not items:
                 continue
 
-            # Category header
-            lines.append(cat_label)
-            lines.append("")
-
-            # Modules in this category
+            block_lines = [cat_label, ""]
             for stem, desc, help_text in items:
-                lines.append(f"{stem} | {desc}")
-                lines.append(help_text)
-                lines.append("")
+                block_lines.append(f"{stem} | {desc}")
+                block_lines.append(help_text)
+                block_lines.append("")
+            category_blocks.append("\n".join(block_lines))
 
-        # Footer
-        lines.append("━" * 20)
-        lines.append("برای جزئیات: `help <نام ماژول>`")
-        lines.append("مثال: `help clearer` یا `help join_left`")
-
-        output = "\n".join(lines)
+        # v3.0.9 fix: Telegram's plain-text message limit is ~4096
+        # characters. The old code always sent one `event.edit(output)`
+        # with every module's full help_text concatenated together — with
+        # enough modules (well within range of what this project already
+        # has), that silently overflowed the limit and the whole `help`
+        # command did nothing, with only a log line and zero user-facing
+        # feedback. Now split into multiple messages by category block
+        # if needed, so a chat with many modules degrades to "more than
+        # one message" instead of "no output at all".
+        _MAX_CHUNK = 3500  # margin below Telegram's ~4096 char limit
+        chunks: list[str] = []
+        current = "\n".join(header_lines)
+        for block in category_blocks:
+            candidate = current + "\n" + block if current else block
+            if len(candidate) > _MAX_CHUNK and current:
+                chunks.append(current)
+                current = block
+            else:
+                current = candidate
+        current = current + "\n" + "\n".join(footer_lines) if current else "\n".join(footer_lines)
+        if len(current) > _MAX_CHUNK and chunks:
+            chunks.append(current[:_MAX_CHUNK])
+            chunks.append(current[_MAX_CHUNK:])
+        else:
+            chunks.append(current)
 
         try:
-            await event.edit(output)
+            await event.edit(chunks[0])
+            for extra_chunk in chunks[1:]:
+                await event.respond(extra_chunk)
         except Exception as exc:
             self._log_error("Failed to show help: %s", exc)
 

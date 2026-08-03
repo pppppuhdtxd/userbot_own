@@ -237,11 +237,17 @@ def extract_telegram_entities(text: str | None) -> list[tuple[str, str | int]]:
     entities: list[tuple[str, str | int]] = []
 
     # Private channel links: t.me/c/1234567890/123
+    # Track which numeric spans came from here so the generic numeric_id
+    # pass below doesn't also re-extract the same digits as a second,
+    # duplicate entity for the same chat (v3.0.9 fix — see numeric_id loop).
+    channel_id_values: set[int] = set()
     for m in re.finditer(
         r'https?://(?:www\.)?(?:t\.me|telegram\.me|telegram\.org)/c/(\d{10,15})/\d+',
         text, re.IGNORECASE,
     ):
-        entities.append(('channel_id', int(m.group(1))))
+        value = int(m.group(1))
+        entities.append(('channel_id', value))
+        channel_id_values.add(value)
 
     # Usernames: @name or t.me/name
     for m in re.finditer(
@@ -263,9 +269,16 @@ def extract_telegram_entities(text: str | None) -> list[tuple[str, str | int]]:
     ):
         entities.append(('invite_link', m.group(1) + m.group(2)))
 
-    # Numeric IDs
+    # Numeric IDs — skip any digit run already captured above as a
+    # channel_id (v3.0.9 fix: a t.me/c/<id>/<msg> link's ID is embedded in
+    # the URL as a plain digit run too, so this generic pass used to
+    # re-extract it a second time as a distinct ('numeric_id', ...) entity,
+    # causing the join loop to process the same chat twice).
     for m in re.finditer(r'\b(\d{9,14})\b', text):
-        entities.append(('numeric_id', int(m.group(1))))
+        value = int(m.group(1))
+        if value in channel_id_values:
+            continue
+        entities.append(('numeric_id', value))
 
     return entities
 
@@ -1686,10 +1699,27 @@ class JoinLeft(Module):
 
                     if entity_type == "channel_id":
                         chan_id = int(f"-100{identifier}")
+                        # v3.0.9 fix: this previously only called
+                        # get_entity(), which resolves/caches an entity but
+                        # never actually joins it — a not-yet-member public
+                        # channel could be reported as "✅ joined" while the
+                        # account's membership never changed. Now actually
+                        # issues JoinChannelRequest; "already a member" is
+                        # still treated as success via the shared check.
                         try:
-                            joined_entity = await client.get_entity(chan_id)
+                            ip = await client.get_input_entity(chan_id)
                         except Exception:
-                            joined_entity = await client.get_entity(identifier)
+                            ip = await client.get_input_entity(identifier)
+                        try:
+                            updates = await client(JoinChannelRequest(ip))
+                            joined_entity = updates.chats[0] if updates.chats else await client.get_entity(ip)
+                        except errors.UserAlreadyParticipantError:
+                            joined_entity = await client.get_entity(ip)
+                        except Exception as exc:
+                            if self._is_already_member_error(exc):
+                                joined_entity = await client.get_entity(ip)
+                            else:
+                                raise
 
                     elif entity_type == "username":
                         try:
@@ -1702,13 +1732,47 @@ class JoinLeft(Module):
                         except (errors.UsernameNotOccupiedError, errors.ChannelPrivateError):
                             raise
                         except Exception as exc:
+                            # v3.0.9 fix: this used to call get_entity() in
+                            # BOTH branches regardless of the condition,
+                            # meaning any join failure that wasn't one of
+                            # the two re-raised types above — including
+                            # PeerFloodError / UserBannedInChannelError,
+                            # Telegram's own anti-spam responses to a join
+                            # flood — was silently treated as a successful
+                            # join whenever get_entity() happened to still
+                            # resolve the (often-public) target. Only a
+                            # genuine "already a member" error should be
+                            # treated as success; anything else must
+                            # re-raise so it's reported as a real failure.
                             if self._is_already_member_error(exc):
                                 joined_entity = await client.get_entity(f"@{identifier}")
                             else:
-                                joined_entity = await client.get_entity(f"@{identifier}")
+                                raise
 
                     elif entity_type == "numeric_id":
+                        # v3.0.9 fix: get_entity() alone never joins
+                        # anything — it only resolves/caches. A bare
+                        # numeric ID for a channel the account isn't a
+                        # member of would previously "succeed" here (if
+                        # public/cached) with no actual membership change.
+                        # If the resolved entity is a Channel, actually
+                        # join it; users/basic Chats have no equivalent
+                        # "join by numeric ID" action, so those are left
+                        # as a plain resolve (which is all that's possible
+                        # for a User, and a basic Chat requires an invite
+                        # from an existing member, not a self-service join).
                         joined_entity = await client.get_entity(identifier)
+                        if isinstance(joined_entity, Channel):
+                            try:
+                                ip = await client.get_input_entity(joined_entity)
+                                updates = await client(JoinChannelRequest(ip))
+                                if updates.chats:
+                                    joined_entity = updates.chats[0]
+                            except errors.UserAlreadyParticipantError:
+                                pass
+                            except Exception as exc:
+                                if not self._is_already_member_error(exc):
+                                    raise
 
                     elif entity_type == "invite_link":
 

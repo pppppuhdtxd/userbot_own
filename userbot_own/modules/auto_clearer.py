@@ -39,12 +39,13 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, events
 from telethon.tl.types import User
 from telethon.utils import get_display_name
 
 from userbot_own.core.context import ModuleContext
 from userbot_own.helpers.utils import (
+    batch_delete,
     classify_message,
     read_json_file,
     safe_delete,
@@ -222,6 +223,11 @@ class AutoClearer(Module):
         if msg is None:
             return
 
+        # v3.0.9 fix: help_extra explicitly promises pinned messages are
+        # never auto-cleared, but this check never actually existed.
+        if getattr(msg, "pinned", False):
+            return
+
         bot = await self._is_bot_chat(event.client, event.chat_id)
         if bot is None:
             return
@@ -339,9 +345,18 @@ class AutoClearer(Module):
                     f"🗑️ در حال پاک کردن پیام‌های قدیمی `{ftype}` در همه بات‌ها (scope {scope})..."
                 )
                 total = 0
+                first = True
                 async for dialog in event.client.iter_dialogs():
                     ent = dialog.entity
                     if isinstance(ent, User) and ent.bot:
+                        # v3.0.9 fix: this used to fire a full-history scan
+                        # + batch delete for every bot dialog back-to-back
+                        # with no pacing — the single highest FloodWait
+                        # risk in this module. A short pause between bots
+                        # spreads the burst out.
+                        if not first:
+                            await asyncio.sleep(1.5)
+                        first = False
                         bot_setting = self._bots.get(ent.id, {}).get(
                             ftype, self._global[ftype]
                         )
@@ -370,12 +385,17 @@ class AutoClearer(Module):
         self, client: TelegramClient, entity, settings: dict[str, dict]
     ) -> int:
         """Delete historical messages matching the given filter settings."""
-        deleted = 0
         ids: list[int] = []
         history_limit = self.context.settings.history_limit
         try:
-            async for msg in client.iter_messages(entity, limit=history_limit):
+            # v3.0.9: wait_time mirrors clearer.py's FloodWait mitigation
+            # for large scans, applied consistently here too.
+            async for msg in client.iter_messages(entity, limit=history_limit, wait_time=1):
                 if msg is None:
+                    continue
+                # v3.0.9 fix: help_extra promises pinned messages are never
+                # cleared; this historical sweep never actually checked.
+                if getattr(msg, "pinned", False):
                     continue
                 for ftype, cfg in settings.items():
                     if cfg["state"] and _message_matches_filter(msg, ftype):
@@ -384,22 +404,13 @@ class AutoClearer(Module):
         except Exception as exc:
             self._log_error("_clear_past scan error: %s", exc)
 
-        if ids:
-            for i in range(0, len(ids), 100):
-                batch = ids[i:i + 100]
-                try:
-                    await client.delete_messages(entity, batch)
-                    deleted += len(batch)
-                except errors.FloodWaitError as exc:
-                    await asyncio.sleep(exc.seconds)
-                    try:
-                        await client.delete_messages(entity, batch)
-                        deleted += len(batch)
-                    except Exception as retry_exc:
-                        self._log_error("_clear_past retry error: %s", retry_exc)
-                except Exception as exc:
-                    self._log_error("_clear_past batch error: %s", exc)
-        return deleted
+        if not ids:
+            return 0
+
+        # v3.0.9 fix: reuse the shared batch_delete helper (accurate
+        # pts_count-based counting, consistent FloodWait retry) instead of
+        # a separately-maintained, less accurate inline implementation.
+        return await batch_delete(client, entity, ids)
 
     # ── Status display ────────────────────────────────────────────────────
 

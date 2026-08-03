@@ -116,6 +116,11 @@ class Clearer(Module):
         # Populated lazily in _is_bot_sender() to avoid per-message
         # get_entity() calls (which were a hidden FloodWait risk).
         self._bot_peer_cache: dict[int, bool] = {}
+        # v3.0.9: guards against two overlapping `clear` runs in the same
+        # chat (e.g. a double-tap or a queued duplicate command) racing
+        # each other — both scanning/deleting concurrently, overlapping
+        # IDs, and producing a misleading second report.
+        self._active_clears: set[int] = set()
 
     def setup(self, client: TelegramClient) -> None:
         self._add_handler(client, events.NewMessage(outgoing=True), self._on_command)
@@ -123,6 +128,7 @@ class Clearer(Module):
 
     def teardown(self, client: TelegramClient) -> None:
         self._bot_peer_cache.clear()
+        self._active_clears.clear()
         super().teardown(client)
 
     # ── Command dispatcher ─────────────────────────────────────────────────
@@ -176,7 +182,20 @@ class Clearer(Module):
         else:
             target_types = TYPE_FILTERS["default"]
 
-        await self._run_clear(client, event, target_types, scope)
+        # v3.0.9 fix: reject a second `clear` in the same chat while one is
+        # already running, instead of letting both scan/delete concurrently.
+        if event.chat_id in self._active_clears:
+            await self._safe_edit(
+                event,
+                "⏳ یک عملیات `clear` دیگر در همین چت در حال اجراست — لطفاً صبر کنید."
+            )
+            return
+
+        self._active_clears.add(event.chat_id)
+        try:
+            await self._run_clear(client, event, target_types, scope)
+        finally:
+            self._active_clears.discard(event.chat_id)
 
     # ── Main clear logic ───────────────────────────────────────────────────
 

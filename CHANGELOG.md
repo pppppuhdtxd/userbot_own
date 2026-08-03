@@ -5,6 +5,151 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.0.9] — 2026-08-02
+
+Applied from a full 12-module review (clearer, auto_clearer, auto_forwarder,
+help_handler, system, whois_handler, info_handler, reaction_commands,
+join_left, base, router, bridge). Each fix below closes a specific finding
+from that review.
+
+### Revert — `bridge.py`: Reacted-To Message Deliberately Remains Eligible For `clear`
+
+A previous draft of this release changed `MockEvent.message.id` from a
+placeholder (`0`) to the real `target_msg_id`, on the theory that a
+reaction-triggered `clear` shouldn't be able to delete the very message
+that was reacted on. **This has been reverted per product decision — it
+wasn't a bug.** If a reaction is mapped to e.g. `clear txt` and the
+reacted-to message matches that filter, it's expected to be deleted like
+any other matching message in the scan; it should not get special
+immunity just because it happened to be the trigger. `message.id` is back
+to the `0` placeholder, so `clearer.py`'s `skip_ids` exclusion (which is
+still correctly used to protect the *progress/status* message the
+direct-invocation flow creates) no longer incorrectly extends to the
+reacted-to message as well.
+
+### Fix — `auto_forwarder.py`: Partial Fallback Failures Left Successfully-Forwarded Originals Undeleted
+
+**Root cause:** `_send_batched`'s one-by-one fallback path tracked a single
+batch-wide `sent_ok` boolean. If any one item in a multi-item batch failed
+during fallback, the flag ended up `False` and **none** of the batch's
+originals were deleted — including items that were actually forwarded
+successfully, leaving permanent duplicate content in the bot chat.
+
+**Fix:** Track per-item send success (`sent_ids`) and delete only the
+originals that were actually confirmed sent.
+
+### Fix — `join_left.py`: Three Issues
+
+1. **Dead-branch join failure masking.** The `username` join handler's
+   generic exception handler called `get_entity()` in both the "already a
+   member" and "else" branches — identically — so *any* join failure other
+   than the two explicitly re-raised types (including `PeerFloodError` /
+   `UserBannedInChannelError`, Telegram's own anti-spam responses) could be
+   silently reported as a successful join whenever the target happened to
+   still be resolvable. Fixed to only treat genuine already-member errors
+   as success; everything else now re-raises and is reported as a failure.
+2. **`channel_id` / `numeric_id` paths never actually joined anything** —
+   they called only `get_entity()` (a resolve, not a join), so a
+   not-yet-joined public channel could be reported "✅ joined" with no
+   actual membership change. Both paths now issue `JoinChannelRequest`
+   where applicable.
+3. **Duplicate entity extraction.** `t.me/c/<id>/<msg>` links were matched
+   by both the `channel_id` pattern and the generic numeric-ID pattern
+   (`\b(\d{9,14})\b` matches the same digits inside the URL), causing the
+   same chat to be queued and joined twice. The numeric-ID pass now skips
+   digit runs already captured as a `channel_id`.
+
+### Fix — `auto_clearer.py`: Missing Pinned-Message Protection + Reimplemented Batch-Delete
+
+**Root cause:** `help_extra` documented that pinned messages are never
+auto-cleared, but neither the live path (`_try_auto_delete`) nor the
+historical sweep (`_clear_past`) ever checked `msg.pinned`. Separately,
+`_clear_past` reimplemented a batch-delete-with-retry loop inline instead
+of using the shared, more accurate `helpers.utils.batch_delete`, and the
+"enable globally" flow fired a full-history scan+delete for every bot
+dialog back-to-back with no pacing — the single highest FloodWait risk in
+the module.
+
+**Fix:** Added the pinned-message check to both paths; `_clear_past` now
+calls the shared `batch_delete` helper (accurate `pts_count`-based
+counting) with `wait_time=1` on its scan; added a short pause between
+per-bot sweeps in the global-enable flow.
+
+### Fix — `whois_handler.py`: Linked-Chat Lookup Silently Swallowed FloodWait
+
+**Root cause:** Every other full-info fetch in this module explicitly
+re-raises `FloodWaitError` so the top-level handler can surface a "please
+wait" message — except the nested linked-chat (`linked_chat_id`) lookup
+inside `_build_channel_info`, which fell into a bare `except Exception`
+and silently displayed a plain-ID fallback instead.
+
+**Fix:** Added the same explicit `except errors.FloodWaitError: raise`
+before the generic fallback.
+
+### Fix — `info_handler.py`: FloodWait Swallowed, UTF-16 Entity Offset Bug, and Two Minor Inconsistencies
+
+1. `_get_sender_section` / `_get_chat_section` / `_get_reply_section` all
+   swallowed `FloodWaitError` via a bare `except Exception`, unlike
+   `whois_handler.py`'s deliberate re-raise pattern. Now re-raise before
+   the generic fallback in all three.
+2. `_link_details` sliced URL-entity text using Python code-point indexing
+   against Telegram's UTF-16-code-unit offsets — wrong for any message
+   containing emoji/astral characters before a link. Added a
+   `_utf16_slice()` helper that round-trips through UTF-16 bytes so the
+   offsets line up correctly.
+3. Poll-question truncation was missing the ellipsis every other
+   truncated field in the codebase includes — fixed.
+4. The GIF/Voice/Audio document-attribute loop had no `break` once a
+   definitive type was found, unlike the sibling filename-attribute loop
+   — added, preventing a theoretical contradictory double type line.
+
+### Fix — `clearer.py`: Overlapping Concurrent `clear` Runs
+
+**Root cause:** No guard against two `clear` invocations in the same chat
+running concurrently (e.g. a double-tap), which could scan/delete
+overlapping message ranges and produce a misleading second report.
+
+**Fix:** Added a per-chat `_active_clears` guard; a second `clear` in the
+same chat while one is already running now gets a clear "already running"
+notice instead of racing the first.
+
+### Fix — `helpers/utils.py`: `batch_delete`'s Single-Shot FloodWait Retry
+
+**Root cause:** A second consecutive `FloodWaitError` on the same batch
+gave up entirely after exactly one retry, silently dropping that batch's
+deletions. No proactive pacing existed between batches either.
+
+**Fix:** Retries now loop (capped at 5 attempts), honoring each new
+`FloodWaitError.seconds`; added a small proactive delay between batches to
+reduce how often FloodWait is hit in the first place.
+
+### Fix — `help_handler.py`: Message-Length Overflow + Fragile Category Lookup
+
+**Root cause:** The compact `help` output concatenated every module's full
+`help_text` into a single `event.edit()` call with no length check against
+Telegram's ~4096-character message limit — overflowing this failed
+silently with zero user-facing feedback. Separately, `grouped[cat_key]`
+was indexed directly against a dict pre-seeded only from `CATEGORIES`,
+which would raise an unhandled `KeyError` if a future `MODULE_MAP` entry's
+category ever didn't match exactly.
+
+**Fix:** Output is now split into multiple messages by category block when
+it would exceed a safe length threshold; category lookup now uses
+`setdefault()` defensively.
+
+### Fix — `system.py`: Unguarded `.ping` Intermediate Edit
+
+**Root cause:** The `.ping` command's intermediate "Pong!" edit was a bare
+`event.edit()` call with no error handling, unlike every other command in
+this module (which use `_safe_edit`/`_safe_edit_with_auto_delete`) — a
+failure there would propagate uncaught and abort the command with no final
+report.
+
+**Fix:** Wrapped in a try/except, matching the rest of the module's
+convention.
+
+---
+
 ## [3.0.8] — 2026-07-31
 
 ### Fix — `reaction_commands.py`: Direct `clear` Invocation Always Fell Back to `send_message`

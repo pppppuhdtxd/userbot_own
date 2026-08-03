@@ -374,6 +374,13 @@ class WhoisHandler(Module):
                         lines.append(f"• **چت مرتبط:** @{linked_username} ({linked_title})")
                     else:
                         lines.append(f"• **چت مرتبط:** `{linked_title}` (ID: `{linked_chat_id}`)")
+                except errors.FloodWaitError:
+                    # v3.0.9 fix: this used to be swallowed by the bare
+                    # except below, unlike every other FloodWait in this
+                    # module, which is deliberately re-raised so the
+                    # top-level handler can show a "wait N seconds"
+                    # message instead of silently hiding it.
+                    raise
                 except Exception:
                     lines.append(f"• **چت مرتبط ID:** `{linked_chat_id}`")
 

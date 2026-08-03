@@ -27,7 +27,7 @@ with `clearer.py` and `auto_clearer.py`.
 """
 from __future__ import annotations
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, errors, events
 from telethon.tl.types import (
     Channel,
     Chat,
@@ -299,10 +299,12 @@ class InfoHandler(Module):
         for attr in media.document.attributes:
             if isinstance(attr, DocumentAttributeAnimated):
                 lines.append("• نوع: **GIF (Animated)**")
+                break
             elif isinstance(attr, DocumentAttributeAudio) and attr.voice:
                 # Voice message: already the most specific case — no further
                 # AudioAttribute fields (performer/title) apply to voice.
                 lines.append("• نوع: **Voice Message**")
+                break
             elif isinstance(attr, DocumentAttributeAudio):
                 # Regular audio file (attr.voice is False in this branch).
                 lines.append("• نوع: **Audio**")
@@ -310,6 +312,7 @@ class InfoHandler(Module):
                     lines.append(f"• Artist: `{attr.performer}`")
                 if attr.title:
                     lines.append(f"• Title: `{attr.title}`")
+                break
 
         return "\n".join(lines)
 
@@ -364,6 +367,25 @@ class InfoHandler(Module):
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _utf16_slice(text: str, offset: int, length: int) -> str:
+        """
+        Slice *text* using Telegram's entity offset/length, which are
+        counted in UTF-16 code units — not Python code points. Plain
+        `text[offset:offset+length]` slicing (v3.0.8 and earlier) gives
+        the wrong substring for any text containing characters outside
+        the Basic Multilingual Plane (most emoji included) before the
+        entity, since those become UTF-16 surrogate pairs (2 code units)
+        but remain a single Python code point. Round-tripping through
+        UTF-16 bytes makes the offsets line up correctly either way.
+        """
+        try:
+            encoded = text.encode("utf-16-le")
+            piece = encoded[offset * 2: (offset + length) * 2]
+            return piece.decode("utf-16-le", errors="ignore")
+        except Exception:
+            return text[offset:offset + length]
+
     def _link_details(self, msg: Message) -> str:
         """Details for link-type messages (WebPage or URL entities)."""
         lines = ["**🔗 جزئیات لینک:**"]
@@ -408,7 +430,7 @@ class InfoHandler(Module):
                     if remaining > 0:
                         lines.append(f"  … و `{remaining}` لینک دیگر")
                     break
-                url_text = text[e.offset:e.offset + e.length] if text else ""
+                url_text = self._utf16_slice(text, e.offset, e.length) if text else ""
                 if isinstance(e, MessageEntityTextUrl) and e.url:
                     lines.append(f"  - `{url_text}` → `{e.url}`")
                 else:
@@ -453,7 +475,9 @@ class InfoHandler(Module):
         elif isinstance(media, MessageMediaPoll):
             lines.append("• نوع: **Poll**")
             if media.poll:
-                lines.append(f"• Question: `{media.poll.question[:100]}`")
+                question = media.poll.question
+                q_trunc = question[:100] + ("…" if len(question) > 100 else "")
+                lines.append(f"• Question: `{q_trunc}`")
                 if media.results and media.results.total_voters is not None:
                     lines.append(f"• Votes: `{media.results.total_voters}`")
 
@@ -521,6 +545,13 @@ class InfoHandler(Module):
         """Build the sender info section."""
         try:
             sender = await msg.get_sender()
+        except errors.FloodWaitError:
+            # v3.0.9 fix: previously swallowed here (and in
+            # _get_chat_section / _get_reply_section below), unlike
+            # whois_handler.py's deliberate re-raise pattern — a flood
+            # wait would just silently show "not available" with no
+            # indication to the user that a rate limit was hit.
+            raise
         except Exception:
             sender = None
 
@@ -588,6 +619,8 @@ class InfoHandler(Module):
         """Build the chat info section."""
         try:
             chat = await msg.get_chat()
+        except errors.FloodWaitError:
+            raise
         except Exception:
             chat = None
 
@@ -638,6 +671,8 @@ class InfoHandler(Module):
         """Build the reply chain info."""
         try:
             reply = await msg.get_reply_message()
+        except errors.FloodWaitError:
+            raise
         except Exception:
             reply = None
 

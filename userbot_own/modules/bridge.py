@@ -109,6 +109,18 @@ class MockEvent:
 
         # Needed by join_left._collect_entities(), which reads
         # event.message.message for command-text entities.
+        #
+        # Note (v3.0.9): id is intentionally a placeholder, not the real
+        # target_msg_id. clearer.py's _run_clear reads event.message.id as
+        # `command_id` and excludes it via `skip_ids` — using the real
+        # target_msg_id here would make the reacted-to message immune to
+        # its own reaction-triggered `clear`. That's not desired: if you
+        # react with an emoji mapped to e.g. `clear txt` on a text message,
+        # that message should be deletable like any other match. A prior
+        # revision of this file set id=target_msg_id specifically to
+        # protect the reacted message from deletion; per product decision
+        # this has been reverted, since it wasn't a bug — matching the
+        # active filter is the intended, expected outcome.
         self.message = _MockMessage(id=0, text=raw_text, message=raw_text)
 
         # Progress message — created on first edit(), reused afterward.

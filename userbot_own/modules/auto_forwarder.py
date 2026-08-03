@@ -349,13 +349,22 @@ class AutoForwarder(Module):
                 if parts:
                     final_cap = "\n---\n".join(parts)
 
-            sent_ok = False
+            # v3.0.9 fix: track which original message IDs were actually
+            # sent successfully, per item — not one batch-wide flag. The
+            # old `sent_ok` boolean was set True/False for the *whole*
+            # batch based on the one-by-one fallback's last failure, so a
+            # single failed item among several successes caused ALL
+            # originals in the batch (including the ones that genuinely
+            # forwarded) to be left undeleted — permanent duplicate
+            # content in the bot chat. `sent_ids` now records exactly
+            # which originals may be safely deleted.
+            sent_ids: list[int] = []
             try:
                 if len(files) == 1:
                     await client.send_file(bot_chat_id, files[0], caption=final_cap)
                 else:
                     await client.send_file(bot_chat_id, files, caption=final_cap)
-                sent_ok = True
+                sent_ids = list(all_ids)
                 self._log_debug(
                     "[Account%d] Batch of %d media forwarded to bot %d.",
                     self.cfg.index, len(files), bot_id,
@@ -365,31 +374,30 @@ class AutoForwarder(Module):
                     "[Account%d] Album send failed (bot %d): %s — retrying one-by-one.",
                     self.cfg.index, bot_id, exc,
                 )
-                sent_ok = True
                 for mid, med, msg in batch:
                     try:
                         cap = msg.message if use_caption else None
                         await client.send_file(bot_chat_id, med, caption=cap)
+                        sent_ids.append(mid)
                     except Exception as exc2:
-                        sent_ok = False
                         self._log_error(
                             "[Account%d] Fallback send FAILED for msg %d: %s",
                             self.cfg.index, mid, exc2,
                         )
 
-            # حذف پیام‌های اصلی فقط در صورت موفقیت ارسال
-            if sent_ok:
+            # حذف پیام‌های اصلی فقط برای آیتم‌هایی که واقعاً ارسال شدند
+            if sent_ids:
                 try:
-                    await safe_delete(client, bot_chat_id, all_ids)
+                    await safe_delete(client, bot_chat_id, sent_ids)
                 except Exception as exc:
                     self._log_error(
                         "[Account%d] Delete originals failed (bot %d): %s",
                         self.cfg.index, bot_id, exc,
                     )
-            else:
+            if len(sent_ids) < len(all_ids):
                 self._log_warning(
-                    "[Account%d] Skipping delete — send failed for bot %d.",
-                    self.cfg.index, bot_id,
+                    "[Account%d] Skipping delete for %d/%d item(s) — send failed for bot %d.",
+                    self.cfg.index, len(all_ids) - len(sent_ids), len(all_ids), bot_id,
                 )
 
     # ── دستور: autofor <type> <on/off> ───────────────────────────

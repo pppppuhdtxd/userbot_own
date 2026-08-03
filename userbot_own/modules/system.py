@@ -204,7 +204,16 @@ class SystemModule(Module):
 
         # Measure message edit latency
         start_edit = time.monotonic()
-        await event.edit("🏓 **Pong!**")
+        try:
+            await event.edit("🏓 **Pong!**")
+        except Exception as exc:
+            # v3.0.9 fix: this was a bare, unhandled call — unlike every
+            # other command in this module, which uses _safe_edit /
+            # _safe_edit_with_auto_delete. A failure here (e.g. the
+            # message was deleted between receipt and this call) used to
+            # propagate uncaught and abort the command with no final
+            # report at all.
+            self._log_debug("[Account%d] .ping intermediate edit failed: %s", self.cfg.index, exc)
         end_edit = time.monotonic()
         edit_latency = (end_edit - start_edit) * 1000
 

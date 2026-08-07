@@ -146,11 +146,10 @@ import time
 
 from telethon import TelegramClient, errors, events
 from telethon.tl.functions.account import UpdateNotifySettingsRequest
-from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.folders import EditPeerFoldersRequest
 from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
-    DeleteHistoryRequest,
     GetDialogFiltersRequest,
     ImportChatInviteRequest,
     UpdateDialogFilterRequest,
@@ -167,13 +166,11 @@ from telethon.tl.types import (
     KeyboardButtonUrl,
     ReplyInlineMarkup,
     TextWithEntities,
-    User,
 )
 from telethon.tl.types import messages as tl_messages
-from telethon import utils as tl_utils
 
 from userbot_own.core.context import ModuleContext
-from userbot_own.helpers.utils import read_json_file, safe_delete, write_json_file_atomic
+from userbot_own.helpers.utils import leave_dialog, read_json_file, safe_delete, write_json_file_atomic
 from userbot_own.modules.base import Module
 
 # Module-level logger — used only by free functions outside the Module class
@@ -808,10 +805,7 @@ async def _leave_and_reset_joined_folder(
             while True:
                 try:
                     entity = await client.get_entity(peer)
-                    if isinstance(entity, Channel):
-                        await client(LeaveChannelRequest(entity))
-                    elif isinstance(entity, (Chat, User)):
-                        await client(DeleteHistoryRequest(peer=entity, just_clear=False, max_id=0))
+                    await leave_dialog(client, entity)
                     left_count += 1
                     left_entities.append(entity)
                     break
@@ -1312,10 +1306,7 @@ class JoinLeft(Module):
                 entity = await client.get_entity(chat_id)
                 name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
 
-                if isinstance(entity, Channel):
-                    await client(LeaveChannelRequest(entity))
-                elif isinstance(entity, (Chat, User)):
-                    await client(DeleteHistoryRequest(peer=entity, just_clear=False, max_id=0))
+                await leave_dialog(client, entity)
 
                 left_entity = entity
                 self._log_debug("Auto-left '%s' (id=%d, joined %s).", name, chat_id, joined_at_str)
@@ -2142,10 +2133,7 @@ class JoinLeft(Module):
 
                     name = getattr(target_entity, "title", None) or getattr(target_entity, "first_name", None) or str(identifier)
 
-                    if isinstance(target_entity, Channel):
-                        await client(LeaveChannelRequest(target_entity))
-                    elif isinstance(target_entity, (Chat, User)):
-                        await client(DeleteHistoryRequest(peer=target_entity, just_clear=False, max_id=0))
+                    await leave_dialog(client, target_entity)
 
                     results.append(f"✅ [{name}] — ترک شد")
                     any_successful_left = True
@@ -2266,7 +2254,7 @@ help_extra = (
     "  → نتایج cache می‌شوند (۶ ساعت) در join_left_invite_cache.json\n"
     "  → نماد 🛡 = از smart path استفاده شد | نماد 🔑 = مستقیم از hash\n\n"
     "Layer 2 — Risk-Based Delays:\n"
-    "  → username: 2s | channel_id/numeric_id: 3s | invite→username: 4s | invite direct: 8s\n"
+    "  → username: 2s | channel_id/numeric_id: 3s | invite→username: 4s | invite direct: 4s\n"
     "  → وقتی `join delay` روی ۰ باشد (پیش‌فرض) فعال است\n\n"
     "Layer 3 — Adaptive FloodWait (safe/human):\n"
     "  → FloodWait خفیف (<30s): ضریب ×1.5\n"

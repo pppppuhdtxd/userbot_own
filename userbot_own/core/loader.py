@@ -16,11 +16,6 @@ hot-reload automatically (requires the `watchdog` package).
 `watch_files()` accepts additional `(path, callback)` pairs so external
 files like `account.json` can also drive callbacks.
 
-Integration with the plugin registry
-─────────────────────────────────────
-After every successful load or reload the loader calls
-`context.plugin_store.upsert()` to keep rich metadata up to date.
-
 DI note: `create_module()` factories now always receive exactly one
 argument — the account's `ModuleContext`. The original loader supported
 two different factory signatures (`create_module(cfg)` or
@@ -28,8 +23,14 @@ two different factory signatures (`create_module(cfg)` or
 most modules reached for a module-level `loader_registry` global instead
 of using the two-argument form. Now that every module receives the same
 `ModuleContext` (which already carries the application-scoped
-loader_registry, plugin_store, and account_registry), that branching is
-gone — there is exactly one supported factory shape.
+loader_registry and account_registry), that branching is gone — there is
+exactly one supported factory shape.
+
+v3.0.11: this used to also call `context.plugin_store.upsert()` /
+`.remove()` on every load/reload/unload to keep a `PluginMetadataStore`
+up to date. That store had no reader anywhere in the codebase and has
+been removed (see registry.py) — load/reload/unload no longer report to
+anything beyond this loader's own logging.
 ════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -38,7 +39,6 @@ import logging
 import sys
 import time
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 
@@ -47,7 +47,6 @@ from telethon import TelegramClient
 from userbot_own.core.context import ModuleContext
 from userbot_own.core.exceptions import ModuleImportError
 from userbot_own.core.logging_setup import get_logger
-from userbot_own.core.registry import PluginMetadata
 from userbot_own.modules.base import Module
 
 log = get_logger(__name__)
@@ -156,20 +155,6 @@ class AccountLoader:
 
         self._loaded[stem] = (instance, py_mod)
 
-        # Register metadata in the application-scoped plugin store
-        self.context.plugin_store.upsert(
-            self.cfg.index,
-            stem,
-            PluginMetadata(
-                account_index = self.cfg.index,
-                stem          = stem,
-                name          = instance.name or stem,
-                help_text     = instance.help_text,
-                file_path     = str(path),
-                loaded_at     = datetime.now(),
-            ),
-        )
-
         self._log.info("[%s] Loaded: %s", self.label, stem)
         return True
 
@@ -185,7 +170,6 @@ class AccountLoader:
             self._log.warning(
                 "[%s] teardown() error for %s: %s", self.label, stem, exc
             )
-        self.context.plugin_store.remove(self.cfg.index, stem)
 
     # ── Public API ────────────────────────────────────────────────────────
 

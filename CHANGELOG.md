@@ -5,6 +5,212 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.0.11] — 2026-08-04
+
+**Source:** AI (full-repository audit — see the standalone audit report for the
+complete findings this release implements; every item below traces back to
+a specific finding there, cross-checked against Telethon's own source
+before being applied)
+
+This release is scoped entirely to fixes, dead-code removal, and
+documentation corrections identified by that audit — no new user-facing
+commands or behavior were added, consistent with this project's own
+PATCH-vs-MINOR versioning rule (see `README.md`'s Versioning Guide).
+
+### Fixed — `join_left.py`: Leaving a legacy basic group didn't actually leave it
+
+**Root cause:** `_leave_and_reset_joined_folder`, `_check_auto_leave`, and
+`_handle_left` each independently branched on entity type and, for `Chat`
+(legacy basic group — not supergroup) entities, called
+`DeleteHistoryRequest(peer=entity, just_clear=False, max_id=0)`. That
+request only clears the *local* message view for the calling account — it
+does not remove chat membership. Verified against Telethon's own
+high-level `kick_participant()` implementation (`telethon/client/chats.py`),
+which uses `messages.DeleteChatUserRequest` for exactly this case. Net
+effect: `.left`, auto-leave, and the folder-wide bulk-leave all logged and
+tracked the account as having "left" any legacy basic group it targeted,
+while the account silently remained a member. `Channel` entities (including
+supergroups) were unaffected — they already correctly used
+`LeaveChannelRequest` — and `User` entities were also unaffected, since
+there's no membership to leave for a private chat.
+
+**Fix:** all three call sites now call a single new shared helper,
+`leave_dialog(client, entity)` (`helpers/utils.py`), which delegates
+entirely to Telethon's own `TelegramClient.delete_dialog()` — already
+correct for every entity type — instead of re-implementing entity-type
+branching a fourth time. This is also a DRY fix: the same flawed 3-line
+branch existed in three places; it's now one call in three places. Unused
+`LeaveChannelRequest` / `DeleteHistoryRequest` imports removed from
+`join_left.py` accordingly.
+
+### Fixed — `join_left.py`: Stale help text
+
+`help_extra` stated `invite direct: 8s`, left over from before the
+`_SMART_DELAYS["invite_direct"]` constant was rebalanced from `8.0s` to
+`4.0s` (see the `3.0.4` entry below) — the constant and the module's own
+top-of-file docstring were updated at the time, but this user-facing
+string wasn't. Now reads `4s`, matching both.
+
+### Fixed — `helpers/utils.py`: `get_file_size()` unit-boundary rounding
+
+**Root cause:** the unit index was chosen via `floor(log(size, 1024))`
+*before* rounding the display value, so a size just under a unit boundary
+(e.g. `1048575` bytes → `1023.99…` KB) would round to `1024.0` but keep
+the lower unit label, displaying `"1024.0 KB"` instead of `"1.0 MB"`.
+
+**Fix:** after rounding, if the value is `>= 1024` and a larger unit
+exists, bump to that unit and recompute. `get_file_size(1048575)` now
+correctly returns `"1.0 MB"`.
+
+### Fixed — `clearer.py`: scans no longer silently report partial results as complete
+
+**Root cause:** the `iter_messages` scan loop in `_run_clear` wrapped the
+whole loop in a single broad `except Exception`, which logged and
+continued — so a `FloodWaitError` (or any other transient error) partway
+through a scan produced a "done" report computed from an incomplete scan,
+with nothing telling the user it was cut short. This was inconsistent with
+`whois_handler.py` and `info_handler.py`, which both consistently re-raise
+`FloodWaitError` for their callers to handle.
+
+**Fix:** the scan loop now re-raises `FloodWaitError` (matching the
+established pattern) instead of swallowing it, and `_on_command` gained a
+dedicated handler for it — matching `whois_handler.py`'s exact user-facing
+message style — that tells the user the scan was interrupted and roughly
+how long to wait. Other (non-FloodWait) scan errors still allow the
+command to complete with whatever was found so far, but every outcome
+message (`"no matches"` and the final report) now says explicitly when
+the scan was cut short, instead of presenting a partial result as final.
+
+### Fixed — `update.sh`: no longer trusts "local is behind origin" — verifies it
+
+**Root cause:** `update.sh` runs `git reset --hard origin/<branch>` to
+sync a deployment to the latest code, on the documented assumption that
+"this device is a deployment target, not a place code is developed... it
+can only discard local commits that were never pushed, which should not
+exist on a deployment target." This audit's GitHub cross-reference found a
+real case where that assumption didn't hold: the live `origin/main` was
+stuck ~2 major versions behind this exact codebase, because 8 local
+commits (this entire architecture refactor, `3.0.7`–`3.0.10`) had never
+been pushed. Had `update.sh` been run in that state, it would have
+silently discarded all of them.
+
+**Fix:** after `git fetch`, `update.sh` now runs
+`git rev-list --count origin/<branch>..HEAD` and refuses to proceed
+(clear error, no changes made) if local has any commits origin doesn't —
+instead of asserting the assumption in a comment and trusting it. See also
+the new README note in the One-Click Installation section, and the FAQ.
+*(The specific 8-commit gap that motivated this fix has already been
+resolved — `main` has been pushed to `origin` as of this release — this
+change is about making sure it can't silently happen again.)*
+
+### Added — `install.sh` / `update.sh`: enforce the documented Python 3.11+ floor
+
+**Root cause:** both scripts detected and displayed the interpreter's
+Python version but never checked it against the `>=3.11` floor documented
+in `requirements.txt` / `pyproject.toml`. An older system `python3` would
+silently produce a venv that then failed confusingly, later, during
+`pip install` or at runtime, far from the actual cause.
+
+**Fix:** `install.sh` now fails fast with a clear message before creating
+the venv if the detected interpreter is below `3.11`. `update.sh` now
+performs the equivalent check against the *existing* venv's interpreter
+(covering a venv created before this fix, or by hand) before doing
+anything else, with instructions to recreate it if it's too old.
+
+### Removed — `core/exceptions.py`: nine confirmed-dead exception classes
+
+A full-repo, grep-verified reference check (not just a visual scan) found
+that only `ModuleImportError` and `LoaderNotFoundError` — and the
+`UserbotError` / `LoaderError` / `RegistryError` parent classes
+structurally required by them — are actually raised or caught anywhere in
+the codebase. The original audit flagged 6 dead classes (`ProxyError`,
+`AuthError`, `ConnectionManagerError`, `FlowAlreadyActiveError`,
+`FlowExpiredError`, `ModuleSetupError`); verifying reference counts before
+deleting anything turned up 3 more of the same kind (`ConfigError`,
+`AccountConfigError`, and the `FlowError` parent of the two
+already-flagged flow exceptions), removed for the same reason. All 9 were
+leftovers from the MTProxy support and the account-management flow system
+(`account_management/flows.py`, `AccountFlowManager`) both removed before
+or during earlier refactors (`3.0.1` for the flow system — see FAQ). The
+hierarchy itself, and its two live branches, are unchanged.
+
+### Removed — `EventBus` and `ConnectionStateChanged` (`core/events.py`)
+
+**Root cause:** `AccountReconnector` published a `ConnectionStateChanged`
+event on every reconnect via an application-scoped `EventBus`, injected
+through `ModuleContext`. A full-repo grep for `.subscribe(` found exactly
+one match anywhere — inside `EventBus`'s own docstring example — and zero
+real subscribers. Notably, this is the *second* connection-notification
+mechanism in a row with no consumer: the pre-refactor version
+(`notify_connection_change()` / `register_connection_callback()`) had the
+same problem.
+
+**Decision:** rather than leave a fully wired, fully unused pub/sub
+mechanism in the dependency-injection graph (or the alternative of adding
+a first, speculative subscriber just to give it a reason to exist), it's
+removed entirely: `core/events.py` deleted; `AccountReconnector` no longer
+takes an `event_bus` constructor argument and now logs connection-state
+transitions directly via its own contextual logger instead of publishing
+them; `ModuleContext`, `composition_root.py`, and `core/__init__.py`
+updated accordingly. Every trigger point and the reconnect logic itself
+are unchanged — only the delivery mechanism for the resulting state
+changed, from "publish to nothing" to "log directly." Straightforward to
+reintroduce later, purpose-built, if a real consumer (e.g. a live
+per-account status view) is ever designed — see FAQ.
+
+### Removed — `PluginMetadataStore` / `PluginMetadata` (`core/registry.py`)
+
+**Root cause:** written to (`upsert()`) on every module load/reload/unload
+by `core/loader.py`, with no reader anywhere in the codebase — confirmed
+by the same full-repo grep pass. It had previously been kept specifically
+because `README.md`'s feature table advertised it ("Plugin registry —
+Rich metadata, introspection, and runtime management API"); removing the
+code without removing that claim would have just created a new
+documentation/reality mismatch of exactly the kind this audit was
+already fixing elsewhere (see below), so both are removed together this
+time. `AccountRegistry` and `AccountLoaderRegistry`, in the same file, are
+unrelated and unchanged.
+
+### Documentation — `README.md`: architecture docs resynced with the code
+
+Beyond the feature-table row and the two removed-subsystem mentions above,
+the architecture section had accumulated several more references to
+`EventBus` / `PluginMetadataStore` that the earlier `3.0.x` refactors
+never fully swept: the `core/` directory tree listing, the Composition
+Root description, the plugin-lifecycle diagram, the `ModuleContext` field
+list (prose and table), the reconnector flow diagram, and the Registries
+table. All updated to match the current code. Also fixed: the feature
+table's "Plugin registry" row linked to a `[FAQ](#faq)` entry that didn't
+exist (removing that row resolves it); two new FAQ entries added — "What
+happened to the EventBus and the plugin registry?" and the `update.sh`
+sync-safety note referenced above — so this doesn't recur as a *new*
+dangling reference.
+
+### Compliance note — `join_left.py`'s bulk-join pacing
+
+Documenting this explicitly, as requested during review: `join_left.py`'s
+`.join` command includes a deliberate delay/backoff/batching design
+("Human Pattern" mode) intended to make bulk, automated chat-joining less
+distinguishable from organic activity to Telegram's own systems. This is
+a documented design choice for personal account management — it only
+ever acts on the account's own membership, and only on links/entities the
+account owner explicitly supplied by replying to a message — not a bug,
+and nothing about it was changed in this release. It does mean this
+specific feature works by reducing the friction Telegram's own systems
+apply to bulk joining on purpose, which is a meaningfully different
+posture from the rest of this project (self-scoped message/reaction/info
+tooling with no interaction with platform rate-limiting at all). Users
+are responsible for their own compliance with
+[Telegram's Terms of Service](https://telegram.org/tos) when using this
+feature.
+
+### Version
+
+`VERSION` and `pyproject.toml` bumped to `3.0.11` (previously `3.0.10` /
+`3.0.8` respectively — see the audit report for how those drifted apart).
+
+---
+
 ## [3.0.10] — 2026-08-03
 
 **Source:** AI (whois_handler / info_handler UX and DRY pass)

@@ -10,52 +10,34 @@ still being able to target specific sub-types when needed.
 Hierarchy
 ---------
 UserbotError
-├── ConfigError
-│   └── AccountConfigError
-├── ConnectionError         (not to be confused with built-in ConnectionError)
-│   ├── ProxyError
-│   └── AuthError
 ├── LoaderError
-│   ├── ModuleImportError
-│   └── ModuleSetupError
-├── FlowError
-│   ├── FlowAlreadyActiveError
-│   └── FlowExpiredError
+│   └── ModuleImportError
 └── RegistryError
+    └── LoaderNotFoundError
+
+v3.0.11: a full-repo grep-verified audit found that only
+``ModuleImportError`` and ``LoaderNotFoundError`` (and the ``UserbotError``
+/ ``LoaderError`` / ``RegistryError`` parents structurally required by
+them) are actually raised or caught anywhere in the codebase. Nine classes
+were removed as confirmed-unreferenced dead code: ``ConfigError``,
+``AccountConfigError`` (config validation currently fails a different
+way — see config/loader.py — this branch was never wired up),
+``ConnectionManagerError``, ``ProxyError``, ``AuthError`` (leftover from
+the MTProxy support dropped before this refactor), and ``FlowError``,
+``FlowAlreadyActiveError``, ``FlowExpiredError`` (leftover from the
+account-management flow system removed in v3.0.1 — see README FAQ). The
+original audit that approved this change flagged 6 of these 9
+(``ProxyError``, ``AuthError``, ``ConnectionManagerError``,
+``FlowAlreadyActiveError``, ``FlowExpiredError``, ``ModuleSetupError``);
+the other 3 (``ConfigError``, ``AccountConfigError``, and the ``FlowError``
+parent of the two already-flagged flow exceptions) turned up during this
+pass and are removed for the same reason and documented here for the
+same transparency.
 """
 
 
 class UserbotError(Exception):
     """Base class for all userbot application exceptions."""
-
-
-# ── Configuration ─────────────────────────────────────────────────────────────
-
-class ConfigError(UserbotError):
-    """Raised when the configuration is invalid or cannot be loaded."""
-
-
-class AccountConfigError(ConfigError):
-    """Raised when a specific account's configuration is invalid."""
-
-    def __init__(self, index: int, reason: str) -> None:
-        self.index  = index
-        self.reason = reason
-        super().__init__(f"Account #{index}: {reason}")
-
-
-# ── Connection ────────────────────────────────────────────────────────────────
-
-class ConnectionManagerError(UserbotError):
-    """Raised for connection-manager failures (distinct from built-in ConnectionError)."""
-
-
-class ProxyError(ConnectionManagerError):
-    """Raised when no working proxy is available and direct connection fails."""
-
-
-class AuthError(ConnectionManagerError):
-    """Raised when an account cannot be authenticated."""
 
 
 # ── Loader / Plugin ───────────────────────────────────────────────────────────
@@ -71,32 +53,6 @@ class ModuleImportError(LoaderError):
         self.stem  = stem
         self.cause = cause
         super().__init__(f"Cannot import module '{stem}': {cause}")
-
-
-class ModuleSetupError(LoaderError):
-    """Raised when a module's setup() raises."""
-
-    def __init__(self, stem: str, cause: BaseException) -> None:
-        self.stem  = stem
-        self.cause = cause
-        super().__init__(f"Module '{stem}' setup() failed: {cause}")
-
-
-# ── Interactive flows ─────────────────────────────────────────────────────────
-
-class FlowError(UserbotError):
-    """Base class for account management flow errors."""
-
-
-class FlowAlreadyActiveError(FlowError):
-    """Raised when an admin tries to start a flow while one is already running."""
-
-    def __init__(self, admin_id: int) -> None:
-        super().__init__(f"Admin {admin_id} already has an active flow.")
-
-
-class FlowExpiredError(FlowError):
-    """Raised when a flow is accessed after its timeout."""
 
 
 # ── Module registry ───────────────────────────────────────────────────────────

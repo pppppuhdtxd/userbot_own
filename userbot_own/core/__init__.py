@@ -7,9 +7,8 @@ Sub-modules
 ───────────
 telegram_client — TelegramClient factory per account (direct connection)
 exceptions      — structured exception hierarchy
-events          — application-scoped EventBus
 context         — ModuleContext (constructor-injection payload)
-registry        — AccountRegistry, AccountLoaderRegistry, PluginMetadataStore
+registry        — AccountRegistry, AccountLoaderRegistry
 loader          — per-account plugin loader with hot-reload
 logging_setup   — centralized structured logging
 reconnector     — per-account reconnect loop with exponential backoff

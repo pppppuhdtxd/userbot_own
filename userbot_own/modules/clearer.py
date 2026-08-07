@@ -62,10 +62,9 @@ This ensures predictable and non-overlapping filter behavior.
 """
 from __future__ import annotations
 
-import asyncio
 import time
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, errors, events
 from telethon.tl.types import User
 
 from userbot_own.core.context import ModuleContext
@@ -194,6 +193,18 @@ class Clearer(Module):
         self._active_clears.add(event.chat_id)
         try:
             await self._run_clear(client, event, target_types, scope)
+        except errors.FloodWaitError as exc:
+            # v3.0.11: previously _run_clear swallowed this internally and
+            # reported partial scan results as if they were complete. Now
+            # it re-raises past here, matching whois_handler.py's pattern,
+            # so the user is told the scan stopped instead of getting a
+            # silently-wrong "done" report.
+            wait_msg = (
+                f"⏳ درخواست بیش از حد — لطفاً {exc.seconds} ثانیه صبر کنید.\n"
+                f"اسکن متوقف شد؛ ممکن است پیام‌هایی بررسی نشده باشند."
+            )
+            self._log_warning("Clear FloodWait %ds.", exc.seconds)
+            await self._safe_edit(event, wait_msg)
         finally:
             self._active_clears.discard(event.chat_id)
 
@@ -264,6 +275,7 @@ class Clearer(Module):
         matched_by_type: dict[str, int] = {}
         start_time = time.monotonic()
 
+        scan_interrupted = False
         try:
             # wait_time=1: adds a 1-second pause every 100 messages to avoid
             # hitting GetHistoryRequest FloodWait. Telethon only auto-applies
@@ -293,18 +305,33 @@ class Clearer(Module):
                 to_delete.append(msg.id)
                 matched_by_type[msg_type] = matched_by_type.get(msg_type, 0) + 1
 
+        except errors.FloodWaitError:
+            # v3.0.11 fix: this used to be caught by the broad `except
+            # Exception` below and silently swallowed, so a FloodWait
+            # partway through a scan produced a result reported as
+            # complete when it was actually partial. Re-raising here
+            # matches the pattern already used consistently in
+            # whois_handler.py / info_handler.py — _on_command now has
+            # a dedicated handler that tells the user the scan was
+            # interrupted instead of presenting partial results as final.
+            raise
         except Exception as exc:
             self._log_error("Scan error: %s", exc)
+            scan_interrupted = True
 
         # No matches
         if not to_delete:
             elapsed = time.monotonic() - start_time
+            note = (
+                "\n• ⚠️ اسکن به‌دلیل خطا ناقص ماند — نتیجه ممکن است کامل نباشد"
+                if scan_interrupted else ""
+            )
             await self._safe_edit(
                 status_msg,
                 f"ℹ️ **پیامی یافت نشد**\n"
                 f"• اسکن شده: `{scanned}` پیام\n"
                 f"• نوع: {type_label}\n"
-                f"• زمان: `{elapsed:.2f}s`"
+                f"• زمان: `{elapsed:.2f}s`{note}"
             )
             self._track_delete_task(status_msg, 6.0)
             return
@@ -348,6 +375,8 @@ class Clearer(Module):
         ]
         if failed_count > 0:
             report_lines.append(f"• ناموفق: `{failed_count}`")
+        if scan_interrupted:
+            report_lines.append("• ⚠️ اسکن به‌دلیل خطا زودتر متوقف شد — ممکن است پیام‌های بیشتری باقی مانده باشند")
         report_lines.append(f"• زمان: `{elapsed:.2f}s`")
         report_lines.append("")
         report_lines.append("🏷 **بر اساس نوع:**")

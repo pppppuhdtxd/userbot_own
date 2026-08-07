@@ -4,11 +4,16 @@ userbot_own/app/composition_root.py
 The Composition Root.
 
 This is the ONE place in the whole application allowed to construct
-the application-scoped singletons (EventBus, AccountLoaderRegistry,
-PluginMetadataStore, AccountRegistry) and wire them into everything
-that needs them. Every other file in the project receives these
-through constructor injection — nothing outside this module ever
-does `SomeRegistry()` for the shared instances.
+the application-scoped singletons (AccountLoaderRegistry,
+AccountRegistry) and wire them into everything that needs them. Every
+other file in the project receives these through constructor injection
+— nothing outside this module ever does `SomeRegistry()` for the
+shared instances.
+
+v3.0.11: this used to also construct an application-scoped `EventBus`
+and `PluginMetadataStore` here. Both were removed after a full-repo
+audit found neither had any real consumer — see core/registry.py and
+core/reconnector.py's docstrings for the detailed reasoning.
 
 Startup order (unchanged from the original main.py's _main(), just
 now made explicit rather than split between "module import time" and
@@ -39,10 +44,9 @@ from userbot_own.config.loader import discover_accounts, load_settings
 from userbot_own.config.models import AccountConfig, Paths, Settings
 from userbot_own.core import logging_setup
 from userbot_own.core.context import ModuleContext
-from userbot_own.core.events import EventBus
 from userbot_own.core.loader import AccountLoader
 from userbot_own.core.reconnector import AccountReconnector
-from userbot_own.core.registry import AccountLoaderRegistry, AccountRegistry, PluginMetadataStore
+from userbot_own.core.registry import AccountLoaderRegistry, AccountRegistry
 from userbot_own.core.telegram_client import AccountClient
 
 log: logging.Logger
@@ -67,9 +71,7 @@ class CompositionRoot:
         self.account_registry: AccountRegistry | None = None
 
         # Application-scoped singletons — constructed once, right here.
-        self.event_bus: EventBus = EventBus()
         self.loader_registry: AccountLoaderRegistry = AccountLoaderRegistry()
-        self.plugin_store: PluginMetadataStore = PluginMetadataStore()
 
     def bootstrap(self) -> logging.Logger:
         """
@@ -125,9 +127,7 @@ class CompositionRoot:
         return ModuleContext(
             cfg=acc_cfg,
             settings=self.settings,
-            event_bus=self.event_bus,
             loader_registry=self.loader_registry,
-            plugin_store=self.plugin_store,
             account_registry=self.account_registry,
         )
 
@@ -196,7 +196,7 @@ class CompositionRoot:
                 log.warning("[%s] Authorization check failed: %s", label, exc)
 
         # Step 5: Run reconnector + file watcher concurrently
-        reconnector = AccountReconnector(ac, loader, self.event_bus)
+        reconnector = AccountReconnector(ac, loader)
         try:
             await asyncio.gather(
                 reconnector.run(),

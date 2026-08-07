@@ -54,6 +54,15 @@ userbot update   # update directly
 > idempotent and will simply refresh your existing installation rather
 > than creating a duplicate or overwriting your account data.
 
+> **Before you run `userbot update` on a machine you also develop on:**
+> `update.sh` makes your local checkout exactly match `origin/<branch>` —
+> that's the whole point, it's how you get the latest fixes. If this
+> machine has commits that were never pushed, syncing to origin would
+> discard them. As of `3.0.11`, `update.sh` checks for this and refuses to
+> proceed (with a clear message telling you to `git push` first) instead
+> of silently overwriting local work — but the simplest fix is just to
+> push before you update: `git -C ~/userbot_own push origin main`.
+
 If you'd rather install manually (or you're on a distro other than
 Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 
@@ -106,11 +115,10 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history.
 | **Message classification** | Unified priority system (`file > vid > pic > link > txt > other`) across all modules |
 | **Category-based help** | RTL-friendly help output with 7 logical categories, plus per-module detail via `help <module>` |
 | **Reaction commands** | Execute commands by reacting to messages with emojis — push-based (zero polling), works on bots, users, groups, and channels per-type toggle |
-| **Plugin registry** | Metadata store tracking every loaded module (currently populated but not yet surfaced by any command — see [FAQ](#faq)) |
 | **Live config reload** | `account.json` edits and new `accounts/N/` folders are picked up by a file watcher without a restart |
 | **Semantic versioning** | Every change tracked in `VERSION` + `CHANGELOG.md` |
 | **Python 3.11+** | Native union types, `match` statements, `slots=True` dataclasses |
-| **Dependency injection** | Composition root wires config, event bus, and registries into every module's constructor — no global state reached for by import |
+| **Dependency injection** | Composition root wires config and registries into every module's constructor — no global state reached for by import |
 
 ---
 
@@ -179,9 +187,8 @@ userbot_own/
     │
     ├── core/
     │   ├── exceptions.py            ← structured exception hierarchy
-    │   ├── events.py                 ← application-scoped EventBus
     │   ├── context.py                ← ModuleContext (constructor-injection payload)
-    │   ├── registry.py               ← AccountRegistry, AccountLoaderRegistry, PluginMetadataStore
+    │   ├── registry.py               ← AccountRegistry, AccountLoaderRegistry
     │   ├── telegram_client.py        ← TelegramClient factory (direct connection)
     │   ├── loader.py                 ← per-account plugin loader + hot-reload
     │   ├── logging_setup.py          ← centralized structured logging
@@ -232,10 +239,14 @@ userbot_own/
 ### Composition root
 
 `userbot_own/app/composition_root.py` is the only place that constructs the
-application-scoped singletons: the `EventBus`, `AccountLoaderRegistry`,
-`PluginMetadataStore`, and `AccountRegistry`. Everything else — every plugin
-module, the loader, the reconnector — receives what it needs through its
-constructor. Nothing reaches for a global import to get at shared state.
+application-scoped singletons: `AccountLoaderRegistry` and `AccountRegistry`.
+Everything else — every plugin module, the loader, the reconnector —
+receives what it needs through its constructor. Nothing reaches for a
+global import to get at shared state.
+
+*(v3.0.11: this used to also build an `EventBus` and `PluginMetadataStore`
+here. Both were removed after a full-repo audit found neither had a real
+consumer — see [FAQ](#faq).)*
 
 ### Plugin lifecycle
 
@@ -244,15 +255,13 @@ AccountLoader.load_all(client)
     └─ for each .py in modules/ (except base.py / router.py / bridge.py)
         ├─ importlib.util.spec_from_file_location()
         ├─ create_module(context)      ← factory call, context = this account's ModuleContext
-        ├─ instance.setup(client)      ← handler registration
-        └─ plugin_store.upsert(metadata)
+        └─ instance.setup(client)      ← handler registration
 ```
 
 `ModuleContext` bundles everything a plugin might need: its own
-`AccountConfig`, the shared `EventBus`, `AccountLoaderRegistry`,
-`PluginMetadataStore`, `AccountRegistry`, and global `Settings`. Every module
-receives the same shape, whether or not it uses every field — see
-[Writing a New Module](#writing-a-new-module).
+`AccountConfig`, the shared `AccountLoaderRegistry`, `AccountRegistry`, and
+global `Settings`. Every module receives the same shape, whether or not it
+uses every field — see [Writing a New Module](#writing-a-new-module).
 
 ### Hot-reload (watchdog triggers)
 
@@ -273,7 +282,7 @@ AccountReconnector._reconnect_cycle()   (every ~30s when healthy)
            ├─ detect_network_state()   → ONLINE / NO_INTERNET / TELEGRAM_DOWN / UNKNOWN
            ├─ NO_INTERNET / TELEGRAM_DOWN → exponential backoff, retry state detection
            └─ ONLINE → rebuild client (tenacity-retried) → loader.reattach(new_client)
-                  └─ publishes ConnectionStateChanged via the EventBus
+                  └─ logs the connection-state transition
 ```
 
 There is no proxy layer — connections are always direct. If your network
@@ -286,11 +295,9 @@ has no visibility into or control over that layer.
 | --- | --- | --- |
 | `AccountRegistry` | `core.registry` | Mutable, live collection of every configured `AccountConfig` |
 | `AccountLoaderRegistry` | `core.registry` | `int` → `AccountLoader`, shared across every account (used by `.stats` for cross-account totals) |
-| `PluginMetadataStore` | `core.registry` | `(int, stem)` → `PluginMetadata` |
-| `EventBus` | `core.events` | Synchronous pub/sub; currently carries `ConnectionStateChanged` |
 
-All four are built once by the composition root and injected — never
-imported as globals.
+Both are built once by the composition root and injected — never imported
+as globals.
 
 ---
 
@@ -521,7 +528,6 @@ file is created, modified, or deleted:
 1. The old module instance's `teardown()` is called (handlers removed).
 2. The file is re-imported from disk.
 3. A new instance is created (via `create_module(context)`) and `setup()` is called.
-4. Plugin metadata in `plugin_store` is updated.
 
 This means you can iterate on module code without restarting the bot.
 Syntax errors in a module are caught and logged — the rest of the plugins
@@ -599,9 +605,7 @@ module is visible and usable from every account.
 | --- | --- | --- |
 | `context.cfg` | `AccountConfig` | Also available as `self.cfg` after `super().__init__(context)` |
 | `context.settings` | `Settings` | `backoff_start/max`, `history_limit`, `log_level` |
-| `context.event_bus` | `EventBus` | `.subscribe(EventType, handler)` / `.publish(event)` |
 | `context.loader_registry` | `AccountLoaderRegistry` | Cross-account — every running account's loader |
-| `context.plugin_store` | `PluginMetadataStore` | Cross-account plugin metadata |
 | `context.account_registry` | `AccountRegistry` | Every configured account (live — reflects add/remove) |
 
 Most modules only ever touch `self.cfg`. The cross-account fields exist for
@@ -753,6 +757,22 @@ A: Removed — see `CHANGELOG.md` for the version where `is_admin`,
 `config.py`, `modules/base.py`, `system.py`, `help_handler.py`, and the
 plugin loader. This is now a single-owner tool: every configured account is
 equal, and every command is available from every account.
+
+---
+
+**Q: What happened to the EventBus and the plugin registry?**
+
+A: Both removed in `3.0.11`. `EventBus` only ever carried one event
+(`ConnectionStateChanged`, published by `AccountReconnector`), and a
+full-repo audit confirmed zero subscribers anywhere — not just in this
+version, but in the original pre-refactor callback-list mechanism it
+replaced either. `AccountReconnector` now logs connection-state
+transitions directly instead. `PluginMetadataStore` was written to on
+every module load/reload/unload but had no reader anywhere; it had been
+kept despite that specifically because this table used to advertise it as
+a feature, which is why that row is gone too. Both are straightforward to
+reintroduce later, purpose-built, if a real feature ends up needing them —
+see `CHANGELOG.md`'s `3.0.11` entry for the full reasoning.
 
 ---
 

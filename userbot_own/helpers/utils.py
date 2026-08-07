@@ -72,6 +72,7 @@ __all__ = [
     # Delete helpers
     "safe_delete",
     "batch_delete",
+    "leave_dialog",
     # Media predicates
     "is_photo",
     "is_video",
@@ -255,6 +256,37 @@ async def batch_delete(
                         deleted += 1
                 break
     return deleted
+
+
+async def leave_dialog(client, entity) -> None:
+    """
+    Remove the account from *entity*, correctly, regardless of its type.
+
+    v3.0.11: replaces three independent call sites in join_left.py
+    (`_leave_and_reset_joined_folder`, `_check_auto_leave`,
+    `_handle_left`) that each used ``DeleteHistoryRequest`` for legacy
+    basic-group (``Chat``) entities. ``DeleteHistoryRequest`` only
+    clears the *local* message view — it does not remove chat
+    membership, so the account silently remained a member of every
+    basic group it was reported to have "left" (see CHANGELOG v3.0.11
+    and the audit report for the full analysis).
+
+    This delegates entirely to Telethon's own high-level
+    ``TelegramClient.delete_dialog()``, which already implements the
+    correct behavior per entity type, rather than re-implementing raw
+    TL request selection a fourth time:
+        - Channel (including supergroups): leaves via LeaveChannelRequest.
+        - Chat (legacy basic group): removes the account as a
+          participant via DeleteChatUserRequest.
+        - User (private chat / bot conversation): there is no
+          membership to leave, so this deletes the local dialog/history
+          — the only meaningful "leave" action for a 1:1 conversation.
+
+    Args:
+        client: Active ``TelegramClient``.
+        entity: Resolved Channel, Chat, or User entity to leave/delete.
+    """
+    await client.delete_dialog(entity)
 
 
 # ── Media type predicates ─────────────────────────────────────────────────────
@@ -535,6 +567,8 @@ def get_file_size(size_bytes: int | None) -> str:
     Example:
         >>> get_file_size(1048576)
         '1.0 MB'
+        >>> get_file_size(1048575)
+        '1.0 MB'
         >>> get_file_size(None)
         'Unknown'
     """
@@ -545,6 +579,14 @@ def get_file_size(size_bytes: int | None) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     idx   = min(int(math.floor(math.log(size_bytes, 1024))), len(units) - 1)
     val   = round(size_bytes / math.pow(1024, idx), 2)
+    # v3.0.11 fix: rounding can push val up to (or past) 1024 for a size
+    # right at a unit boundary — e.g. 1048575 bytes is 1023.999... KB,
+    # which rounds to 1024.0 and used to display as "1024.0 KB" instead
+    # of bumping to the next unit. Re-check and bump if needed so the
+    # displayed value always stays below 1024.
+    if val >= 1024 and idx < len(units) - 1:
+        idx += 1
+        val = round(size_bytes / math.pow(1024, idx), 2)
     return f"{val} {units[idx]}"
 
 

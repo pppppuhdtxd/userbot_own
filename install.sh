@@ -110,6 +110,22 @@ fi
 PY_VERSION="$($PYTHON_BIN -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "unknown")"
 log "Using interpreter: ${PYTHON_BIN} (Python ${PY_VERSION})"
 
+# v3.0.11: this used to only detect and display PY_VERSION without ever
+# checking it against the >=3.11 floor documented in requirements.txt /
+# pyproject.toml — an older system python3 would silently create a venv
+# that then failed confusingly, later, during `pip install` or at runtime.
+# Enforce the floor here instead, with a clear message up front.
+if [[ ! "$PY_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+  die "Could not determine ${PYTHON_BIN}'s version. Python 3.11+ is required."
+fi
+PY_MAJOR="${PY_VERSION%%.*}"
+PY_MINOR="${PY_VERSION##*.}"
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
+  die "Python ${PY_VERSION} found (${PYTHON_BIN}), but Python 3.11+ is required.
+Install a newer Python (e.g. 'pkg install python' on Termux, or your distro's
+python3.11+ package) and re-run this script."
+fi
+
 # ---------------------------------------------------------------------------
 # 3. Clone or update the repository
 #    A failed pull is a HARD STOP, never a silent warn-and-continue.

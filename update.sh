@@ -43,6 +43,23 @@ die()  { printf "%b[ FAIL ]%b %s\n" "$E" "$R" "$1"; exit 1; }
 [ -x "$VENV_PY" ] \
   || die "Virtual environment not found at ${INSTALL_DIR}/.venv. Re-run the installer."
 
+# v3.0.11: install.sh now refuses to create a venv with Python <3.11, but an
+# existing venv predating that fix (or hand-made) could still be stale.
+# Verify the interpreter actually inside it, not just that install.sh once
+# checked one — a version drift here would otherwise surface later as a
+# confusing pip/runtime failure instead of this clear message up front.
+PY_VERSION="$("$VENV_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "unknown")"
+if [[ ! "$PY_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+  die "Could not determine the venv interpreter's version (${VENV_PY})."
+fi
+PY_MAJOR="${PY_VERSION%%.*}"
+PY_MINOR="${PY_VERSION##*.}"
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
+  die "The virtual environment at ${INSTALL_DIR}/.venv uses Python ${PY_VERSION},
+  but Python 3.11+ is required. Remove it and re-run the installer:
+    rm -rf ${INSTALL_DIR}/.venv && bash ${INSTALL_DIR}/install.sh"
+fi
+
 VERSION_FILE="${INSTALL_DIR}/VERSION"
 read_version() { [ -f "$VERSION_FILE" ] && cat "$VERSION_FILE" || echo "unknown"; }
 
@@ -70,17 +87,35 @@ fi
 ok "Working tree clean (untracked files, if any, are not a blocker)."
 
 # ---------------------------------------------------------------------------
-# 2. Sync to origin. This device is a deployment target, not a place code
-#    is developed — origin is always authoritative. We already confirmed
-#    the tracked working tree is clean (step 1), so a hard reset to origin
-#    cannot lose any uncommitted work; it can only discard local commits
-#    that were never pushed, which should not exist on a deployment target.
+# 2. Sync to origin. This device is assumed to be a deployment target, not
+#    a place code is developed — origin is assumed authoritative. We already
+#    confirmed the tracked working tree is clean (step 1), so a hard reset
+#    to origin cannot lose any uncommitted work.
+#
+#    v3.0.11: that assumption used to be asserted only in this comment, not
+#    checked. A repo audit found a real case where it didn't hold — local
+#    had 8 commits (an entire architecture refactor) that were never pushed,
+#    which `reset --hard origin/<branch>` would have silently discarded on
+#    the next update. Verify the assumption instead of trusting it: refuse
+#    to proceed if HEAD has commits origin doesn't have yet.
 # ---------------------------------------------------------------------------
 log "Fetching latest code..."
 git -C "$INSTALL_DIR" fetch --quiet origin \
   || die "git fetch failed. Check your network connection and try again."
 
 BRANCH="$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+
+AHEAD_COUNT="$(git -C "$INSTALL_DIR" rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo 0)"
+if [ "$AHEAD_COUNT" != "0" ]; then
+  die "Local branch '${BRANCH}' has ${AHEAD_COUNT} commit(s) that are not on
+  origin/${BRANCH}. Continuing would run 'git reset --hard', which silently
+  DISCARDS them. This usually means this machine is also where the code is
+  developed, not only a deployment target. Push those commits first:
+    git -C ${INSTALL_DIR} push origin ${BRANCH}
+  then re-run update. If they were never meant to be here, remove or rebase
+  them off first instead — either way, this script won't guess for you."
+fi
+
 git -C "$INSTALL_DIR" reset --hard "origin/${BRANCH}" --quiet \
   || die "git reset --hard origin/${BRANCH} failed. Check the error above."
 

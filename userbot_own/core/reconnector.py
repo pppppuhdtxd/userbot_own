@@ -32,18 +32,24 @@ Adaptive Health Check:
 - 5-15s interval when degraded (faster recovery detection)
 
 Public API:
-    AccountReconnector(account_client, loader, event_bus) → reconnector instance
+    AccountReconnector(account_client, loader) → reconnector instance
         .run()          → start the reconnect loop (async)
         .stop()         → stop the loop
         .is_connected() → check current connection status
 
-DI note: the original module-level `_connection_callbacks` list plus
-`notify_connection_change()` / `register_connection_callback()` /
-`unregister_connection_callback()` functions are replaced by publishing
-`ConnectionStateChanged` events through the application-scoped `EventBus`
-injected into the constructor (see core/events.py). Every call site and
-trigger point below is unchanged — only the delivery mechanism moved from
-a bespoke callback list to the shared bus.
+v3.0.11 note: connection-state transitions were previously published as
+`ConnectionStateChanged` events through an application-scoped `EventBus`
+(core/events.py, now removed). A full-repo audit found zero subscribers
+anywhere in the codebase — the *original* pre-refactor mechanism this
+replaced (`notify_connection_change()` / `register_connection_callback()`)
+had zero real subscribers too. Two independent implementations of the same
+notification in a row with no consumer is a strong signal it isn't needed
+yet, so the bus was removed rather than carried forward unused. Every
+trigger point below is unchanged — `_notify()` now logs the transition
+directly via this reconnector's own contextual logger instead of
+publishing it. If a real consumer shows up later (e.g. a live per-account
+status view), it's easy to reintroduce a bus purpose-built for whatever
+that feature actually needs.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -65,8 +71,6 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
-
-from userbot_own.core.events import ConnectionStateChanged, EventBus
 
 if TYPE_CHECKING:
     from userbot_own.core.loader import AccountLoader
@@ -147,13 +151,13 @@ class AccountReconnector:
     3. Applies exponential backoff based on failure type
     4. Rebuilds client when internet is available
     5. RE-REGISTERS handlers on new client (CRITICAL)
-    6. Publishes ConnectionStateChanged events via the EventBus
+    6. Logs connection-state transitions for this account
 
     The actual reconnect logic uses @retry decorator from tenacity
     for automatic exponential backoff with smart exception handling.
 
     Usage:
-        reconnector = AccountReconnector(account_client, loader, event_bus)
+        reconnector = AccountReconnector(account_client, loader)
         await reconnector.run()  # blocks until cancelled
     """
 
@@ -161,11 +165,9 @@ class AccountReconnector:
         self,
         account_client: AccountClient,
         loader: AccountLoader,
-        event_bus: EventBus,
     ) -> None:
         self._ac = account_client
         self._loader = loader
-        self._event_bus = event_bus
         self._cfg = account_client.cfg
         self._running = False
         self._last_state = NetworkState.UNKNOWN
@@ -178,9 +180,10 @@ class AccountReconnector:
         )
 
     def _notify(self, connected: bool) -> None:
-        """Publish a ConnectionStateChanged event for this account."""
-        self._event_bus.publish(
-            ConnectionStateChanged(account_index=self._cfg.index, connected=connected)
+        """Log a connection-state transition for this account."""
+        self._log.info(
+            "[Account{}] Connection state changed: connected={}",
+            self._cfg.index, connected,
         )
 
     async def run(self) -> None:
@@ -332,7 +335,7 @@ class AccountReconnector:
         3. If internet available but Telegram down, wait longer
         4. If all good, rebuild client with tenacity retry
         5. RE-REGISTER handlers on new client (CRITICAL)
-        6. Publish ConnectionStateChanged about the connection change
+        6. Log the connection-state transition
 
         On successful recovery _consecutive_failures is reset to zero inside
         _attempt_connect().  On any non-success path the counter continues

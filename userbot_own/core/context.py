@@ -22,8 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from userbot_own.config.models import AccountConfig, Settings
-from userbot_own.core.events import EventBus
-from userbot_own.core.registry import AccountLoaderRegistry, AccountRegistry, PluginMetadataStore
+from userbot_own.core.registry import AccountLoaderRegistry, AccountRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,14 +38,11 @@ class ModuleContext:
                           one of these fields (history_limit) today, but the
                           whole Settings object is provided for the same
                           uniformity reason as the other fields here.
-        event_bus:        Application-scoped EventBus (shared across every account).
         loader_registry:  Application-scoped account-index -> AccountLoader map.
                           Deliberately cross-account, not per-account — see
                           registry.py's module docstring (system.py's `.stats`
                           command reports on every running account, not just
                           its own).
-        plugin_store:     Application-scoped plugin metadata store, likewise
-                          shared across every account.
         account_registry: Application-scoped, mutable registry of every
                           configured AccountConfig — replaces the old
                           `config.ACCOUNTS` global list that account_manager.py
@@ -54,9 +50,7 @@ class ModuleContext:
     """
     cfg: AccountConfig
     settings: Settings
-    event_bus: EventBus
     loader_registry: AccountLoaderRegistry
-    plugin_store: PluginMetadataStore
     account_registry: AccountRegistry
 
 

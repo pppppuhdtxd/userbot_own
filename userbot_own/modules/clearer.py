@@ -108,6 +108,8 @@ TYPE_FILTERS: dict[str, set[str]] = {
 
 class Clearer(Module):
     name = "clearer"
+    category = "cleaning"
+    desc = "پاک‌سازی دستی پیام‌ها"
 
     def __init__(self, context: ModuleContext) -> None:
         super().__init__(context)

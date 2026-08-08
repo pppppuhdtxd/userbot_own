@@ -11,8 +11,13 @@ The base class provides:
 - Constructor injection of a `ModuleContext` (cfg + application-scoped
   services) — see core/context.py. `self.cfg` remains available directly
   as a convenience since almost every module's body reads it, but the
-  full context (event bus, loader registry, plugin store) is also
-  available via `self.context` for the few modules that need it.
+  full context (`settings`, `loader_registry`, `account_registry`) is
+  also available via `self.context` for the few modules that need it.
+  (v3.0.13: corrected — this used to say "event bus, loader registry,
+  plugin store", neither of which exist. There is no event bus anywhere
+  in this codebase, and `PluginMetadataStore` was removed in v3.0.11 —
+  see core/registry.py's docstring. `ModuleContext` only ever carries
+  `cfg`, `settings`, `loader_registry`, `account_registry`.)
 - Automatic handler registration with duplicate-prevention
 - Per-module structured logging helpers
 - Safe message editing (swallows MessageNotModified / NotFound)
@@ -88,19 +93,41 @@ class Module:
     Abstract base for all userbot plugins.
 
     Subclasses must set at minimum:
-        name      — short identifier (used in logs and the plugin store)
+        name      — short identifier (used in logs, and as the key the
+                    loader tracks this module under)
         help_text — short Persian help string shown in the compact ``help``
                     output. Keep it to ~3-5 lines max.
 
     Optional:
         help_extra — extended Persian help shown via ``help <module>``.
                      Include examples, detailed explanations, edge cases.
+        category   — which group this module's help_text is shown under
+                     in the compact ``help`` output (see
+                     modules/help_handler.py's ``CATEGORIES`` list for the
+                     valid keys: cleaning, forward, info, social, reaction,
+                     system, general). Defaults to ``"general"``.
+                     (v3.0.13: previously the help system tracked
+                     category/description in a hardcoded external dict,
+                     `MODULE_MAP`, in help_handler.py — a new module was
+                     invisible in `help` and `help <module>` unless a
+                     human remembered to add a matching entry there too,
+                     even though the module itself loaded and ran
+                     perfectly fine. `category`/`desc` living directly on
+                     the module, read the same way `help_text`/
+                     `help_extra` always have been, removes that manual
+                     step entirely — see CHANGELOG v3.0.13.)
+        desc       — short Persian one-line description shown next to
+                     this module's name in the compact ``help`` listing
+                     (distinct from `help_text`, which is the module's own
+                     command summary). Defaults to ``""``.
     """
 
     # ── Public attributes (override in subclasses) ───────────────────────────
     name: str = ""
     help_text: str = ""
     help_extra: str = ""
+    category: str = "general"
+    desc: str = ""
 
     #: Default delay (seconds) for _track_delete_task / _safe_edit_with_auto_delete
     #: when called without an explicit delay. Override per-subclass — e.g.

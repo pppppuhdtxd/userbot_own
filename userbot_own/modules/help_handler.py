@@ -38,18 +38,22 @@ CATEGORIES: list[tuple[str, str]] = [
     ("general",   "عمومی"),
 ]
 
-#: Maps module stem → (category_key, short_description)
-MODULE_MAP: dict[str, tuple[str, str]] = {
-    "clearer":            ("cleaning",  "پاک‌سازی دستی پیام‌ها"),
-    "auto_clearer":       ("cleaning",  "پاک‌سازی خودکار"),
-    "auto_forwarder":     ("forward",   "فوروارد خودکار"),
-    "info_handler":       ("info",      "اطلاعات پیام"),
-    "whois_handler":      ("info",      "اطلاعات کاربر و چت"),
-    "join_left":          ("social",    "عضویت و ترک چت‌ها"),
-    "reaction_commands":  ("reaction",  "دستورات با ری‌اکشن"),
-    "system":             ("system",    "مدیریت سیستم"),
-    "help_handler":       ("general",   "راهنما"),
-}
+#: Set of valid category keys — derived from CATEGORIES so the two never
+#: drift apart. Used to detect a module whose `category` attribute doesn't
+#: match any known key (see _show_compact_help's grouping loop below).
+_VALID_CATEGORY_KEYS: frozenset[str] = frozenset(key for key, _ in CATEGORIES)
+
+# v3.0.13: MODULE_MAP (a hardcoded stem → (category, desc) dict) has been
+# removed. It required every new module's author to also manually add a
+# matching entry here — a step nothing enforced and nothing documented
+# clearly, so a module could be fully loaded and functional (handlers
+# registered, commands working) while being completely invisible to both
+# `help` and `help <module>`, simply because this dict was never updated.
+# `category` and `desc` are now read directly off each loaded Module
+# instance (see base.py), the same way `help_text`/`help_extra` already
+# were — any module that loads is now automatically visible in help, with
+# zero extra step required. See CHANGELOG v3.0.13 for the full root-cause
+# writeup.
 
 
 # ── Module ──────────────────────────────────────────────────────────────────
@@ -58,6 +62,8 @@ class HelpHandler(Module):
     """Category-based help system with dynamic reading from modules."""
 
     name = "help_handler"
+    category = "general"
+    desc = "راهنما"
 
     def setup(self, client: TelegramClient) -> None:
         self._add_handler(client, events.NewMessage(outgoing=True), self._on_command)
@@ -117,11 +123,6 @@ class HelpHandler(Module):
         grouped: dict[str, list[tuple[str, str, str]]] = {}
 
         for stem in loaded_stems:
-            if stem not in MODULE_MAP:
-                continue
-
-            cat_key, desc = MODULE_MAP[stem]
-
             # Retrieve the Module instance via the loader's public API.
             instance = loader.get_module(stem)
             if instance is None:
@@ -131,6 +132,39 @@ class HelpHandler(Module):
 
             if not help_text.strip():
                 continue
+
+            cat_key = getattr(instance, "category", "general") or "general"
+            desc = getattr(instance, "desc", "") or ""
+
+            # v3.0.13: category/desc now come from the module instance
+            # itself instead of an external MODULE_MAP, so there's no
+            # longer a way for a loaded module to be silently skipped here.
+            # Two remaining failure modes are still worth surfacing:
+            if cat_key not in _VALID_CATEGORY_KEYS:
+                # An unrecognized category value (typo, stale category from
+                # a renamed group) — fall back to "general" so the module
+                # still shows up somewhere, but log it so it gets fixed.
+                self._log_warning(
+                    "Module '%s' has unrecognized category '%s' — showing "
+                    "under 'general' instead. Valid categories: %s",
+                    stem, cat_key, ", ".join(k for k, _ in CATEGORIES),
+                )
+                cat_key = "general"
+            elif cat_key == "general" and "category" not in type(instance).__dict__:
+                # The module's class never set `category` at all, so this
+                # is Module's own class-level default rather than a
+                # deliberate choice — very likely a module author simply
+                # forgot to set it. Not fatal (defaults to "general" is a
+                # safe fallback, same spirit as MODULE_MAP's old design),
+                # but worth a warning so the gap doesn't go unnoticed the
+                # way a missing MODULE_MAP entry used to (see CHANGELOG
+                # v3.0.13 for the bug this replaces).
+                self._log_warning(
+                    "Module '%s' has no `category` set — defaulting to "
+                    "'general' ('عمومی'). Set `category` on its Module "
+                    "subclass to place it in a more specific group.",
+                    stem,
+                )
 
             grouped.setdefault(cat_key, []).append((stem, desc, help_text.strip()))
             visible_modules += 1
@@ -214,10 +248,17 @@ class HelpHandler(Module):
         # Try exact match first
         stem = query.lower().strip()
 
-        # Check if module exists in the known map
-        if stem not in MODULE_MAP:
-            # Try fuzzy search
-            matches = self._fuzzy_search(query, list(MODULE_MAP.keys()))
+        # v3.0.13: previously checked `stem not in MODULE_MAP` here — a
+        # hardcoded external dict that had no relationship to what was
+        # actually loaded. A fully-functional module missing from that
+        # dict would always land in this "not found" branch. Now the
+        # loader's own live module list is the single source of truth:
+        # any stem the loader actually has loaded resolves correctly here.
+        instance = loader.get_module(stem)
+        if instance is None:
+            # Not currently loaded — try fuzzy search against everything
+            # that *is* currently loaded, instead of a static map.
+            matches = self._fuzzy_search(query, loader.list_modules())
             if matches:
                 suggestions = "، ".join(f"`{m}`" for m in matches[:5])
                 await self._safe_edit(
@@ -232,12 +273,6 @@ class HelpHandler(Module):
                     f"ماژول `{query}` یافت نشد.\n\n"
                     f"برای لیست کامل: `help`"
                 )
-            return
-
-        # Retrieve the Module instance via the loader's public API.
-        instance = loader.get_module(stem)
-        if instance is None:
-            await self._safe_edit(event, f"ماژول `{stem}` لود نشده است.")
             return
 
         extra = getattr(instance, "help_extra", "") or ""

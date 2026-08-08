@@ -5,6 +5,99 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.0.13] — 2026-08-08
+
+**Source:** AI (targeted investigation — "new module invisible in help
+despite working correctly at runtime"; see the standalone report this
+release implements for full root-cause analysis)
+
+### Fixed — `help_handler.py`: new modules invisible in `help` / `help <module>`
+
+**Root cause:** `help_handler.py` determined which loaded modules were
+shown in the `help` output — and whether `help <module_name>` could find
+one at all — via a hardcoded, module-level `MODULE_MAP` dict mapping
+stem → `(category, description)`. This dict had no relationship to what
+the loader actually had loaded: `AccountLoader.load_all()` (`core/loader.py`)
+loads any `.py` file in `modules/` that defines `create_module()` and
+returns a `Module` instance — no registration step required, no dependency
+on `MODULE_MAP` whatsoever. A brand-new module therefore loaded correctly,
+its handlers registered, and its commands worked immediately — but it was
+silently skipped by `_show_compact_help()`'s `if stem not in MODULE_MAP:
+continue`, and `_show_module_help()` routed `help <new_module>` straight to
+the "module not found" / fuzzy-suggestion branch, because it ran the exact
+same check. Nothing logged a warning; the only symptom was the module
+simply never appearing.
+
+Several plausible-sounding hypotheses for this turned out not to apply to
+this codebase at all: there is no `PluginMetadataStore` (removed in
+`3.0.11` — see `core/registry.py`'s docstring) and no EventBus anywhere in
+this project, so a "stale plugin store" or "disconnected EventBus" theory,
+while a reasonable first guess for a symptom shaped like this, doesn't
+describe what's actually here.
+
+**Fix:** `MODULE_MAP` has been removed entirely. `category` and `desc` are
+now class attributes on `modules/base.py`'s `Module` base class (`category
+= "general"`, `desc = ""` by default), set per-subclass exactly the same
+way `help_text`/`help_extra` already are, and read directly off the loaded
+instance by `help_handler.py`. This makes `help` visibility fully derived
+from what the loader actually has loaded — a new module that defines
+`category`/`desc` (or even one that doesn't, since both default sanely) is
+now automatically visible in both `help` and `help <module>` with **zero**
+extra registration step, closing off this entire class of bug rather than
+just fixing today's specific instance. `help <module>`'s fuzzy-search
+fallback now also suggests from the loader's live module list instead of
+the old static map.
+
+Also added: a warning log (`help_handler.py`) when a loaded module is
+found using the default `"general"` category without having explicitly
+set one — surfacing a likely-forgotten `category` attribute immediately
+instead of the module quietly filing under "عمومی" with no trace.
+
+### Changed — `modules/base.py`, `clearer.py`, `auto_clearer.py`,
+`auto_forwarder.py`, `info_handler.py`, `whois_handler.py`, `join_left.py`,
+`reaction_commands.py`, `system.py`, `help_handler.py`
+
+Added `category` and `desc` class attributes to `Module` (with sensible
+defaults) and set them explicitly on all 9 existing plugin modules, using
+the exact `(category, description)` values the old `MODULE_MAP` previously
+held for each — so the compact `help` output is visually unchanged for
+every module that existed before this release.
+
+### Fixed — `modules/base.py`: stale docstring referencing removed `PluginMetadataStore` / non-existent EventBus
+
+**Root cause:** `Module`'s class docstring described `self.context` as
+providing "event bus, loader registry, plugin store" — none of which is
+accurate. There has never been an EventBus in this codebase, and
+`PluginMetadataStore` was deliberately removed in `3.0.11` (see
+`core/registry.py`'s own docstring, which documents the removal in detail).
+This stale phrasing was carried over unnoticed and, during this
+investigation, its similarity to some initially-plausible root-cause
+hypotheses for the help-visibility bug (a stale/disconnected plugin store)
+briefly pointed research in the wrong direction before the actual
+`ModuleContext` fields were checked directly.
+
+**Fix:** docstring corrected to accurately list what `ModuleContext`
+actually provides: `cfg`, `settings`, `loader_registry`, `account_registry`.
+
+### Changed — `README.md`: "Writing a New Module" section
+
+- Added `category` and `desc` to the "Key Module Attributes" table, with
+  the valid category keys spelled out.
+- Corrected the `name` attribute's stale description ("used in logs and
+  the plugin store" → "used in logs, and as the key the loader tracks this
+  module under") — same stale-plugin-store phrasing as the `base.py` fix
+  above, now consistent in both places.
+- Clarified that a module left without an explicit `category` still loads
+  and works normally, just files under the generic "عمومی" group with a
+  logged warning.
+- Added a new "`help_text` / `help_extra` formatting conventions"
+  subsection documenting the informal but consistent style every existing
+  module already follows (bullet format, section headers, RTL/backtick
+  interaction), since this was previously only inferable by reading
+  existing modules rather than being written down anywhere.
+
+---
+
 ## [3.0.12] — 2026-08-08
 
 **Source:** AI (targeted follow-up investigation — three reported bugs plus a

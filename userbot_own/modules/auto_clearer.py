@@ -118,6 +118,8 @@ def _message_matches_filter(msg, filter_type: str) -> bool:
 
 class AutoClearer(Module):
     name = "auto_clearer"
+    category = "cleaning"
+    desc = "پاک‌سازی خودکار"
 
     def __init__(self, context: ModuleContext) -> None:
         super().__init__(context)

@@ -853,6 +853,8 @@ class JoinLeft(Module):
     """Join/leave chats with folder management, mute/archive, and auto-leave."""
 
     name = "join_left"
+    category = "social"
+    desc = "عضویت و ترک چت‌ها"
     _auto_delete_default_delay = _AUTO_DELETE_DELAY
 
     def __init__(self, context: ModuleContext) -> None:

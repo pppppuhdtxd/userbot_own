@@ -40,6 +40,8 @@ class SystemModule(Module):
     """Owner management commands (Saved Messages only, read-only subset)."""
 
     name = "system"
+    category = "system"
+    desc = "مدیریت سیستم"
     _auto_delete_default_delay = _AUTO_DELETE_DELAY
 
     def __init__(self, context: ModuleContext) -> None:

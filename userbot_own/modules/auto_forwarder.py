@@ -98,6 +98,8 @@ def _is_audio(msg) -> bool:
 
 class AutoForwarder(Module):
     name = "auto_forwarder"
+    category = "forward"
+    desc = "فوروارد خودکار"
 
     def __init__(self, context: ModuleContext) -> None:
         super().__init__(context)

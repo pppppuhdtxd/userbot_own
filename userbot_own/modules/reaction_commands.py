@@ -176,6 +176,8 @@ class ReactionCommands(Module):
     """Execute commands via emoji reactions (Funnel Architecture, zero polling)."""
 
     name = "reaction_commands"
+    category = "reaction"
+    desc = "دستورات با ری‌اکشن"
 
     # ── Dynamic scope (v3.0.8) ──────────────────────────────────────────────
     # Replaces the old hardcoded ENABLE_FOR_BOTS/USERS/GROUPS/CHANNELS class

@@ -82,6 +82,8 @@ class WhoisHandler(Module):
     """Display detailed information about users, channels, and groups."""
 
     name = "whois_handler"
+    category = "info"
+    desc = "اطلاعات کاربر و چت"
 
     def setup(self, client: TelegramClient) -> None:
         self._add_handler(client, events.NewMessage(outgoing=True), self._on_command)

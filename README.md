@@ -554,6 +554,17 @@ from userbot_own.modules.base import Module
 class MyModule(Module):
     name = "my_module"
 
+    # Which group this module appears under in the compact `help` output.
+    # One of: cleaning, forward, info, social, reaction, system, general
+    # (see modules/help_handler.py's CATEGORIES list). Defaults to
+    # "general" if omitted — but set it explicitly so `help` groups your
+    # module sensibly instead of dumping it in "عمومی".
+    category = "general"
+
+    # Short one-line description shown next to your module's name in the
+    # compact `help` listing (distinct from help_text below).
+    desc = "توضیح کوتاه ماژول من"
+
     # Compact help text shown in `help` (2-5 lines max)
     help_text = "• `mycommand` — does something cool\n"
 
@@ -584,18 +595,31 @@ def create_module(context: ModuleContext) -> Module:
     return MyModule(context)
 ```
 
-3. The file is picked up automatically (hot-reload) — no restart needed.
+3. The file is picked up automatically (hot-reload) — the module loads and
+   its commands work immediately, no restart needed, and it's automatically
+   visible in `help` / `help <module>` too — as of `3.0.13`, help visibility
+   is derived directly from the module's own attributes below, not from any
+   separate list you need to remember to update.
 
 ### Key Module Attributes
 
 | Attribute | Required | Description |
 | --- | --- | --- |
-| `name` | ✅ | Short identifier (used in logs and the plugin store) |
+| `name` | ✅ | Short identifier (used in logs, and as the key the loader tracks this module under) |
 | `help_text` | ✅ | Compact help shown in `help` (2-5 lines) |
 | `help_extra` | ❌ | Extended help shown via `help <module_name>` |
+| `category` | ❌ | Which group this module appears under in the compact `help` output — one of `cleaning`, `forward`, `info`, `social`, `reaction`, `system`, `general` (see `modules/help_handler.py`'s `CATEGORIES` list). Defaults to `"general"` if omitted. |
+| `desc` | ❌ | Short one-line description shown next to the module's name in the compact `help` listing. Defaults to `""` if omitted. |
 
 There is no admin/permission attribute — every account is equal, and every
 module is visible and usable from every account.
+
+`category` and `desc` determine where and how your module shows up in the
+`help` output — set `category` to whichever group in the table above best
+matches what your module does. If you leave it unset, the module still
+loads and works normally, but shows up under the generic "عمومی" ("general")
+group in `help`, and a warning is logged so the omission doesn't go
+unnoticed (`3.0.13`).
 
 ### What `context` gives you
 
@@ -635,6 +659,24 @@ leave a truncated settings file. See `auto_clearer.py`, `auto_forwarder.py`,
 For a multi-command module, `userbot_own.modules.router.CommandRouter` gives you
 declarative first-token dispatch instead of a hand-rolled `if/elif` chain —
 see `system.py` for a small example.
+
+### `help_text` / `help_extra` formatting conventions
+
+These aren't enforced by code, but every existing module follows the same
+shape — match it so `help` output stays visually consistent:
+
+- **`help_text`** (shown in the compact `help` listing): 2–5 lines. One
+  bullet (`• `) per command, each in the form
+  `` • `command syntax` | کوتاه‌ترین توضیح ممکن\n ``. Wrap every literal
+  command the user would type in backticks so it copy-pastes cleanly.
+- **`help_extra`** (shown via `help <module_name>`): no strict length
+  limit, but organize it under a handful of short bolded-by-convention
+  section headers (see any existing module for the pattern) — typically
+  "دستورات اصلی", "مثال‌ها", and "نکات مهم" at minimum. Keep each bullet to
+  one line where possible.
+- Persian text is RTL; keep backticked command syntax (which is LTR) short
+  and self-contained per line so it doesn't visually break the surrounding
+  RTL flow.
 
 ---
 

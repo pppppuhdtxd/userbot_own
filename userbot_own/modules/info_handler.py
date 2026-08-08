@@ -123,6 +123,8 @@ _TYPE_LABELS: dict[str, str] = {
 
 class InfoHandler(Module):
     name = "info_handler"
+    category = "info"
+    desc = "اطلاعات پیام"
 
     def setup(self, client: TelegramClient) -> None:
         self._add_handler(client, events.NewMessage(outgoing=True), self._on_command)

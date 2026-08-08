@@ -62,16 +62,20 @@ class Application:
         # also trigger a clean shutdown rather than an abrupt exit.
         if sys.platform != "win32":
             loop = asyncio.get_running_loop()
-            loop.add_signal_handler(
-                signal.SIGTERM,
-                lambda: loop.call_soon_threadsafe(
-                    asyncio.get_event_loop().stop
-                    if False  # placeholder — overridden below
-                    else _cancel_all_tasks,
-                    loop,
-                ),
-            )
-            # Replace placeholder with the real cancellation helper
+            # v3.0.12: this used to register a SIGTERM handler here that
+            # referenced an undefined `_cancel_all_tasks` name (flagged by
+            # ruff). It was harmless in practice — `add_signal_handler`
+            # replaces rather than stacks handlers for the same signal, and
+            # the single handler registered below always won — but it was
+            # genuinely dead/broken code left over from an earlier draft.
+            # Removed; `_request_shutdown` below is the one real handler and
+            # already does the correct `asyncio.all_tasks()` + `task.cancel()`
+            # work. This is a separate cancellation layer from the
+            # `except asyncio.CancelledError` block further down: SIGTERM
+            # cancels every task on the loop (including this one), which
+            # propagates into `run()`'s own `gather()` as CancelledError,
+            # which then does its own targeted cancel/gather of just the
+            # per-account tasks for orderly per-account cleanup.
             loop.add_signal_handler(
                 signal.SIGTERM,
                 lambda: _request_shutdown(loop),
@@ -119,12 +123,25 @@ def _request_shutdown(loop: asyncio.AbstractEventLoop) -> None:
 
 def main() -> None:
     """Entry point — run the async main loop, exit cleanly on Ctrl+C or SIGTERM."""
+    import logging
+
     userbot_dir = Path(__file__).resolve().parent.parent
+    log = logging.getLogger(__name__)
 
     try:
         asyncio.run(Application(userbot_dir).run())
     except KeyboardInterrupt:
-        print("\n[SHUTDOWN] Ctrl+C received — exiting gracefully.")
+        # v3.0.12: log through the configured logger (not print()) so a
+        # Ctrl+C shutdown shows up in log files the same way a SIGTERM
+        # shutdown already does, instead of only appearing on stdout.
+        log.info("Ctrl+C received — exiting gracefully.")
+    except Exception:
+        # v3.0.12: a startup/runtime error before this point previously
+        # produced a raw traceback with no consistent framing. Log it
+        # cleanly through the configured logger, then re-raise so the
+        # process still exits non-zero and the full traceback is preserved.
+        log.exception("Unexpected error — exiting.")
+        raise
 
 
 __all__ = ["Application", "main"]

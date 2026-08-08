@@ -118,6 +118,7 @@ Commands (in Saved Messages):
 from __future__ import annotations
 
 import asyncio
+import time
 
 from telethon import TelegramClient, events
 from telethon import utils as telethon_utils
@@ -146,6 +147,27 @@ from userbot_own.modules.bridge import MockEvent
 #: memory at once. Evicted oldest-first, in a batch (down to half the cap),
 #: same pattern the old permanent _processed set used for its own eviction.
 _MAX_TRACKED_MESSAGES = 1000
+
+#: v3.0.12 (Gate 5b): how long, in seconds, an identical (chat_id, msg_id,
+#: emoji) trigger is suppressed after it fires — a time-based debounce
+#: layered on top of Gate 5's state-based rising-edge check. Gate 5 alone
+#: intentionally allows a genuine remove-then-re-add of the same emoji to
+#: re-fire (that's the whole point of its v3.0.2 fix), but that means a
+#: rapid double-tap / flicker looks identical to a deliberate re-trigger
+#: minutes later. This cooldown distinguishes the two without touching
+#: Gate 5's own semantics.
+_REACTION_COOLDOWN_SECONDS = 30.0
+
+#: Soft cap on how many (chat, msg, emoji) cooldown entries to keep in
+#: memory at once — same oldest-first, evict-to-half pattern as
+#: _MAX_TRACKED_MESSAGES / _remember_reaction_state.
+_MAX_TRACKED_COOLDOWNS = 1000
+
+#: v3.0.12: how often (seconds) the "still alive" heartbeat log line is
+#: emitted, so a module that has gone silently deaf (e.g. via a failed
+#: reattach, or a swallowed exception) is discoverable within one interval
+#: instead of only by manually testing it.
+_HEARTBEAT_INTERVAL_SECONDS = 300.0
 
 
 # ── Module ────────────────────────────────────────────────────────────────────
@@ -195,6 +217,14 @@ class ReactionCommands(Module):
         # state tracking" section for the full rationale.
         self._active_reactions: dict[tuple[int, int], frozenset[str]] = {}
 
+        # v3.0.12 (Gate 5b): (chat_id, msg_id, emoji) -> time.monotonic()
+        # timestamp of the last time this exact trigger actually executed a
+        # command. See _REACTION_COOLDOWN_SECONDS above for the rationale.
+        # Deliberately in-memory only, same as _active_reactions — a restart
+        # clears the cooldown along with the rising-edge state, which is
+        # consistent with existing behavior rather than a new inconsistency.
+        self._last_fired: dict[tuple[int, int, str], float] = {}
+
         # user_id -> is this peer a bot. Populated on first sight per user,
         # avoiding a repeated client.get_entity() call for every reaction
         # event from/about a user we've already classified.
@@ -211,12 +241,39 @@ class ReactionCommands(Module):
         self._me_id_task: asyncio.Task | None = None
         self._ready_task: asyncio.Task | None = None
 
+        # v3.0.12: periodic "still alive" heartbeat task — see setup()/
+        # teardown() and _heartbeat_loop() below.
+        self._heartbeat_task: asyncio.Task | None = None
+
     def setup(self, client: TelegramClient) -> None:
         self._client = client
-        self._ensure_settings_file()
-        self._load_settings()
-        self._ensure_scope_file()
-        self._load_scope()
+
+        # v3.0.12: each of these four calls used to run unwrapped, back to
+        # back — a single bad disk read (permissions glitch, transient I/O
+        # error, full disk, etc.) in any one of them would raise out of
+        # setup() entirely and skip the _add_handler() calls below it,
+        # silently leaving this module with no registered handlers at all
+        # (see loader.py's reattach()/_do_load() — a setup() exception is
+        # exactly the failure mode that produces a module that looks loaded
+        # but never receives another event). Wrapping each call
+        # individually means a bad settings/scope read degrades to
+        # "defaults for this run" instead of "module never wakes up".
+        try:
+            self._ensure_settings_file()
+        except Exception as exc:
+            self._log_error("ensure_settings_file failed during setup(): %s", exc)
+        try:
+            self._load_settings()
+        except Exception as exc:
+            self._log_error("load_settings failed during setup(): %s", exc)
+        try:
+            self._ensure_scope_file()
+        except Exception as exc:
+            self._log_error("ensure_scope_file failed during setup(): %s", exc)
+        try:
+            self._load_scope()
+        except Exception as exc:
+            self._log_error("load_scope failed during setup(): %s", exc)
 
         # Register command handler
         self._add_handler(client, events.NewMessage(outgoing=True), self._on_command)
@@ -238,6 +295,11 @@ class ReactionCommands(Module):
             self._set_ready(), name=f"reaction_ready_a{self.cfg.index}"
         )
 
+        # v3.0.12: periodic "still alive" heartbeat — see _heartbeat_loop().
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name=f"reaction_heartbeat_a{self.cfg.index}"
+        )
+
         self._log_info(
             "ReactionCommands ready (Funnel Architecture). %d reactions configured. "
             "Active scope: %s",
@@ -249,8 +311,11 @@ class ReactionCommands(Module):
             self._me_id_task.cancel()
         if self._ready_task is not None and not self._ready_task.done():
             self._ready_task.cancel()
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
         self._me_id_task = None
         self._ready_task = None
+        self._heartbeat_task = None
 
         # v3.0.8: _active_reactions (Gate 5 dedup state), _peer_is_bot_cache
         # and _channel_megagroup_cache are deliberately NOT cleared here.
@@ -280,6 +345,34 @@ class ReactionCommands(Module):
             return
         self._is_ready = True
         self._log_info("Module marked as ready — processing new reactions.")
+
+    # ── Heartbeat (v3.0.12) ──────────────────────────────────────────────
+
+    async def _heartbeat_loop(self) -> None:
+        """
+        Periodically log that this module is still alive and receiving
+        control.
+
+        Task 2B's silent-failure symptom ("no matter how many reactions are
+        added, no command is executed, and no log output appears — not even
+        a debug log") is only diagnosable from the outside if *something*
+        logs on a schedule regardless of whether any reaction ever arrives.
+        This loop is that something: if it stops appearing in the logs, the
+        module's own event loop / task scheduling has died (extremely
+        unlikely); if reactions stop working but this keeps appearing, the
+        problem is upstream (handlers not receiving updates) rather than
+        this module having gone entirely dark, which narrows debugging
+        immediately.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+                self._log_info(
+                    "alive — %d reactions configured, ready=%s",
+                    len(self._reactions), self._is_ready,
+                )
+        except asyncio.CancelledError:
+            return
 
     # ── Self ID cache ─────────────────────────────────────────────────────
 
@@ -630,6 +723,26 @@ class ReactionCommands(Module):
         """
         Handle UpdateMessageReactions — the primary push route.
 
+        v3.0.12: this is now a thin try/except wrapper around
+        _on_reaction_update_impl(). Telethon's own docs note that
+        exceptions raised inside event-handler callbacks are hidden by
+        default unless the caller has separately configured logging for
+        Telethon's internal logger — which means a bug inside this handler
+        could previously produce *zero* log output anywhere, matching Task
+        2B's "not even a debug log" symptom exactly. This wrapper logs via
+        this project's own logger unconditionally, regardless of how
+        Telethon's logging is configured elsewhere, so that failure mode
+        can never be silent again.
+        """
+        try:
+            await self._on_reaction_update_impl(event)
+        except Exception as exc:
+            self._log_error("Unhandled error in _on_reaction_update: %s", exc)
+
+    async def _on_reaction_update_impl(self, event) -> None:
+        """
+        Handle UpdateMessageReactions — the primary push route.
+
         BUG FIX (v3.0.2): this used to read `event.peer_id` and
         `event.chat_id`. Neither exists on the raw UpdateMessageReactions
         update — its actual fields (confirmed against the Telethon
@@ -655,6 +768,7 @@ class ReactionCommands(Module):
         Gate 3: Self-Only filter (recent_reactions)
         Gate 4: Mapping filter (emoji in _reactions)
         Gate 5: Reaction-state tracking (_active_reactions)
+        Gate 5b: Per-trigger cooldown (_last_fired) — v3.0.12
         """
         # Gate 1: Post-Startup Filter
         if not self._is_ready:
@@ -689,6 +803,19 @@ class ReactionCommands(Module):
     # ── Method 2: UpdateEditMessage (Secondary Push Route) ────────────────
 
     async def _on_edit_update(self, event) -> None:
+        """
+        Handle UpdateEditMessage — secondary push route.
+
+        v3.0.12: thin try/except wrapper around _on_edit_update_impl() —
+        see _on_reaction_update's wrapper docstring for why this matters
+        (Telethon hides handler exceptions by default).
+        """
+        try:
+            await self._on_edit_update_impl(event)
+        except Exception as exc:
+            self._log_error("Unhandled error in _on_edit_update: %s", exc)
+
+    async def _on_edit_update_impl(self, event) -> None:
         """
         Handle UpdateEditMessage — secondary push route.
 
@@ -845,6 +972,29 @@ class ReactionCommands(Module):
             if emoji_str not in self._reactions:
                 continue
 
+            # Gate 5b (v3.0.12): per-trigger cooldown. Gate 5 above is a
+            # pure state-comparison rising-edge check — it deliberately
+            # allows a genuine remove-then-re-add of the same emoji to
+            # fire again, which is correct for a deliberate re-trigger
+            # minutes later, but looks identical to a rapid double-tap /
+            # flicker seconds later. This gate suppresses an identical
+            # (chat_id, msg_id, emoji) trigger for _REACTION_COOLDOWN_SECONDS
+            # after it last actually fired, without affecting a different
+            # emoji on the same message or the same emoji on a different
+            # message (both use a different key and are unaffected).
+            cooldown_key = (chat_id, msg_id, emoji_str)
+            now = time.monotonic()
+            last_fired = self._last_fired.get(cooldown_key)
+            if last_fired is not None and (now - last_fired) < _REACTION_COOLDOWN_SECONDS:
+                self._log_debug(
+                    "⏳ Cooldown active, skipping: emoji=%s, chat=%d, msg=%d "
+                    "(%.1fs remaining)",
+                    emoji_str, chat_id, msg_id,
+                    _REACTION_COOLDOWN_SECONDS - (now - last_fired),
+                )
+                continue
+            self._remember_last_fired(cooldown_key, now)
+
             command_text = self._reactions[emoji_str]
 
             self._log_debug(
@@ -876,6 +1026,23 @@ class ReactionCommands(Module):
             overflow = len(self._active_reactions) - (_MAX_TRACKED_MESSAGES // 2)
             for old_key in list(self._active_reactions.keys())[:overflow]:
                 del self._active_reactions[old_key]
+
+    def _remember_last_fired(self, key: tuple[int, int, str], when: float) -> None:
+        """
+        Record *when* (a time.monotonic() timestamp) as the last-fired time
+        for the (chat_id, msg_id, emoji) cooldown *key* — see
+        _REACTION_COOLDOWN_SECONDS / Gate 5b — and evict the oldest tracked
+        cooldown entries in a batch if the total count exceeds
+        `_MAX_TRACKED_COOLDOWNS`, same oldest-first, evict-to-half pattern
+        as `_remember_reaction_state`.
+        """
+        is_new_key = key not in self._last_fired
+        self._last_fired[key] = when
+
+        if is_new_key and len(self._last_fired) > _MAX_TRACKED_COOLDOWNS:
+            overflow = len(self._last_fired) - (_MAX_TRACKED_COOLDOWNS // 2)
+            for old_key in list(self._last_fired.keys())[:overflow]:
+                del self._last_fired[old_key]
 
     # ── Direct command execution ──────────────────────────────────────────
 

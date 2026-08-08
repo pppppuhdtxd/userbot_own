@@ -5,6 +5,99 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.0.12] — 2026-08-08
+
+**Source:** AI (targeted follow-up investigation — three reported bugs plus a
+best-practices research pass; see the standalone report this release
+implements for full root-cause analysis of each item below)
+
+### Fixed — `app/application.py`: `_cancel_all_tasks` undefined-name bug (ruff)
+
+**Root cause:** `Application.run()` registered a `SIGTERM` handler twice for
+the same signal. `add_signal_handler` replaces rather than stacks handlers
+per signal, so the first (broken) registration — a leftover draft that
+referenced a `_cancel_all_tasks` name never defined anywhere in the module —
+was always immediately overridden by the second, working registration
+(`_request_shutdown`) and never actually ran. Ruff correctly flagged it as a
+genuine undefined-name reference regardless of reachability.
+
+**Fix:** removed the dead first registration entirely, keeping only
+`_request_shutdown` (which already does the correct
+`asyncio.all_tasks()` → `task.cancel()` pattern). Also normalized
+`main()`'s `KeyboardInterrupt` handling to log through the configured
+logger instead of `print()`, and added a top-level `except Exception` in
+`main()` for cleaner, consistently-logged startup-error output.
+
+### Fixed — `reaction_commands.py`: repeated command execution on rapid reaction re-triggers
+
+**Root cause:** Gate 5 (`_active_reactions`) is a pure state-comparison
+rising-edge check — it intentionally treats a genuine remove-then-re-add of
+the same emoji as a new, legitimate trigger (that's the whole point of the
+v3.0.2 fix). Nothing previously distinguished a deliberate re-trigger
+minutes later from a rapid double-tap / flicker seconds later — both look
+identical to Gate 5.
+
+**Fix:** added Gate 5b — a new `(chat_id, msg_id, emoji) → timestamp`
+cooldown (`_last_fired`, `_remember_last_fired()`) that suppresses an
+identical trigger for 30 seconds after it last fired, independent of Gate
+5's own state tracking. A different emoji on the same message, or the same
+emoji on a different message, uses a different cooldown key and is
+unaffected. In-memory only (consistent with `_active_reactions`'s existing
+behavior across restarts), with the same oldest-first, evict-to-half
+eviction pattern already used elsewhere in this module to bound memory.
+
+### Fixed — `reaction_commands.py`: module could silently stop responding entirely
+
+**Root cause (primary):** `core/loader.py`'s `reattach()` — called after
+every reconnect — previously logged and counted a `setup()` failure but
+left the module in the loaded set regardless, with handlers never actually
+re-registered on the new client. The module then looked "loaded" forever
+while never receiving another event, with no further log output to
+diagnose it by. **Contributing factor:** Telethon's own documentation
+confirms exceptions raised inside event-handler callbacks are hidden by
+default unless the caller has separately configured Telethon's internal
+logger — so a bug inside either update handler could independently produce
+zero log output anywhere, matching the same symptom via a different path.
+
+**Fix:**
+- `core/loader.py`: `reattach()` now removes a module from the loaded set
+  when its `setup()` fails, instead of leaving a half-registered instance
+  behind — `get_module(stem)` correctly returns `None` afterward, making
+  the failure diagnosable rather than silent. Failing stems are named
+  explicitly in a `warning`-level summary log.
+- `reaction_commands.py`: `_on_reaction_update` and `_on_edit_update` are
+  now thin try/except wrappers around their (renamed, `_impl`-suffixed)
+  bodies, logging any exception through this project's own logger
+  unconditionally — independent of how Telethon's logging is configured
+  elsewhere.
+- `reaction_commands.py`: added a periodic heartbeat (`_heartbeat_loop()`,
+  every 5 minutes, `info` level — `"alive — N reactions configured,
+  ready=%s"`) so a module that has gone deaf for any reason is discoverable
+  within one interval instead of only by manual testing.
+- `reaction_commands.py`: `setup()`'s four file-I/O calls
+  (`_ensure_settings_file`, `_load_settings`, `_ensure_scope_file`,
+  `_load_scope`) are now wrapped individually rather than left unwrapped
+  as a block — a single bad disk read now degrades to "defaults for this
+  run" instead of aborting `setup()` before the handler-registration calls
+  that follow it, which was itself a second way to reach the same
+  never-registered-handlers failure mode.
+
+### Research — reaction-based command systems: best-practices review
+
+Reviewed Telethon 1.44.0 for reaction-update API changes, open GitHub
+issues related to reaction handling, and alternative detection strategies
+used by comparable projects. No changes to `UpdateMessageReactions` /
+`MessageReactions` / `MessagePeerReaction` field shapes or delivery
+semantics were found since this module's design was last updated;
+`events.Raw(UpdateMessageReactions)` remains the correct, lowest-level tool
+for this and no newer higher-level wrapper exists. No known Telethon issue
+matches this project's "handler silently deregisters" symptom, supporting
+treating it as this project's own bug (addressed above) rather than a
+library defect. Telegram Bot API inline keyboards/callback queries remain a
+theoretically more reliable alternative trigger mechanism but require a
+genuinely separate bot account and are out of scope for this release;
+noted as a possible future optional companion feature.
+
 ## [3.0.11] — 2026-08-04
 
 **Source:** AI (full-repository audit — see the standalone audit report for the

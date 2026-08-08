@@ -319,9 +319,13 @@ class AccountLoader:
         self._client = new_client
 
         reattached = 0
-        failed = 0
+        failed_stems: list[str] = []
 
-        for stem, (instance, _) in self._loaded.items():
+        # v3.0.12: iterate over a snapshot of the loaded items, not
+        # self._loaded itself — a failed reattach below now removes the
+        # stem from self._loaded mid-loop, which would otherwise raise
+        # "dictionary changed size during iteration".
+        for stem, (instance, _) in list(self._loaded.items()):
             # Remove handlers from old client (safe even if already disconnected)
             if old_client is not None:
                 try:
@@ -337,16 +341,33 @@ class AccountLoader:
                 instance.setup(new_client)
                 reattached += 1
             except Exception as exc:
+                # v3.0.12: previously this only logged and incremented a
+                # counter, leaving the module in self._loaded as a "loaded"
+                # instance whose handlers were never actually registered on
+                # the new client — a silent, permanent dead-handler bug that
+                # would survive every future reconnect. Remove it from
+                # self._loaded instead, so get_module(stem) correctly
+                # returns None (diagnosable) rather than an instance that
+                # looks alive but will never receive another event.
                 self._log.error(
-                    "[%s] setup() failed for %s during reattach: %s",
+                    "[%s] setup() failed for %s during reattach — module "
+                    "unloaded (was silently left half-registered before "
+                    "v3.0.12): %s",
                     self.label, stem, exc,
                 )
-                failed += 1
+                self._loaded.pop(stem, None)
+                failed_stems.append(stem)
 
-        self._log.info(
-            "[%s] Reattached handlers: %d OK, %d failed.",
-            self.label, reattached, failed,
-        )
+        if failed_stems:
+            self._log.warning(
+                "[%s] Reattached handlers: %d OK, %d FAILED and unloaded: %s.",
+                self.label, reattached, len(failed_stems), ", ".join(failed_stems),
+            )
+        else:
+            self._log.info(
+                "[%s] Reattached handlers: %d OK, 0 failed.",
+                self.label, reattached,
+            )
 
     # ── Introspection ─────────────────────────────────────────────────────
 

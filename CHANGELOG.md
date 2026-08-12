@@ -5,6 +5,102 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.1.0] — 2026-08-11
+
+**Source:** AI (feature design following a full architectural research
+pass — compatibility with `help_handler.py`, hot-reload, multi-account
+isolation, `install.sh`/`update.sh`, and `.gitignore` was traced and
+verified against the actual v3.0.13 source before any code was
+written, then reviewed and approved before implementation began)
+
+### Added — `modules_extra/` system: per-account enable/disable plugins
+
+New optional module system, alongside the existing `modules/`:
+
+- **`userbot_own/modules_extra/`** — a second, git-tracked plugin
+  directory. Files here follow the exact same contract as `modules/`
+  (a `Module` subclass + module-level `create_module(context)`
+  factory) with one difference: a file only loads for an account if
+  its stem is listed in that account's own
+  `data/settings/account{N}/enabled_modules.json`. New extra modules
+  are **disabled by default** — nothing in `modules_extra/` runs until
+  explicitly enabled per account.
+- **`core/loader.py` — `AccountLoader`** now accepts an optional
+  second root, `extra_modules_dir`. `load_all()` / `reload_all()`
+  load core `modules/` files unconditionally (unchanged) and
+  `modules_extra/` files only if enabled; both roots feed the *same*
+  `self._loaded` dict, so `list_modules()`, `get_module()`, and
+  `get_help_texts()` — and everything built on them, including
+  `help_handler.py` and `system.py`'s `.modules`/`.stats` — needed
+  **zero changes** to correctly include or exclude extra modules.
+  A disabled extra module is never imported: no per-event "is this
+  enabled?" check exists anywhere, because the gate is entirely a
+  load-time decision. New public methods: `list_available_extra()`,
+  `is_extra_enabled()`, `enable_extra_module()`,
+  `disable_extra_module()` — the only sanctioned way for anything
+  outside the loader to inspect or change extra-module state, mirroring
+  the existing `get_module()` "public replacement for reaching into
+  `_loaded` directly" convention.
+- **Hot-reload** extends to `modules_extra/`: editing an *enabled*
+  extra module reloads exactly like a core module; editing a
+  *disabled* one is a no-op (nothing is loaded to reload, and importing
+  it just because the file changed would defeat the purpose of the
+  enabled-set). Editing `enabled_modules.json` directly (instead of via
+  a chat command) is also detected and applied live, through the same
+  enable/disable code path the commands use — see
+  `AccountLoader._on_enabled_file_changed()`.
+- **`config/models.py`** — `Paths` gained a `modules_extra` field
+  (`userbot/modules_extra/`), alongside the existing `modules` field.
+  Not part of `ensure()`: like `modules/`, it ships with the repo and
+  is git-tracked, not runtime-generated.
+- **`modules/module_manager.py`** (new core module) — per-account
+  commands: `.extra` (list all available extra modules with ✅/❌
+  status), `.extra enable <name>`, `.extra disable <name>`,
+  `.extra info <name>`. Deliberately *not* named `.modules` — that
+  command already exists (`system.py`, lists currently-loaded
+  modules) and does something different; reusing it would have
+  silently collided with a documented, working command.
+- **`help_handler.py`** — `help <module>` now recognizes a module
+  that exists in `modules_extra/` but is currently disabled, and
+  responds with the specific command to enable it
+  (`.extra enable <name>`) instead of a generic "not found" / fuzzy
+  suggestion.
+- **`modules_extra/example_module.py`** (new, ships disabled) — a
+  minimal template/smoke-test module. Its only purpose is to prove the
+  enable → loads/appears-in-help → disable → unloads/disappears cycle
+  works end-to-end on a real account before anyone builds a real
+  module against this system. Safe to delete once verified.
+
+### Removed — `modules/enemy.py`
+
+This file existed in `modules/` (core, unconditionally loaded for
+every account) without ever being added to this changelog, to
+`README.md`'s Project Structure tree or Available Commands section, or
+given a `category` attribute like every other module received in
+`3.0.13` — it predates this release and was not part of any documented
+change. Its behavior: replying to a message with `دشمن` marked that
+sender as an "enemy" for the current chat, after which every
+subsequent message they sent there triggered an automatic reply built
+from random content pulled from a separately configured "source chat,"
+sent without a forward tag.
+
+It has been removed from `modules/` as of this release and was **not**
+migrated into `modules_extra/` — its automatic-reply-to-a-targeted-
+individual mechanic was assessed as out of scope for this system
+regardless of enable/disable gating, since gating only controls
+whether it's easy to turn on, not what it does once on.
+`modules_extra/example_module.py` (above) takes its place as the
+system's initial test case.
+
+### Changed — `pyproject.toml`
+
+`[project].version` was stale at `3.0.11` against the real `3.0.13` in
+`VERSION` (harmless — this table is tooling metadata only, not an
+install path — but incorrect). Synced to `3.1.0` while already
+touching versioning for this release.
+
+---
+
 ## [3.0.13] — 2026-08-08
 
 **Source:** AI (targeted investigation — "new module invisible in help

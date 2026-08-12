@@ -16,6 +16,22 @@ hot-reload automatically (requires the `watchdog` package).
 `watch_files()` accepts additional `(path, callback)` pairs so external
 files like `account.json` can also drive callbacks.
 
+v3.1.0: optional second root, `extra_modules_dir` (`modules_extra/`).
+Files there behave exactly like core `modules/` files (same `Module`
+contract, same hot-reload) with one difference: a file is only ever
+imported — and therefore only ever appears in `self._loaded`, `help`,
+`.modules`, etc. — if its stem is in this account's own
+`enabled_modules.json` (`data/settings/account{N}/`). Disabled extra
+modules are never imported, so there is no per-event "is this
+enabled?" check anywhere on the hot path; the gate is entirely a
+load-time decision. Both roots feed the *same* `self._loaded` dict, so
+every existing consumer of `list_modules()` / `get_module()` /
+`get_help_texts()` (help_handler.py, system.py's `.modules`/`.stats`)
+needed zero changes for this. See `enable_extra_module()` /
+`disable_extra_module()` for the runtime toggle path, and
+`_on_enabled_file_changed()` for what happens when the JSON file is
+edited directly instead of via a chat command.
+
 DI note: `create_module()` factories now always receive exactly one
 argument — the account's `ModuleContext`. The original loader supported
 two different factory signatures (`create_module(cfg)` or
@@ -47,6 +63,7 @@ from telethon import TelegramClient
 from userbot_own.core.context import ModuleContext
 from userbot_own.core.exceptions import ModuleImportError
 from userbot_own.core.logging_setup import get_logger
+from userbot_own.helpers.utils import read_json_file, write_json_file_atomic
 from userbot_own.modules.base import Module
 
 log = get_logger(__name__)
@@ -68,24 +85,65 @@ class AccountLoader:
     instances bound to a single ``TelegramClient``.
 
     Args:
-        context:     This account's ModuleContext (cfg + injected services),
-                     passed unchanged to every plugin's `create_module()`.
-        modules_dir: Directory containing ``.py`` plugin files.
+        context:           This account's ModuleContext (cfg + injected
+                            services), passed unchanged to every plugin's
+                            `create_module()`.
+        modules_dir:       Directory containing core ``.py`` plugin files —
+                            always loaded, every account, no opt-out.
+        extra_modules_dir: Optional (v3.1.0) second directory of ``.py``
+                            plugin files that are only loaded if their stem
+                            is in this account's own `enabled_modules.json`
+                            (`context.cfg.settings_dir /
+                            "enabled_modules.json"`). ``None`` (the default)
+                            disables the extra-module system entirely for
+                            this loader — `list_available_extra()` then
+                            returns ``[]`` and `enable_extra_module()` /
+                            `disable_extra_module()` fail cleanly rather
+                            than raising.
     """
 
-    def __init__(self, context: ModuleContext, modules_dir: Path) -> None:
+    def __init__(
+        self,
+        context: ModuleContext,
+        modules_dir: Path,
+        extra_modules_dir: Path | None = None,
+    ) -> None:
         self.context:     ModuleContext = context
         self.cfg                        = context.cfg
         self.modules_dir: Path          = modules_dir
+        self.extra_modules_dir: Path | None = extra_modules_dir
         self.label:       str           = f"Account{context.cfg.index}"
         self._client:     TelegramClient | None = None
 
-        # stem → (Module instance, Python module object)
+        # stem → (Module instance, Python module object). Populated from
+        # BOTH modules_dir and extra_modules_dir — deliberately one dict,
+        # not two, so every existing reader (list_modules(), get_module(),
+        # get_help_texts()) keeps working unchanged regardless of which
+        # root a given stem came from.
         self._loaded: dict[str, tuple[Module, ModuleType]] = {}
         self._log:    logging.Logger = get_logger(f"loader.account{context.cfg.index}")
 
         # Extra (path, callback) pairs registered via watch_files()
         self._extra_watches: list[tuple[Path, Callable[[Path], None]]] = []
+
+        # v3.1.0 — extra-module enablement state. In-memory set, treated as
+        # a cache: populated from enabled_modules.json by
+        # _load_enabled_extra() (called from load_all()) and kept in sync
+        # incrementally afterward by enable_extra_module() /
+        # disable_extra_module() / _on_enabled_file_changed() — never
+        # re-read from disk on a hot path.
+        self._enabled_extra: set[str] = set()
+        self._enabled_file: Path | None = (
+            context.cfg.settings_dir / "enabled_modules.json"
+            if extra_modules_dir is not None else None
+        )
+        if self._enabled_file is not None:
+            # Registered here (not in load_all()) because watch_files()
+            # only requires "before watch() starts", and __init__ always
+            # runs before watch() is ever called — this keeps the whole
+            # extra-module-file-watching detail self-contained inside
+            # AccountLoader instead of leaking into composition_root.py.
+            self.watch_files([(self._enabled_file, self._on_enabled_file_changed)])
 
     # ── Internals ─────────────────────────────────────────────────────────
 
@@ -171,6 +229,126 @@ class AccountLoader:
                 "[%s] teardown() error for %s: %s", self.label, stem, exc
             )
 
+    # ── Extra-module enablement state (v3.1.0) ──────────────────────────────
+
+    def _load_enabled_extra(self) -> None:
+        """
+        (Re)populate ``self._enabled_extra`` from ``enabled_modules.json``.
+
+        Called once from ``load_all()``. A missing file (first run) or a
+        corrupt one both degrade to "nothing enabled" rather than raising —
+        same defensive shape as every other settings file in this project
+        (``read_json_file`` never raises).
+        """
+        if self._enabled_file is None:
+            return
+        data, err = read_json_file(self._enabled_file)
+        if err is not None:
+            self._log.error(
+                "[%s] enabled_modules.json unreadable — treating as no "
+                "extra modules enabled: %s", self.label, err,
+            )
+            self._enabled_extra = set()
+            return
+        if data is None:
+            self._enabled_extra = set()
+            return
+        raw = data.get("enabled", [])
+        self._enabled_extra = {s for s in raw if isinstance(s, str)}
+
+    def _save_enabled_extra(self) -> None:
+        """Persist ``self._enabled_extra`` to ``enabled_modules.json`` atomically."""
+        if self._enabled_file is None:
+            return
+        data = {"enabled": sorted(self._enabled_extra)}
+        err = write_json_file_atomic(self._enabled_file, data, indent=2)
+        if err is not None:
+            self._log.error(
+                "[%s] Failed to save enabled_modules.json: %s", self.label, err
+            )
+
+    def _resolve_path(self, stem: str) -> tuple[Path, bool] | None:
+        """
+        Find *stem*'s ``.py`` file, checking ``modules_dir`` first, then
+        ``extra_modules_dir``.
+
+        Returns ``(path, is_extra)``, or ``None`` if not found in either
+        root. Core modules always take priority — see
+        ``enable_extra_module()`` for the corresponding same-name-collision
+        guard on the extra-module side.
+        """
+        core_path = self.modules_dir / f"{stem}.py"
+        if core_path.exists():
+            return core_path, False
+        if self.extra_modules_dir is not None:
+            extra_path = self.extra_modules_dir / f"{stem}.py"
+            if extra_path.exists():
+                return extra_path, True
+        return None
+
+    def _on_enabled_file_changed(self, path: Path) -> None:
+        """
+        ``watch_files()`` callback for external edits to
+        ``enabled_modules.json`` (i.e. not made via
+        ``enable_extra_module()`` / ``disable_extra_module()``).
+
+        Diffs the file's new contents against the in-memory enabled-set and
+        applies exactly the same load/unload calls the chat commands use,
+        so an external edit and an in-chat command are indistinguishable in
+        their effect. Deliberately does NOT call ``_save_enabled_extra()``
+        at the end — the file was just externally written; rewriting it
+        immediately would be presumptuous, and it isn't needed: the second
+        this callback re-reads the file, ``self._enabled_extra`` already
+        matches it, so nothing is lost by not echoing it back.
+        """
+        if self._client is None or self.extra_modules_dir is None:
+            return
+
+        data, err = read_json_file(self._enabled_file)
+        if err is not None:
+            self._log.error(
+                "[%s] enabled_modules.json unreadable after external edit "
+                "— ignoring this change: %s", self.label, err,
+            )
+            return
+
+        new_enabled = (
+            {s for s in data.get("enabled", []) if isinstance(s, str)}
+            if data is not None else set()
+        )
+
+        to_enable = sorted(new_enabled - self._enabled_extra)
+        to_disable = sorted(self._enabled_extra - new_enabled)
+
+        for stem in to_enable:
+            candidate = self.extra_modules_dir / f"{stem}.py"
+            if not candidate.exists():
+                self._log.warning(
+                    "[%s] enabled_modules.json now lists '%s', but no such "
+                    "file exists in modules_extra/ — skipped.",
+                    self.label, stem,
+                )
+                continue
+            if stem in self._loaded:
+                self._log.warning(
+                    "[%s] enabled_modules.json now lists '%s', but that "
+                    "name is already loaded (core-module collision?) — "
+                    "skipped.", self.label, stem,
+                )
+                continue
+            if self._do_load(stem, candidate):
+                self._enabled_extra.add(stem)
+
+        for stem in to_disable:
+            self._do_unload(stem)
+            self._enabled_extra.discard(stem)
+
+        if to_enable or to_disable:
+            self._log.info(
+                "[%s] enabled_modules.json changed externally: +%d enabled, "
+                "-%d disabled.", self.label, len(to_enable), len(to_disable),
+            )
+
     # ── Public API ────────────────────────────────────────────────────────
 
     def get_module(self, stem: str) -> Module | None:
@@ -230,6 +408,76 @@ class AccountLoader:
         self._do_unload(stem)
         return True
 
+    # ── Extra-module control (v3.1.0) ───────────────────────────────────────
+    #
+    # The only intended way for module_manager.py (or anything else) to
+    # change or inspect extra-module enablement — mirrors get_module()'s
+    # role as "the public replacement for reaching into _loaded directly".
+
+    def list_available_extra(self) -> list[str]:
+        """
+        Return every ``.py`` stem present in ``extra_modules_dir``,
+        regardless of enabled state — i.e. "available", not "active".
+
+        Returns ``[]`` if this loader wasn't configured with an
+        ``extra_modules_dir`` (never raises).
+        """
+        if self.extra_modules_dir is None:
+            return []
+        return sorted(
+            p.stem for p in self.extra_modules_dir.glob("*.py")
+            if not p.stem.startswith("_") and p.stem not in _INFRASTRUCTURE_STEMS
+        )
+
+    def is_extra_enabled(self, stem: str) -> bool:
+        """Return whether *stem* is currently in this account's enabled-set."""
+        return stem in self._enabled_extra
+
+    def enable_extra_module(self, stem: str) -> tuple[bool, str]:
+        """
+        Enable an extra module for this account: load it now, then persist.
+
+        Returns ``(success, message)`` — *message* is written to explain
+        either outcome and is safe to show directly to the user (e.g. from
+        a chat command), including the real import/setup error text on
+        failure rather than a generic "something went wrong".
+        """
+        if self.extra_modules_dir is None:
+            return False, "Extra modules are not configured for this account."
+        if stem in self._enabled_extra:
+            return False, f"'{stem}' is already enabled."
+        path = self.extra_modules_dir / f"{stem}.py"
+        if not path.exists():
+            return False, f"No such extra module: '{stem}'."
+        if stem in self._loaded:
+            return False, (
+                f"'{stem}' conflicts with an already-loaded module of the "
+                f"same name — refusing to shadow it."
+            )
+        if not self._do_load(stem, path):
+            return False, (
+                f"'{stem}' failed to load — check this account's log for "
+                f"the import/setup error."
+            )
+        self._enabled_extra.add(stem)
+        self._save_enabled_extra()
+        return True, f"'{stem}' enabled."
+
+    def disable_extra_module(self, stem: str) -> tuple[bool, str]:
+        """
+        Disable an extra module for this account: tear it down now, then
+        persist. Returns ``(success, message)``, same shape as
+        ``enable_extra_module()``.
+        """
+        if self.extra_modules_dir is None:
+            return False, "Extra modules are not configured for this account."
+        if stem not in self._enabled_extra:
+            return False, f"'{stem}' is not currently enabled."
+        self._do_unload(stem)
+        self._enabled_extra.discard(stem)
+        self._save_enabled_extra()
+        return True, f"'{stem}' disabled."
+
     def unload_all(self) -> None:
         """
         Unload every currently loaded plugin.
@@ -245,8 +493,17 @@ class AccountLoader:
 
     def load_all(self, client: TelegramClient) -> None:
         """
-        Bind *client*, unload all current plugins, and (re)load every
-        ``.py`` file in ``modules_dir``.
+        Bind *client*, unload all current plugins, and (re)load every core
+        ``.py`` file in ``modules_dir`` plus every *enabled* ``.py`` file in
+        ``extra_modules_dir`` (if configured).
+
+        Core modules are unconditional — every ``.py`` file in
+        ``modules_dir`` loads regardless of any enabled-set. Extra modules
+        only load if their stem is in ``enabled_modules.json`` as of this
+        call; a disabled extra module's file is never opened, imported, or
+        even glob-matched against a decision beyond a single set-membership
+        check, so it costs nothing (see ``core/loader.py``'s module
+        docstring).
 
         Args:
             client: The active ``TelegramClient`` for this account.
@@ -257,29 +514,69 @@ class AccountLoader:
         for stem in list(self._loaded.keys()):
             self._do_unload(stem)
 
+        if self.extra_modules_dir is not None:
+            self._load_enabled_extra()
+
         count = 0
+
+        # Core modules — always loaded, unconditionally, exactly as before.
         for path in sorted(self.modules_dir.glob("*.py")):
             if path.stem.startswith("_") or path.stem in _INFRASTRUCTURE_STEMS:
                 continue
             if self._do_load(path.stem, path):
                 count += 1
 
-        self._log.info("[%s] %d plugin(s) loaded.", self.label, count)
+        # Extra modules — only the ones enabled for this account.
+        if self.extra_modules_dir is not None:
+            for path in sorted(self.extra_modules_dir.glob("*.py")):
+                if path.stem.startswith("_") or path.stem in _INFRASTRUCTURE_STEMS:
+                    continue
+                if path.stem not in self._enabled_extra:
+                    continue
+                if path.stem in self._loaded:
+                    # Same stem already loaded from modules_dir — core wins,
+                    # an extra module can never shadow a core one.
+                    self._log.error(
+                        "[%s] modules_extra/%s.py has the same name as a "
+                        "core module — skipped.", self.label, path.stem,
+                    )
+                    continue
+                if self._do_load(path.stem, path):
+                    count += 1
+
+        self._log.info(
+            "[%s] %d plugin(s) loaded (%d extra enabled).",
+            self.label, count, len(self._enabled_extra),
+        )
 
     def reload_module(self, stem: str) -> bool:
         """
-        Unload and reload a single plugin by its file stem.
+        Unload and reload a single plugin by its file stem, in whichever
+        root (``modules_dir`` or ``extra_modules_dir``) it actually lives.
+
+        A disabled extra module's stem resolves to a real file (so
+        ``_resolve_path`` finds it) but is refused here — reloading it
+        would mean importing a module nothing has asked to run, which is
+        exactly what the enabled-set exists to prevent. Use
+        ``enable_extra_module()`` to bring it up instead.
 
         Args:
             stem: The module file stem, e.g. ``"clearer"`` for ``clearer.py``.
 
         Returns:
-            ``True`` on success, ``False`` if the file does not exist or the
-            load fails.
+            ``True`` on success, ``False`` if the file does not exist, is a
+            disabled extra module, or the load fails.
         """
-        path = self.modules_dir / f"{stem}.py"
-        if not path.exists():
+        resolved = self._resolve_path(stem)
+        if resolved is None:
             self._log.error("[%s] Module file not found: %s.py", self.label, stem)
+            return False
+        path, is_extra = resolved
+        if is_extra and stem not in self._enabled_extra:
+            self._log.warning(
+                "[%s] '%s' is a disabled extra module — not reloading "
+                "(use enable_extra_module() to enable it).", self.label, stem,
+            )
             return False
         self._do_unload(stem)
         return self._do_load(stem, path)
@@ -287,7 +584,8 @@ class AccountLoader:
     def reload_all(self) -> dict[str, bool]:
         """
         Reload all plugins — both currently loaded and any new ``.py`` files
-        that appeared on disk since the last load.
+        that appeared on disk since the last load (core modules
+        unconditionally; extra modules only if already enabled).
 
         Returns:
             A dict mapping each stem to ``True`` (loaded) / ``False`` (failed).
@@ -298,6 +596,14 @@ class AccountLoader:
             for p in self.modules_dir.glob("*.py")
             if not p.stem.startswith("_") and p.stem not in _INFRASTRUCTURE_STEMS
         }
+        if self.extra_modules_dir is not None:
+            on_disk |= {
+                p.stem
+                for p in self.extra_modules_dir.glob("*.py")
+                if not p.stem.startswith("_")
+                and p.stem not in _INFRASTRUCTURE_STEMS
+                and p.stem in self._enabled_extra
+            }
         return {stem: self.reload_module(stem) for stem in sorted(existing | on_disk)}
 
     def reattach(self, new_client: TelegramClient) -> None:
@@ -405,8 +711,17 @@ class AccountLoader:
 
     async def watch(self) -> None:
         """
-        Watch ``modules_dir`` for ``.py`` changes (hot-reload) and any extra
-        paths registered via ``watch_files()``.
+        Watch ``modules_dir`` and ``extra_modules_dir`` (if configured) for
+        ``.py`` changes (hot-reload), plus any extra paths registered via
+        ``watch_files()`` — which, as of v3.1.0, always includes this
+        account's own ``enabled_modules.json`` when extra modules are
+        configured (registered in ``__init__``).
+
+        A change to an *enabled* extra module hot-reloads exactly like a
+        core module. A change to a *disabled* extra module's file is a
+        no-op — there is nothing loaded to reload, and importing it just
+        because the file changed would defeat the entire point of the
+        enabled-set.
 
         Requires the ``watchdog`` package.  Logs a warning and exits if it is
         not installed.
@@ -458,17 +773,35 @@ class AccountLoader:
                     return
                 self._last[key] = now
 
-                # Hot-reload for .py files inside modules_dir
                 if (
                     path.suffix == ".py"
-                    and path.parent.resolve() == loader_ref.modules_dir.resolve()
                     and not path.stem.startswith("_")
                     and path.stem not in _INFRASTRUCTURE_STEMS
                 ):
-                    asyncio.run_coroutine_threadsafe(
-                        _hot_reload(loader_ref, path.stem), loop
-                    )
-                    return
+                    parent = path.parent.resolve()
+
+                    # Core modules/ — unconditional hot-reload, unchanged.
+                    if parent == loader_ref.modules_dir.resolve():
+                        asyncio.run_coroutine_threadsafe(
+                            _hot_reload(loader_ref, path.stem), loop
+                        )
+                        return
+
+                    # modules_extra/ (v3.1.0) — hot-reload ONLY if this
+                    # stem is currently enabled. A disabled module's file
+                    # changing is deliberately a no-op: nothing is loaded
+                    # to reload, and importing it solely because it was
+                    # edited would reintroduce a per-event-adjacent cost
+                    # the enabled-set exists specifically to avoid.
+                    if (
+                        loader_ref.extra_modules_dir is not None
+                        and parent == loader_ref.extra_modules_dir.resolve()
+                    ):
+                        if path.stem in loader_ref._enabled_extra:
+                            asyncio.run_coroutine_threadsafe(
+                                _hot_reload(loader_ref, path.stem), loop
+                            )
+                        return
 
                 # Extra file watch
                 abs_path = path.resolve()
@@ -488,6 +821,19 @@ class AccountLoader:
 
         # Collect all directories to schedule on the observer
         watch_dirs: set[str] = {str(self.modules_dir)}
+        if self.extra_modules_dir is not None:
+            if self.extra_modules_dir.exists():
+                watch_dirs.add(str(self.extra_modules_dir))
+            else:
+                # Observer.schedule() raises FileNotFoundError on a missing
+                # directory — degrade to "no extra-module hot-reload" rather
+                # than taking the whole watcher down with it.
+                self._log.warning(
+                    "[%s] modules_extra/ does not exist on disk — extra "
+                    "modules will still load if enabled, but hot-reload for "
+                    "them is unavailable until the directory exists.",
+                    self.label,
+                )
         for watch_path, _ in self._extra_watches:
             abs_path = watch_path.resolve()
             watch_dirs.add(str(abs_path if abs_path.is_dir() else abs_path.parent))
@@ -497,12 +843,17 @@ class AccountLoader:
         for d in watch_dirs:
             observer.schedule(handler, d, recursive=False)
 
+        base_dirs = {str(self.modules_dir)}
+        if self.extra_modules_dir is not None and str(self.extra_modules_dir) in watch_dirs:
+            base_dirs.add(str(self.extra_modules_dir))
+
         observer.start()
         self._log.info(
-            "[%s] File watcher active — modules_dir=%s, extra_dirs=%d.",
+            "[%s] File watcher active — modules_dir=%s, modules_extra=%s, extra_dirs=%d.",
             self.label,
             self.modules_dir.name,
-            len(watch_dirs) - 1,
+            self.extra_modules_dir.name if self.extra_modules_dir else "(none)",
+            len(watch_dirs - base_dirs),
         )
 
         try:

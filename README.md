@@ -99,6 +99,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history.
 - [Configuration](#configuration)
 - [Available Commands](#available-commands)
 - [Hot-Reload System](#hot-reload-system)
+- [Extra Modules (modules_extra/)](#extra-modules-modules_extra)
 - [Writing a New Module](#writing-a-new-module)
 - [Versioning Guide](#versioning-guide)
 - [FAQ](#faq)
@@ -203,6 +204,7 @@ userbot_own/
     │   ├── router.py                 ← CommandRouter (declarative command dispatch)
     │   ├── bridge.py                 ← MockEvent (bridges reaction triggers into normal handlers)
     │   ├── system.py                 ← owner commands: .modules .account .stats .ping
+    │   ├── module_manager.py          ← .extra enable/disable/info for modules_extra/ (v3.1.0)
     │   ├── help_handler.py           ← `help` + `help <module>` commands
     │   ├── clearer.py                 ← manual message clearing
     │   ├── auto_clearer.py            ← automatic message clearing
@@ -211,6 +213,10 @@ userbot_own/
     │   ├── reaction_commands.py       ← execute commands via emoji reactions
     │   ├── info_handler.py            ← message info (reply)
     │   └── whois_handler.py           ← user/chat info
+    │
+    ├── modules_extra/                 ← optional plugins, per-account enable/disable (v3.1.0)
+    │   ├── __init__.py
+    │   └── example_module.py          ← template / smoke-test module, ships disabled
     │
     ├── account_management/
     │   └── cli.py                    ← interactive `python add_account.py` menu
@@ -228,7 +234,8 @@ userbot_own/
             │   ├── join_left.json
             │   ├── reactions.json
             │   ├── autoclear.json
-            │   └── autoforward.json
+            │   ├── autoforward.json
+            │   └── enabled_modules.json  ← which modules_extra/ files are on (v3.1.0)
             └── account2/ …
 ```
 
@@ -391,12 +398,26 @@ system.
 | `.stats` | System statistics — accounts configured, accounts connected, total modules loaded, uptime |
 | `.ping` | API + edit latency, connection quality rating |
 
+### Module Manager (Saved Messages only) — v3.1.0
+
+Controls which files in `modules_extra/` are active for *this* account.
+Core modules in `modules/` are unaffected — they always load and can't be
+disabled this way. See [Extra Modules](#extra-modules-modules_extra) below
+for the full system.
+
+| Command | Description |
+| --- | --- |
+| `.extra` | List all available extra modules with ✅ enabled / ❌ disabled status |
+| `.extra enable <name>` | Enable a module — loads and starts it immediately, no restart |
+| `.extra disable <name>` | Disable a module — tears it down immediately, no restart |
+| `.extra info <name>` | Status, category, and description for one extra module |
+
 ### Help System
 
 | Command | Description |
 | --- | --- |
 | `help` | Category-based compact help (7 logical groups) |
-| `help <module>` | Extended help for one module, e.g. `help clearer` |
+| `help <module>` | Extended help for one module, e.g. `help clearer`. For a disabled `modules_extra/` module, shows the exact `.extra enable` command instead of a generic "not found". |
 
 ### Reaction Commands (`reaction_commands` module)
 
@@ -536,6 +557,67 @@ shared infrastructure, not plugins, and are never imported as one.
 
 There is currently no in-chat command to trigger a manual reload — edit the
 file and the watcher picks it up automatically.
+
+---
+
+## Extra Modules (`modules_extra/`)
+
+v3.1.0 adds a second, optional plugin directory alongside `modules/`. The
+two are functionally identical — same `Module` base class, same
+`create_module(context)` factory, same hot-reload — with one difference:
+**a file in `modules_extra/` only runs for an account if that account has
+explicitly enabled it.** New extra modules are disabled by default.
+
+This exists for modules you don't want active on every account by
+default — experiments, per-account personal tweaks, anything you'd rather
+opt into deliberately than have silently active after a `git pull`.
+
+### How it works
+
+- Which modules are enabled is tracked per account in
+  `data/settings/account{N}/enabled_modules.json`:
+  ```json
+  {
+    "enabled": ["example_module"]
+  }
+  ```
+  Absence from the list means disabled — you don't need to pre-list every
+  available module with `false`.
+- **Disabled modules are never imported.** Not on startup, not on hot-reload,
+  not anywhere — there's no per-message "is this enabled?" check to skip,
+  because a disabled module's code simply never runs. This also means a
+  disabled module is invisible everywhere a loaded module would normally
+  show up: `help`, `.modules`, `.stats`.
+- **Enabling/disabling takes effect immediately, no restart**, via
+  `.extra enable <name>` / `.extra disable <name>` (see
+  [Module Manager](#module-manager-saved-messages-only--v310) above) — these
+  call `setup()` / `teardown()` on the spot, exactly like a hot-reload.
+- You can also edit `enabled_modules.json` directly instead of using the
+  chat commands — the file is watched, and changes are picked up and
+  applied live, the same as editing a module's `.py` file.
+- Enablement is entirely per-account. Account 1 can have a module enabled
+  that account 2 doesn't have at all, with no shared state between them.
+
+### Trying it out
+
+The repo ships with one example module, `modules_extra/example_module.py`,
+disabled by default, that does nothing but respond to `پینگ اضافی` with a
+pong — enough to verify the whole system end-to-end on a real account:
+
+```
+.extra                          →  shows example_module as ❌ disabled
+help example_module             →  "غیرفعال است. برای فعال‌سازی: .extra enable example_module"
+.extra enable example_module    →  ✅ enabled
+پینگ اضافی                       →  🏓 pong
+help                             →  example_module now appears
+.extra disable example_module   →  ✅ disabled — پینگ اضافی stops responding
+```
+
+Delete `example_module.py` (or replace it with something real) once you've
+confirmed this works. Writing an actual extra module afterward is identical
+to [writing a core one](#writing-a-new-module) below — just save it under
+`modules_extra/` instead of `modules/`, and remember it won't do anything
+until you `.extra enable` it.
 
 ---
 

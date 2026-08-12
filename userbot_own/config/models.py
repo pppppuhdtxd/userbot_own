@@ -32,14 +32,25 @@ class Paths:
         data:      `userbot/data/` — runtime data root.
         settings:  `userbot/data/settings/` — per-account module settings.
         logs:      `userbot/data/logs/` — rotating log files.
-        modules:   `userbot/modules/` — hot-reloadable plugin files.
+        modules:   `userbot/modules/` — hot-reloadable core plugin files
+                   (always loaded, every account, no opt-out).
+        modules_extra: `userbot/modules_extra/` — hot-reloadable *optional*
+                   plugin files (v3.1.0). Ships with the repo and is
+                   git-tracked exactly like `modules/` — unlike
+                   `data/settings/`, nothing here is runtime-generated,
+                   so it is intentionally not part of `ensure()` below.
+                   Which files are actually active is a *per-account*
+                   decision recorded in each account's own
+                   `data/settings/account{N}/enabled_modules.json` (see
+                   `core/loader.py`), not a property of this path itself.
     """
-    base:      Path
-    accounts:  Path
-    data:      Path
-    settings:  Path
-    logs:      Path
-    modules:   Path
+    base:          Path
+    accounts:      Path
+    data:          Path
+    settings:      Path
+    logs:          Path
+    modules:       Path
+    modules_extra: Path
 
     @classmethod
     def from_base(cls, base_dir: Path) -> Paths:
@@ -52,6 +63,7 @@ class Paths:
             settings=data_dir / "settings",
             logs=data_dir / "logs",
             modules=base_dir / "modules",
+            modules_extra=base_dir / "modules_extra",
         )
 
     def ensure(self, extra_dirs: list[Path] | None = None) -> None:

@@ -163,7 +163,12 @@ class CompositionRoot:
         # so this is safe before connect(). It also closes the race window where
         # a message arrives between connect() and load_all().
         context = self.build_module_context(acc_cfg)
-        loader = AccountLoader(context, self.paths.modules)
+        # v3.1.0: second, optional root for per-account enable/disable
+        # plugins. Everything else about the extra-module system —
+        # enabled_modules.json's path, watching it for external edits,
+        # the enabled-set cache — is self-contained inside AccountLoader;
+        # this is the only line composition_root.py needed to change.
+        loader = AccountLoader(context, self.paths.modules, self.paths.modules_extra)
         loader.load_all(client)
         self.loader_registry.register(acc_cfg.index, loader)
 

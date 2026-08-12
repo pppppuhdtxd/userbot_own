@@ -256,6 +256,19 @@ class HelpHandler(Module):
         # any stem the loader actually has loaded resolves correctly here.
         instance = loader.get_module(stem)
         if instance is None:
+            # v3.1.0: before falling to generic fuzzy search, check whether
+            # this is a *known* modules_extra/ module that's simply
+            # disabled — that's a far more useful answer than "not found"
+            # or a fuzzy guess at some unrelated module, and it's the exact
+            # scenario a user hits right after reading `.extra`'s listing.
+            if stem in loader.list_available_extra() and not loader.is_extra_enabled(stem):
+                await self._safe_edit(
+                    event,
+                    f"⚠️ ماژول `{stem}` غیرفعال است.\n"
+                    f"برای فعال‌سازی: `.extra enable {stem}`"
+                )
+                return
+
             # Not currently loaded — try fuzzy search against everything
             # that *is* currently loaded, instead of a static map.
             matches = self._fuzzy_search(query, loader.list_modules())

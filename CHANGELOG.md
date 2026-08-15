@@ -5,6 +5,134 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.1.1] — 2026-08-15
+
+**Source:** AI (5-phase research pass — current architecture traced
+file-by-file against the actual v3.1.0 source, Telethon 1.44.0's
+connection primitives and Termux/Android network-event options
+researched externally, risk assessment covering battery/data/FloodWait/
+race conditions/Termux constraints completed and reviewed — before any
+code was written, the full report was reviewed and explicitly approved,
+including which items to include vs. defer, before implementation began)
+
+### Fixed — Reconnection "dead zone": instant disconnect detection + interruptible backoff
+
+Both halves of reconnection were pure polling in `3.1.0`: a dropped
+connection could go unnoticed for up to the 30-second healthy-interval
+check, and once genuinely offline the bot could then wait up to 300
+seconds (the `NO_INTERNET`/`TELEGRAM_DOWN` backoff ceiling) before even
+re-checking whether the network had come back — even if it came back 1
+second into that wait. This produced a visible "dead zone" where the bot
+stayed offline for minutes after connectivity was already restored
+(e.g. after airplane mode, a VPN reconnect, or a Wi-Fi/mobile-data
+switch).
+
+- **`core/reconnector.py` — instant disconnect detection.** A new
+  background task per account (`_watch_disconnected()`) awaits Telethon's
+  own `client.disconnected` Future — which resolves the instant the
+  sender detects a dead socket, no polling involved — and sets an
+  `asyncio.Event`. The healthy-interval sleep in `_reconnect_cycle()` now
+  races a timer against that event (`_interruptible_healthy_wait()`), so
+  a drop interrupts the wait immediately instead of waiting up to 30s.
+  The watcher is (re)started every time the client is (re)built, so it
+  always tracks the current client instance — including the very first
+  client, watched from the moment `AccountReconnector.run()` starts.
+- **`core/reconnector.py` — interruptible backoff.** The three places
+  that previously did a plain `asyncio.sleep(backoff)` —
+  `_handle_no_internet()`, `_handle_telegram_down()`, and the
+  `RetryError` fallback in `_handle_online()` — now call
+  `_interruptible_backoff()`, which periodically probes connectivity via
+  a cheap raw TCP connect to a Telegram data-center endpoint (identical
+  to the TCP-connect step `detect_network_state()` already performed —
+  **not** a Telegram API call, so it carries zero FloodWait risk) and
+  returns the moment the probe succeeds. The backoff *ceiling* itself —
+  the `2 ** min(failures, 8)` / `60 + failures * 30` / `30 * failures`
+  formulas, all capped at 300s — is completely unchanged; this only ever
+  *shortens* the wait, never lengthens it, so a genuinely prolonged
+  outage (probe keeps failing) behaves exactly as it did in `3.1.0`.
+- **`core/reconnector.py` — recovery guard.** `_recover_connection()` is
+  now guarded by a `self._recovering` flag. This is defense-in-depth
+  rather than a fix for an observed bug: `_reconnect_cycle()`'s own
+  sequential loop meant there was no actual concurrent-invocation path
+  even before this version, but the guard protects against that changing
+  later (e.g. if the disconnect watcher is ever wired to trigger recovery
+  directly) without altering any currently-observable behavior.
+- **Configurable via environment variables**, read directly by
+  `core/reconnector.py` (see its module docstring for the full
+  rationale) — no changes required to `config/loader.py` or
+  `app/composition_root.py` to use them:
+  - `FAST_RECONNECT_ENABLED` (default `true`) — master switch; set
+    `false` to restore `3.1.0`'s plain-polling behavior byte-for-byte.
+  - `FAST_RECONNECT_HEALTHY_INTERVAL` (default `30`, seconds) — replaces
+    the previously-hardcoded `_HEALTHY_INTERVAL` constant.
+  - `FAST_RECONNECT_PROBE_INTERVAL` (default `3`, seconds) — how often
+    the backoff probe checks connectivity during an outage.
+- **`config/models.py`** — `Settings` gained three matching fields
+  (`fast_reconnect_enabled`, `fast_reconnect_healthy_interval`,
+  `fast_reconnect_probe_interval`) purely for documentation/
+  discoverability. They mirror the pre-existing `backoff_start`/
+  `backoff_max` fields in spirit but, like those two, are **not**
+  currently wired through to `core/reconnector.py` at runtime — the
+  reconnector reads the corresponding environment variables directly.
+  End-to-end plumbing through `config/loader.py` and
+  `app/composition_root.py` (so `AccountReconnector` receives a
+  `Settings` instance instead of reading `os.environ` itself) is a
+  natural follow-up if a single source of truth for all configuration
+  becomes worth the extra wiring; out of scope for this release.
+- **`README.md`** — "Connection resilience" architecture section updated
+  to describe the new interruptible flow; new FAQ entry explains fast
+  reconnect, lists all three environment variables, and documents
+  `termux-wake-lock` as a prerequisite for the feature to matter while
+  Termux is backgrounded on Android — Android's Doze mode can suspend the
+  Termux process regardless of any code change here, and this note makes
+  clear that fast reconnect only affects how quickly the bot responds
+  *once it's allowed to run*, not whether Android lets it run in the
+  background at all.
+
+### Deliberately deferred (research phase, not included in this release)
+
+Per the approved v3.1.1 report:
+
+- **OS-level network-change event integration** (e.g. Linux NetworkManager
+  D-Bus signals, Android `ConnectivityManager` callbacks) — researched and
+  rejected as impractical for the primary Termux deployment target:
+  `termux-api` exposes one-shot query commands
+  (`termux-wifi-connectioninfo`, etc.), not a push/callback interface; a
+  true event-driven listener requires a Java/Kotlin Android app, not a
+  Termux Python process. The interruptible-backoff probe above achieves
+  effectively the same user-perceived latency (a few seconds instead of
+  instant) with no new platform-specific dependencies. May be revisited
+  as a Linux-only accelerant in a future version.
+- **A separate circuit-breaker abstraction** — considered and rejected:
+  the existing `NetworkState` enum plus `_consecutive_failures` already
+  provide the same CLOSED/OPEN/HALF-OPEN semantics a formal circuit
+  breaker would add, so a dedicated library/pattern would only duplicate
+  state that already exists.
+- **Per-account reconnection latency metrics/logging** — deferred as
+  nice-to-have; the existing log lines (connection-state transitions,
+  probe-triggered early wakes) already give enough signal for manual
+  diagnosis, but they aren't yet aggregated into a queryable metric.
+
+### Verified unaffected (no changes needed)
+
+- **Hot-reload system** (`watchdog`-based) — no shared code paths with
+  the reconnector changes.
+- **Multi-account support** — each account's `AccountReconnector` is
+  already fully independent; the fix lives entirely inside that class.
+- **Modules** (`reaction_commands.py`, `auto_clearer.py`, etc.) — their
+  existing `teardown()`/`setup()` cycle around `loader.reattach()` was
+  already correct; faster reconnection just means it runs sooner, not
+  differently. No module files were modified.
+- **`install.sh` / `update.sh`** — shell scripts run outside the Python
+  process, triggered manually via the `userbot` launcher; zero
+  interaction with the in-process reconnection system.
+- **`core/loader.py`, `core/telegram_client.py`** — untouched;
+  `auto_reconnect=False` remains set in `telegram_client.py` exactly as
+  before, so the custom reconnector remains the sole owner of
+  reconnection logic.
+
+---
+
 ## [3.1.0] — 2026-08-11
 
 **Source:** AI (feature design following a full architectural research

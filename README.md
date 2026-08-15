@@ -283,14 +283,24 @@ AccountLoader.reload_module(stem)
 Each account runs an independent `AccountReconnector` loop:
 
 ```
-AccountReconnector._reconnect_cycle()   (every ~30s when healthy)
+AccountReconnector._reconnect_cycle()   (every ~30s when healthy — v3.1.1: interruptible)
     ├─ lightweight API call to verify the connection
+    ├─ v3.1.1: a background watcher awaits Telethon's own `client.disconnected`
+    │  Future and interrupts the healthy-interval wait immediately on a drop —
+    │  no waiting for the next scheduled check
     └─ on failure → _recover_connection()
            ├─ detect_network_state()   → ONLINE / NO_INTERNET / TELEGRAM_DOWN / UNKNOWN
-           ├─ NO_INTERNET / TELEGRAM_DOWN → exponential backoff, retry state detection
+           ├─ NO_INTERNET / TELEGRAM_DOWN → exponential backoff — v3.1.1: interruptible,
+           │  a cheap TCP probe (never a Telegram API call) wakes the wait early the
+           │  moment connectivity returns, instead of sleeping out the full backoff
            └─ ONLINE → rebuild client (tenacity-retried) → loader.reattach(new_client)
-                  └─ logs the connection-state transition
+                  ├─ logs the connection-state transition
+                  └─ v3.1.1: restarts the disconnect watcher on the new client
 ```
+
+v3.1.1's fast-reconnect behavior is on by default and configurable via
+environment variables — see the FAQ entry below for the full list and how
+to disable it.
 
 There is no proxy layer — connections are always direct. If your network
 blocks Telegram, use a system-level VPN (WireGuard, OpenVPN, V2Ray); the bot
@@ -897,6 +907,44 @@ kept despite that specifically because this table used to advertise it as
 a feature, which is why that row is gone too. Both are straightforward to
 reintroduce later, purpose-built, if a real feature ends up needing them —
 see `CHANGELOG.md`'s `3.0.11` entry for the full reasoning.
+
+---
+
+**Q: What is "fast reconnect" (v3.1.1), and does it need anything special on Android?**
+
+A: Before `3.1.1`, both halves of reconnection were pure polling: a dropped
+connection could go unnoticed for up to 30 seconds, and once the bot
+started backing off after a real outage it could wait up to 300 seconds
+before even checking whether the network had come back — even if it came
+back 1 second into that wait. `3.1.1` fixes both halves:
+
+- **Drops are now detected instantly.** A background task awaits
+  Telethon's own `client.disconnected` signal (which resolves the moment
+  the socket dies — genuinely event-driven, not a poll) instead of
+  waiting for the next scheduled health check.
+- **Restoration is now detected within a few seconds**, not minutes. While
+  backing off after a real outage, a lightweight probe (a raw TCP connect
+  to a Telegram data center — **never** a Telegram API call, so it carries
+  no FloodWait risk) checks every few seconds and wakes the bot up the
+  instant connectivity returns, instead of sleeping out the full backoff.
+
+This is on by default and tunable via environment variables in your `.env`:
+
+| Variable                          | Default | Description                                     |
+|------------------------------------|---------|--------------------------------------------------|
+| `FAST_RECONNECT_ENABLED`           | `true`  | Master switch — set `false` to restore the plain pre-3.1.1 polling behavior |
+| `FAST_RECONNECT_HEALTHY_INTERVAL`  | `30`    | Seconds between health checks when connected      |
+| `FAST_RECONNECT_PROBE_INTERVAL`    | `3`     | Seconds between connectivity probes while backing off from an outage |
+
+**On Termux/Android specifically:** none of this can run at all while
+Android has suspended the Termux process — no code change can override
+that. If you're running the bot in the background on a phone, run
+`termux-wake-lock` (part of `termux-api`) to prevent Android's Doze mode
+from suspending Termux; without it, both the pre-3.1.1 polling and the new
+fast-reconnect behavior are equally unable to run until you bring Termux
+back to the foreground. Fast reconnect makes the bot respond faster once
+it *is* allowed to run — it doesn't change whether Android lets it run in
+the background at all.
 
 ---
 

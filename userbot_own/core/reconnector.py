@@ -50,11 +50,78 @@ directly via this reconnector's own contextual logger instead of
 publishing it. If a real consumer shows up later (e.g. a live per-account
 status view), it's easy to reintroduce a bus purpose-built for whatever
 that feature actually needs.
+
+────────────────────────────────────────────────────────────────
+v3.1.1 — Fast Reconnect (instant detection, interruptible backoff)
+────────────────────────────────────────────────────────────────
+Prior to this version, both halves of reconnection were pure polling:
+
+- Detecting a drop could take up to _HEALTHY_INTERVAL (30s) — the loop
+  only noticed a dead connection on its next scheduled check.
+- Detecting that the network had come *back* was worse: once inside a
+  NO_INTERNET/TELEGRAM_DOWN backoff, the wait was a plain
+  `asyncio.sleep(backoff)` with no early exit — even if connectivity
+  returned 1 second into a 256-second sleep, nothing woke the loop up
+  until the full sleep elapsed. This was the "dead zone" reported in
+  the v3.1.1 investigation.
+
+Two additive mechanisms fix this without touching the backoff *ceilings*,
+the 2-consecutive-failures escalation threshold, FloodWait handling, or
+`loader.reattach()` — all of which were already correct:
+
+1. Instant disconnect detection — `_watch_disconnected()` awaits
+   Telethon's own `client.disconnected` Future (resolves the instant the
+   sender detects a dead socket — no polling involved) and sets
+   `self._disconnect_event`. The healthy-interval sleep in
+   `_reconnect_cycle()` now races a plain timer against that event via
+   `_interruptible_healthy_wait()`, so a drop interrupts the wait
+   immediately instead of waiting up to 30s. The watcher is (re)started
+   every time a client is (re)built, so it always tracks the *current*
+   client.
+
+2. Interruptible backoff — `_interruptible_backoff()` replaces the three
+   plain `asyncio.sleep(backoff)` calls (in `_handle_no_internet()`,
+   `_handle_telegram_down()`, and `_handle_online()`'s `RetryError`
+   fallback) with a wait that periodically probes connectivity via a
+   cheap raw TCP connect (identical to the TCP-connect step of
+   `detect_network_state()`, deliberately NOT a Telegram API call, so it
+   carries zero FloodWait risk) and returns the instant the probe
+   succeeds. The backoff ceiling itself is untouched — this only ever
+   *shortens* the wait, never lengthens it, so behavior during a
+   genuinely prolonged outage is unchanged.
+
+Both mechanisms are gated by `FAST_RECONNECT_ENABLED` (default: on) and
+their intervals are configurable via environment variables, so v3.1.0's
+pure-polling behavior can be restored with a single setting if the fast
+path misbehaves on a given device:
+
+    FAST_RECONNECT_ENABLED             default: true
+    FAST_RECONNECT_HEALTHY_INTERVAL    default: 30   (seconds)
+    FAST_RECONNECT_PROBE_INTERVAL      default: 3    (seconds)
+
+These are read directly from the environment by this module (see
+`_env_bool()` / `_env_float()` below) rather than routed through
+`config/models.py`'s `Settings` object — this keeps the feature fully
+functional via plain environment variables / `.env` with no changes
+required to `config/loader.py` or `app/composition_root.py`. Matching
+fields were added to `Settings` for discoverability/documentation
+alongside the other env-configurable values there; see that file's
+docstring for the note on why they are not (yet) wired through it.
+
+A `_recovering` guard was also added around `_recover_connection()`. In
+the current code this is defense-in-depth rather than a fix for an
+observed bug — `_reconnect_cycle()` only ever calls `_recover_connection()`
+from within its own single sequential loop iteration, so there was no
+actual concurrent-invocation path even before this version. The guard
+protects against that changing in the future (e.g. if the disconnect
+watcher is ever wired to trigger recovery directly instead of merely
+signalling the loop) without changing any currently-observable behavior.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import sqlite3
 from enum import Enum, auto
@@ -73,17 +140,50 @@ from tenacity import (
 )
 
 if TYPE_CHECKING:
+    from telethon import TelegramClient
+
     from userbot_own.core.loader import AccountLoader
     from userbot_own.core.telegram_client import AccountClient
 
 
-# ── Health Check Intervals ────────────────────────────────────────────────────
+# ── Fast-reconnect environment configuration (v3.1.1) ────────────────────────
+#
+# Read once at import time, same pattern as the pre-existing module-level
+# constants below.
 
-#: Interval when connection is healthy (seconds)
-_HEALTHY_INTERVAL: float = 30.0
+def _env_float(key: str, default: float) -> float:
+    """Read *key* from the environment as a float, or *default* on any error."""
+    try:
+        raw = os.environ.get(key, "").strip()
+        return float(raw) if raw else default
+    except ValueError:
+        return default
 
-#: Minimum interval when degraded (seconds)
+
+def _env_bool(key: str, default: bool) -> bool:
+    """Read *key* from the environment as a bool, or *default* if unset/unrecognized."""
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+#: Master switch for the v3.1.1 fast-reconnect behavior (instant disconnect
+#: detection + interruptible backoff probing). Set to false to fall back to
+#: v3.1.0's pure-polling behavior unchanged.
+_FAST_RECONNECT_ENABLED: bool = _env_bool("FAST_RECONNECT_ENABLED", True)
+
+#: Interval when connection is healthy (seconds).
+_HEALTHY_INTERVAL: float = _env_float("FAST_RECONNECT_HEALTHY_INTERVAL", 30.0)
+
+#: Minimum interval when degraded (seconds). Unrelated to the fast-reconnect
+#: feature — unchanged from prior versions.
 _MIN_DEGRADED_INTERVAL: float = 5.0
+
+#: How often the interruptible backoff wait probes connectivity during a
+#: NO_INTERNET / TELEGRAM_DOWN / post-RetryError backoff (seconds). A raw
+#: TCP connect, never a Telegram API call — see _cheap_probe_online().
+_PROBE_INTERVAL: float = _env_float("FAST_RECONNECT_PROBE_INTERVAL", 3.0)
 
 
 # ── Network State Detection ──────────────────────────────────────────────────
@@ -94,6 +194,13 @@ class NetworkState(Enum):
     NO_INTERNET = auto()   # No internet at all
     TELEGRAM_DOWN = auto() # Internet works but Telegram unreachable
     UNKNOWN = auto()       # Couldn't determine
+
+
+#: Known Telegram DC IP used for both detect_network_state()'s TCP-connect
+#: step and the v3.1.1 fast-reconnect probe (_cheap_probe_online()) — kept
+#: as one constant so the two only ever test the same endpoint.
+_TELEGRAM_PROBE_HOST: str = "149.154.167.50"
+_TELEGRAM_PROBE_PORT: int = 443
 
 
 async def detect_network_state(timeout: float = 3.0) -> NetworkState:
@@ -125,9 +232,8 @@ async def detect_network_state(timeout: float = 3.0) -> NetworkState:
     # Step 2: Telegram endpoint test (lightweight TCP connect)
     try:
         # Try connecting to Telegram DC (149.154.167.50 is a known DC)
-        telegram_dc = "149.154.167.50"
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(telegram_dc, 443),
+            asyncio.open_connection(_TELEGRAM_PROBE_HOST, _TELEGRAM_PROBE_PORT),
             timeout=timeout,
         )
         writer.close()
@@ -137,6 +243,35 @@ async def detect_network_state(timeout: float = 3.0) -> NetworkState:
         return NetworkState.TELEGRAM_DOWN
     except Exception:
         return NetworkState.UNKNOWN
+
+
+async def _cheap_probe_online(timeout: float = 3.0) -> bool:
+    """
+    v3.1.1 — Cheap connectivity probe used only inside interruptible backoff
+    waits, to detect restoration early.
+
+    Deliberately a raw TCP connect to the same Telegram DC endpoint
+    `detect_network_state()` uses for its second step — NOT a Telegram API
+    call (no MTProto handshake, no GetStateRequest), so repeating it every
+    `_PROBE_INTERVAL` seconds during an outage carries zero FloodWait risk.
+    Skips the DNS-lookup step `detect_network_state()` does, since here we
+    only need a binary online/offline signal, not which failure category —
+    `_recover_connection()`'s next full cycle will re-classify NO_INTERNET
+    vs TELEGRAM_DOWN properly once backoff exits.
+
+    Returns:
+        True if the TCP connect succeeded, False otherwise.
+    """
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(_TELEGRAM_PROBE_HOST, _TELEGRAM_PROBE_PORT),
+            timeout=timeout,
+        )
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
 
 
 # ── AccountReconnector ───────────────────────────────────────────────────────
@@ -156,6 +291,15 @@ class AccountReconnector:
     The actual reconnect logic uses @retry decorator from tenacity
     for automatic exponential backoff with smart exception handling.
 
+    v3.1.1 additionally runs a lightweight background watcher
+    (`_watch_disconnected`) that awaits Telethon's own `client.disconnected`
+    Future so drops are noticed the instant they happen rather than on the
+    next scheduled poll, and races that signal (plus a cheap TCP probe
+    during backoff waits) against the existing timers so restoration is
+    noticed within `_PROBE_INTERVAL` seconds instead of up to the full
+    backoff ceiling. See the module docstring's "v3.1.1" section for the
+    full design rationale.
+
     Usage:
         reconnector = AccountReconnector(account_client, loader)
         await reconnector.run()  # blocks until cancelled
@@ -172,6 +316,19 @@ class AccountReconnector:
         self._running = False
         self._last_state = NetworkState.UNKNOWN
         self._consecutive_failures = 0
+
+        # v3.1.1: guards against a concurrent second call to
+        # _recover_connection() while one is already in flight. Not fixing
+        # an observed bug today (see module docstring) — defense-in-depth
+        # now that a second signal source (the disconnect watcher) exists
+        # alongside the main loop.
+        self._recovering: bool = False
+
+        # v3.1.1: set the instant client.disconnected resolves; consumed by
+        # _interruptible_healthy_wait() to interrupt the healthy-interval
+        # sleep immediately instead of waiting out the full interval.
+        self._disconnect_event: asyncio.Event = asyncio.Event()
+        self._disconnect_watch_task: asyncio.Task | None = None
 
         # Create a context-bound logger for this account
         self._log = logger.bind(
@@ -196,6 +353,13 @@ class AccountReconnector:
         self._running = True
         self._log.info("[Account{}] Reconnector started.", self._cfg.index)
 
+        # v3.1.1: if a client already exists (composition_root connects the
+        # initial client before starting the reconnector), start watching
+        # it for an instant disconnect signal right away rather than only
+        # after the first rebuild.
+        if self._ac.client is not None:
+            self._start_disconnect_watcher(self._ac.client)
+
         while self._running:
             try:
                 await self._reconnect_cycle()
@@ -209,6 +373,7 @@ class AccountReconnector:
                 )
                 await asyncio.sleep(5)
 
+        self._cancel_disconnect_watcher()
         self._log.info("[Account{}] Reconnector stopped.", self._cfg.index)
 
     def stop(self) -> None:
@@ -219,6 +384,135 @@ class AccountReconnector:
         """Check if the client is currently connected."""
         client = self._ac.client
         return client is not None and client.is_connected()
+
+    # ── v3.1.1: instant disconnect watcher ──────────────────────────────────
+
+    def _start_disconnect_watcher(self, client: TelegramClient) -> None:
+        """
+        (Re)start the background task that watches `client.disconnected`.
+
+        Called once at reconnector startup (for the initial client) and
+        again every time `_attempt_connect()` builds a fresh client, so the
+        watcher always tracks the *current* client instance. Clears
+        `_disconnect_event` before starting so a stale signal from a
+        previous (now-replaced) client can never leak into the new watch
+        period — the event is otherwise never cleared elsewhere, which
+        avoids a race where a genuine pending disconnect signal could be
+        wiped out by a wait loop that clears-then-waits (see module
+        docstring for why this ordering matters).
+        """
+        self._cancel_disconnect_watcher()
+        self._disconnect_event.clear()
+        self._disconnect_watch_task = asyncio.create_task(
+            self._watch_disconnected(client),
+            name=f"reconnect_watch_a{self._cfg.index}",
+        )
+
+    def _cancel_disconnect_watcher(self) -> None:
+        """Cancel and clear the current disconnect-watch task, if any."""
+        task = self._disconnect_watch_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._disconnect_watch_task = None
+
+    async def _watch_disconnected(self, client: TelegramClient) -> None:
+        """
+        Await Telethon's own `client.disconnected` Future.
+
+        This resolves the instant the sender detects the socket is gone —
+        no polling, no timeout, genuinely event-driven. Telethon's docs
+        show it can resolve with an exception (e.g. OSError) as well as
+        cleanly; either way, a resolution means "this client is no longer
+        connected", which is all `_disconnect_event` needs to communicate.
+        """
+        if not _FAST_RECONNECT_ENABLED:
+            return
+        try:
+            await client.disconnected
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            # Any resolution (clean or exceptional) of client.disconnected
+            # means the same thing here: the client is no longer connected.
+            pass
+        self._disconnect_event.set()
+
+    async def _interruptible_healthy_wait(self) -> None:
+        """
+        v3.1.1 — Wait `_HEALTHY_INTERVAL` seconds, same as before, but wake
+        immediately if `_disconnect_event` fires in the meantime.
+
+        Falls back to a plain `asyncio.sleep(_HEALTHY_INTERVAL)` — byte-for-
+        byte the v3.1.0 behavior — when `FAST_RECONNECT_ENABLED` is false.
+
+        Waking early here does not itself trigger recovery: it simply
+        returns control to `_reconnect_cycle()`, whose very next iteration
+        re-checks `client.is_connected()` (Step 1) and will correctly route
+        into `_recover_connection()` on its own. This deliberately reuses
+        the existing, already-correct escalation path instead of adding a
+        second one.
+        """
+        if not _FAST_RECONNECT_ENABLED:
+            await asyncio.sleep(_HEALTHY_INTERVAL)
+            return
+
+        sleep_task = asyncio.ensure_future(asyncio.sleep(_HEALTHY_INTERVAL))
+        event_task = asyncio.ensure_future(self._disconnect_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {sleep_task, event_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for t in (sleep_task, event_task):
+                if not t.done():
+                    t.cancel()
+            # Swallow cancellation of whichever task didn't win the race.
+            await asyncio.gather(sleep_task, event_task, return_exceptions=True)
+
+        if event_task in done:
+            self._log.info(
+                "[Account{}] Instant disconnect signal received — "
+                "skipping remainder of healthy-interval wait.",
+                self._cfg.index,
+            )
+
+    async def _interruptible_backoff(self, backoff_seconds: float) -> None:
+        """
+        v3.1.1 — Wait up to `backoff_seconds`, same ceiling as before, but
+        wake early the moment a cheap background probe reports connectivity
+        is back.
+
+        This never waits *longer* than the original fixed sleep would have
+        — it only ever shortens it — so behavior during a genuinely
+        prolonged outage (probe keeps failing) is unchanged from v3.1.0.
+        Falls back to a plain `asyncio.sleep(backoff_seconds)` when
+        `FAST_RECONNECT_ENABLED` is false, or when the backoff itself is
+        already shorter than one probe interval (nothing to gain by
+        probing).
+
+        Args:
+            backoff_seconds: The full backoff duration computed by the
+                caller (_handle_no_internet / _handle_telegram_down / the
+                RetryError fallback in _handle_online) — unchanged formulas.
+        """
+        if not _FAST_RECONNECT_ENABLED or backoff_seconds <= _PROBE_INTERVAL:
+            await asyncio.sleep(backoff_seconds)
+            return
+
+        elapsed = 0.0
+        while elapsed < backoff_seconds:
+            step = min(_PROBE_INTERVAL, backoff_seconds - elapsed)
+            await asyncio.sleep(step)
+            elapsed += step
+            if elapsed >= backoff_seconds:
+                return
+            if await _cheap_probe_online():
+                self._log.info(
+                    "[Account{}] Connectivity probe succeeded during "
+                    "backoff — waking early ({:.1f}s of {:.1f}s skipped).",
+                    self._cfg.index, backoff_seconds - elapsed, backoff_seconds,
+                )
+                return
 
     async def _reconnect_cycle(self) -> None:
         """
@@ -245,9 +539,10 @@ class AccountReconnector:
         try:
             await asyncio.wait_for(client(GetStateRequest()), timeout=10.0)
 
-            # Connection is healthy — reset failure counter, use long interval
+            # Connection is healthy — reset failure counter, use long
+            # interval (v3.1.1: now interruptible — see docstring above).
             self._consecutive_failures = 0
-            await asyncio.sleep(_HEALTHY_INTERVAL)
+            await self._interruptible_healthy_wait()
             return
 
         except TimeoutError:
@@ -315,6 +610,11 @@ class AccountReconnector:
             # Minor issue — use adaptive shorter interval for faster detection
             # Formula: 30s / (failures+1), but at least 5s
             # failures=1 → 15s, failures=2 → recovery (handled above)
+            # v3.1.1: intentionally NOT routed through the interruptible
+            # wait — this interval is already short (≤15s) and this path
+            # is a one-cycle grace period before escalation, not a
+            # multi-minute backoff, so there is little to gain and it
+            # keeps this branch's behavior identical to v3.1.0.
             interval = max(
                 _MIN_DEGRADED_INTERVAL,
                 _HEALTHY_INTERVAL / (self._consecutive_failures + 1),
@@ -341,33 +641,52 @@ class AccountReconnector:
         _attempt_connect().  On any non-success path the counter continues
         to grow so that backoff naturally lengthens — but it is capped at
         the formula maxima to avoid runaway values.
+
+        v3.1.1: guarded by `_recovering` so a second, concurrent call (e.g.
+        from a future direct-trigger use of the disconnect watcher) can't
+        race this one — see module docstring. Under the current call
+        pattern (always sequential, from within `_reconnect_cycle()`'s own
+        loop iteration) this guard should never actually trigger; it logs
+        at debug level if it ever does.
         """
-        self._log.info(
-            "[Account{}] Starting connection recovery...",
-            self._cfg.index,
-        )
-
-        # Detect network state
-        state = await detect_network_state()
-        self._last_state = state
-
-        self._log.info(
-            "[Account{}] Network state detected: {}",
-            self._cfg.index, state.name,
-        )
-
-        if state == NetworkState.NO_INTERNET:
-            await self._handle_no_internet()
-        elif state == NetworkState.TELEGRAM_DOWN:
-            await self._handle_telegram_down()
-        elif state == NetworkState.ONLINE:
-            await self._handle_online()
-        else:  # UNKNOWN
-            self._log.warning(
-                "[Account{}] Unknown network state — attempting reconnect.",
+        if self._recovering:
+            self._log.debug(
+                "[Account{}] Recovery already in progress — skipping "
+                "duplicate trigger.",
                 self._cfg.index,
             )
-            await self._handle_online()
+            return
+
+        self._recovering = True
+        try:
+            self._log.info(
+                "[Account{}] Starting connection recovery...",
+                self._cfg.index,
+            )
+
+            # Detect network state
+            state = await detect_network_state()
+            self._last_state = state
+
+            self._log.info(
+                "[Account{}] Network state detected: {}",
+                self._cfg.index, state.name,
+            )
+
+            if state == NetworkState.NO_INTERNET:
+                await self._handle_no_internet()
+            elif state == NetworkState.TELEGRAM_DOWN:
+                await self._handle_telegram_down()
+            elif state == NetworkState.ONLINE:
+                await self._handle_online()
+            else:  # UNKNOWN
+                self._log.warning(
+                    "[Account{}] Unknown network state — attempting reconnect.",
+                    self._cfg.index,
+                )
+                await self._handle_online()
+        finally:
+            self._recovering = False
 
     async def _handle_no_internet(self) -> None:
         """Handle NO_INTERNET state — wait with exponential backoff."""
@@ -383,7 +702,9 @@ class AccountReconnector:
         )
         self._notify(connected=False)
         self._consecutive_failures += 1
-        await asyncio.sleep(backoff)
+        # v3.1.1: interruptible — wakes early the instant a probe succeeds,
+        # never waits longer than `backoff` would have on its own.
+        await self._interruptible_backoff(backoff)
 
     async def _handle_telegram_down(self) -> None:
         """Handle TELEGRAM_DOWN state — wait longer, Telegram is having issues."""
@@ -396,7 +717,8 @@ class AccountReconnector:
         )
         self._notify(connected=False)
         self._consecutive_failures += 1
-        await asyncio.sleep(backoff)
+        # v3.1.1: interruptible — see _handle_no_internet() above.
+        await self._interruptible_backoff(backoff)
 
     async def _handle_online(self) -> None:
         """Handle ONLINE state — rebuild client with tenacity retry."""
@@ -415,7 +737,8 @@ class AccountReconnector:
             )
             self._consecutive_failures += 1
             # Wait before next cycle
-            await asyncio.sleep(min(30 * self._consecutive_failures, 300))
+            # v3.1.1: interruptible — see _handle_no_internet() above.
+            await self._interruptible_backoff(min(30 * self._consecutive_failures, 300))
 
     async def _rebuild_client_with_retry(self) -> None:
         """
@@ -514,6 +837,10 @@ class AccountReconnector:
 
             # Re-register all module handlers on the new client
             self._loader.reattach(new_client)
+
+            # v3.1.1: (re)start the instant-disconnect watcher on the new
+            # client — it must always track whichever client is current.
+            self._start_disconnect_watcher(new_client)
 
             # Reset failure counter and notify subscribers
             self._consecutive_failures = 0

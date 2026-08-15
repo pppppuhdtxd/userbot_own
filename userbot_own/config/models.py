@@ -89,11 +89,51 @@ class Settings:
     | BACKOFF_MAX       | 300     | Maximum reconnect back-off (seconds)      |
     | HISTORY_LIMIT     | 2000    | Max messages scanned by clearer modules   |
     | LOG_LEVEL         | DEBUG   | Root logging level                        |
+
+    v3.1.1 note on `backoff_start` / `backoff_max` above: a repo-wide grep
+    confirms these two fields are loaded from the environment by
+    `config/loader.py` but were never actually read by
+    `core/reconnector.py` — the reconnector's real backoff formulas
+    (`_handle_no_internet()`'s `2 ** min(failures, 8)`,
+    `_handle_telegram_down()`'s `60 + failures * 30`, both capped at 300)
+    are hardcoded there and always have been. This dataclass simply
+    documents the values as loaded; it doesn't claim they're consumed.
+
+    v3.1.1 also adds three fast-reconnect settings below. Unlike the
+    fields above, these are **not** read from this `Settings` object at
+    runtime — `core/reconnector.py` reads the same three environment
+    variables directly (see its module docstring's "v3.1.1" section for
+    the full rationale). They're listed here purely so this table stays
+    the single place documenting every environment variable this project
+    reads, alongside their actual defaults:
+
+    | Variable                          | Default | Description                                    |
+    |------------------------------------|---------|-------------------------------------------------|
+    | FAST_RECONNECT_ENABLED             | true    | Master switch for v3.1.1 fast reconnect          |
+    | FAST_RECONNECT_HEALTHY_INTERVAL    | 30      | Healthy-connection check interval (seconds)      |
+    | FAST_RECONNECT_PROBE_INTERVAL      | 3       | Backoff-probe interval during outages (seconds)  |
     """
     backoff_start: int = 1
     backoff_max:   int = 300
     history_limit: int = 2000
     log_level:     str = "DEBUG"
+
+    # v3.1.1 — documented here for discoverability; NOT wired through this
+    # object at runtime (core/reconnector.py reads the corresponding
+    # FAST_RECONNECT_* environment variables directly). These fields exist
+    # so `Settings` remains a complete inventory of configurable values
+    # even though the reconnector doesn't currently receive a `Settings`
+    # instance at all (composition_root.py constructs `AccountReconnector`
+    # with just `(ac, loader)`). Wiring these through end-to-end — passing
+    # `Settings` into `AccountReconnector` via `config/loader.py` and
+    # `app/composition_root.py` — is a natural follow-up if a single
+    # source of truth for all config becomes worth the extra plumbing;
+    # out of scope for this release, which only touched
+    # `core/reconnector.py`, this file, `README.md`, `VERSION`, and
+    # `CHANGELOG.md`.
+    fast_reconnect_enabled:          bool  = True
+    fast_reconnect_healthy_interval: float = 30.0
+    fast_reconnect_probe_interval:   float = 3.0
 
 
 # ── AccountConfig ─────────────────────────────────────────────────────────────

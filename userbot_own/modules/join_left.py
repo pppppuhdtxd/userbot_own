@@ -200,7 +200,7 @@ _ADAPTIVE_MAX_MULT  = 20.0   # never exceed 20× the base smart delay
 _ADAPTIVE_DECAY     = 0.90   # per-successful-join decay factor toward 1.0
 
 # Layer 4: batch / human-pattern parameters
-_BATCH_SIZE          = 5
+_BATCH_SIZE          = 4
 _COOLDOWN_SHORT      = 30.0
 _COOLDOWN_LONG       = 120.0
 _BATCHES_BEFORE_LONG = 3

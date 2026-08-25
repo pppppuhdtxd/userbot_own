@@ -155,15 +155,27 @@ class AccountConfig:
         phone:        E.164 phone number, e.g. "+989123456789".
         log_file:     Absolute path to the per-account log file.
         settings_dir: Absolute path to the per-account settings directory.
+        session_string: Optional Telethon StringSession value, loaded
+                      from account.json's "session_string" field (added
+                      in v3.1.3). When set (non-empty), core/telegram_client.py
+                      connects via StringSession instead of the file-based
+                      session at session_path — session_path is still
+                      always populated for backward compatibility (e.g.
+                      account_management/cli.py's file-session tooling)
+                      but is simply not used to build the client in that
+                      case. When unset (the default — every account.json
+                      created before v3.1.3 has no such field), behavior
+                      is 100% identical to before this field existed.
     """
-    index:        int
-    account_dir:  Path
-    session_path: str
-    api_id:       int
-    api_hash:     str
-    phone:        str
-    log_file:     str
-    settings_dir: Path
+    index:          int
+    account_dir:    Path
+    session_path:   str
+    api_id:         int
+    api_hash:       str
+    phone:          str
+    log_file:       str
+    settings_dir:   Path
+    session_string: str = ""
 
 
 __all__ = ["Paths", "Settings", "AccountConfig"]

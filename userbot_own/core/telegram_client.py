@@ -37,6 +37,7 @@ import logging
 
 from telethon import TelegramClient
 from telethon.network.connection import ConnectionTcpFull
+from telethon.sessions import StringSession
 
 from userbot_own import __version__ as _BOT_VERSION
 from userbot_own.config.models import AccountConfig
@@ -84,11 +85,20 @@ def _build_connection_kwargs(cfg: AccountConfig) -> dict:
     Uses direct connection (ConnectionTcpFull) with optimized settings
     for mobile and desktop environments.
 
+    Session source (v3.1.3+): if cfg.session_string is set (populated by
+    account_management/cli.py, either from a fresh login or from an
+    imported string session), it takes priority and the client connects
+    via telethon.sessions.StringSession — no local .session file is
+    touched. Otherwise, falls back to the file-based session at
+    cfg.session_path exactly as before. Accounts created before v3.1.3
+    always have an empty session_string, so their behavior is unchanged.
+
     Returns:
         Dict ready to be unpacked into TelegramClient(**kwargs).
     """
+    session = StringSession(cfg.session_string) if cfg.session_string else cfg.session_path
     return {
-        "session":               cfg.session_path,
+        "session":               session,
         "api_id":                cfg.api_id,
         "api_hash":              cfg.api_hash,
         "connection":            ConnectionTcpFull,
@@ -139,9 +149,11 @@ class AccountClient:
         """
         kwargs = _build_connection_kwargs(self.cfg)
         self.client = TelegramClient(**kwargs)
+        session_source = "string session" if self.cfg.session_string else "file session"
         log.info(
-            "[Account%d] Client built — direct connection.",
+            "[Account%d] Client built — direct connection (%s).",
             self.cfg.index,
+            session_source,
         )
         return self.client
 

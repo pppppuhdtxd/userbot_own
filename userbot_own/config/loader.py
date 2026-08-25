@@ -88,6 +88,11 @@ def discover_accounts(paths: Paths) -> list[AccountConfig]:
             print(f"[CONFIG] #{idx}: missing api_id or api_hash — skipped.", file=sys.stderr)
             continue
 
+        # Optional (v3.1.3+). Empty string means "no string session" —
+        # AccountClient/build_temp_client fall back to the file-based
+        # session at session_path exactly as they always have.
+        session_string: str = str(raw.get("session_string", "")).strip()
+
         accounts.append(
             AccountConfig(
                 index=idx,
@@ -98,6 +103,7 @@ def discover_accounts(paths: Paths) -> list[AccountConfig]:
                 phone=str(raw.get("phone", "")).strip(),
                 log_file=str(paths.logs / f"account{idx}.log"),
                 settings_dir=paths.settings / f"account{idx}",
+                session_string=session_string,
             )
         )
 

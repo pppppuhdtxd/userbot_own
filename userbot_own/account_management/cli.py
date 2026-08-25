@@ -5,21 +5,41 @@ userbot_own/account_management/cli.py  (was add_account.py at the repo root)
 Interactive account manager for the Multi-Account Userbot.
 
 Menu options:
-  1) Add new account         — create account.json + login
+  1) Add new account         — two ways to add: full login, or import
+                                an existing string session (no login)
   2) Re-login account        — recreate session (backup taken first)
   3) Edit account details    — modify api_id / api_hash / phone / label
   4) Remove account          — delete account folder entirely
   5) List accounts           — show all accounts with status
-  6) Verify session          — check if session file is valid
+  6) Verify session          — check if the account's session is valid
   7) Exit
 
 Account schema (account.json):
   {
-      "api_id":   12345678,
-      "api_hash": "abcdef...",
-      "phone":    "+989123456789",
-      "label":    "اکانت شخصی"   ← optional nickname
+      "api_id":         12345678,
+      "api_hash":       "abcdef...",
+      "phone":          "+989123456789",
+      "label":          "اکانت شخصی",   ← optional nickname
+      "session_string": "1BVtsO..."     ← optional, Telethon StringSession
   }
+
+  "session_string" is optional and additive: when present, the account
+  connects via telethon.sessions.StringSession instead of the on-disk
+  session.session file. When absent, behavior is 100% unchanged from
+  before — the account uses the file-based session exactly as it always
+  has. An account can have a file session, a string session, or both;
+  the string session (if present) always takes priority when building
+  the client (see core/telegram_client.py).
+
+  On every successful login (new account or re-login), the string
+  session equivalent of the freshly-created file session is
+  automatically derived and saved into account.json too — no extra
+  step required. This does NOT create a new Telegram login/auth key by
+  itself; it only serializes the auth key that the login step already
+  created. Its purpose is purely so that account.json alone (independent
+  of the .session file on disk) is always enough to recover access if
+  the .session file is ever lost/corrupted, without repeating phone +
+  code + 2FA.
 
 Run:  python add_account.py   (a thin repo-root shim that calls main() here)
 
@@ -34,7 +54,9 @@ Migration notes:
   the old core/client.py and userbot/__init__.py). It now imports the
   single canonical userbot.__version__ instead.
 - Everything else — every prompt, validation rule, retry count, and menu
-  flow — is unchanged.
+  flow — is unchanged, except where noted in the v3.1.3 section of
+  CHANGELOG.md (string session support, richer session-status reporting,
+  and the empty-account-folder cleanup fix).
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -65,6 +87,11 @@ _API_HASH_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 _API_ID_MIN = 1000
 _API_ID_MAX = 99_999_999
 _LABEL_MAX_LEN = 40
+# Telethon StringSession values are base64-ish and, in practice, always
+# well over 100 chars. This is just a sanity floor to catch obvious
+# copy-paste mistakes (truncated/empty paste) before we ever try to
+# connect with it — not a strict format check.
+_SESSION_STRING_MIN_LEN = 50
 
 # Network timeouts (seconds)
 _CONNECT_TIMEOUT = 30.0
@@ -255,6 +282,41 @@ def _session_files(account_dir: Path) -> list[Path]:
     return files
 
 
+def _has_file_session(account_dir: Path) -> bool:
+    """True if the main session.session file exists (the file the client
+    actually needs — journal/shm/wal are just SQLite side-files)."""
+    return (account_dir / "session.session").exists()
+
+
+def _has_string_session(cfg: dict | None) -> bool:
+    """True if account.json carries a non-empty session_string."""
+    return bool(cfg and str(cfg.get("session_string", "")).strip())
+
+
+def _session_status(account_dir: Path, cfg: dict | None) -> tuple[str, bool]:
+    """
+    Build a short colored status tag describing what login material this
+    account has available, and whether it has *any* usable session at all.
+
+    Four possible states:
+      - both file + string session  → most resilient, "✔ file+string"
+      - file session only            → "✔ file"
+      - string session only          → "✔ string" (no local .session yet;
+                                         one will be created on next start)
+      - neither                      → "⏳ no session"
+    """
+    has_file = _has_file_session(account_dir)
+    has_string = _has_string_session(cfg)
+
+    if has_file and has_string:
+        return f"{C.GREEN}✔ file+string{C.RESET}", True
+    if has_file:
+        return f"{C.GREEN}✔ file{C.RESET}", True
+    if has_string:
+        return f"{C.GREEN}✔ string{C.RESET}", True
+    return f"{C.YELLOW}⏳ no session{C.RESET}", False
+
+
 # ── Display ───────────────────────────────────────────────────────────────────
 
 def _print_header(title: str) -> None:
@@ -289,13 +351,7 @@ def _list_accounts(verbose: bool = True) -> list[Path]:
 
         for d in dirs:
             cfg = _read_cfg(d)
-            sess_files = _session_files(d)
-            has_main_sess = any(f.name == "session.session" for f in sess_files)
-            sess_tag = (
-                f"{C.GREEN}✔ active{C.RESET}"
-                if has_main_sess
-                else f"{C.YELLOW}⏳ no session{C.RESET}"
-            )
+            sess_tag, _has_any = _session_status(d, cfg)
 
             if cfg:
                 phone = cfg.get("phone", "N/A")
@@ -417,17 +473,70 @@ def _collect_info(index: int, existing: dict | None = None) -> dict | None:
 
 # ── Telegram Login ────────────────────────────────────────────────────────────
 
+def _build_client(cfg: dict, account_dir: Path):
+    """
+    Build a TelegramClient for this account.
+
+    Priority: if account.json already carries a session_string, connect
+    with that (telethon.sessions.StringSession) — no local .session file
+    is required for this to work. Otherwise, fall back to the file-based
+    session at accounts/N/session.session, exactly as before.
+
+    Raises ImportError if telethon is not installed (caller handles it).
+    """
+    from telethon import TelegramClient
+    from telethon.network.connection import ConnectionTcpAbridged
+
+    session_string = str(cfg.get("session_string", "")).strip()
+    if session_string:
+        from telethon.sessions import StringSession
+        session = StringSession(session_string)
+    else:
+        session = str(account_dir / "session")
+
+    return TelegramClient(
+        session,
+        cfg["api_id"],
+        cfg["api_hash"],
+        connection=ConnectionTcpAbridged,
+    )
+
+
+def _save_string_session(cfg: dict, account_dir: Path, client) -> str | None:
+    """
+    Derive the StringSession equivalent of `client`'s current (already
+    authorized) session and persist it into account.json.
+
+    This does NOT talk to Telegram and does NOT create a new auth key —
+    it only serializes the auth key the current session already holds.
+    Safe to call after any successful login/re-login. Returns the string
+    on success, or None if it could not be saved (non-fatal either way;
+    the file-based session still works normally).
+    """
+    try:
+        from telethon.sessions import StringSession
+        session_string = StringSession.save(client.session)
+    except Exception as exc:
+        _warn(f"Could not derive string session (non-fatal): {exc}")
+        return None
+
+    cfg["session_string"] = session_string
+    if _write_cfg(account_dir, cfg):
+        _ok("String session saved to account.json (backup of your login).")
+        return session_string
+
+    _warn("Could not save string session to account.json.")
+    return None
+
+
 async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
     """Connect to Telegram and authenticate. Returns True on success."""
     try:
-        from telethon import TelegramClient
         from telethon import errors as tl_errors
-        from telethon.network.connection import ConnectionTcpAbridged
     except ImportError:
         _err("telethon is not installed. Run: pip install telethon")
         return False
 
-    session_path = str(account_dir / "session")
     label_or_phone = cfg.get("label") or cfg.get("phone", "?")
     print()
     _sep()
@@ -435,12 +544,7 @@ async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
     _sep()
     print()
 
-    client = TelegramClient(
-        session_path,
-        cfg["api_id"],
-        cfg["api_hash"],
-        connection=ConnectionTcpAbridged,
-    )
+    client = _build_client(cfg, account_dir)
 
     try:
         # ── Step 1: Connect with timeout ────────────────────────────
@@ -466,10 +570,10 @@ async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
             try:
                 me = await asyncio.wait_for(client.get_me(), timeout=_GET_ME_TIMEOUT)
                 _ok(f"Session already exists — {me.first_name} (ID: {me.id})")
-                return True
             except Exception as exc:
                 _warn(f"Authorized but couldn't fetch user info: {exc}")
-                return True
+            _save_string_session(cfg, account_dir, client)
+            return True
 
         # ── Step 3: Send code with retry ────────────────────────────
         _info(f"Sending verification code to {cfg['phone']}...")
@@ -541,7 +645,7 @@ async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
             _warn("Two-step verification (2FA) is enabled.")
             password_ok = False
             for attempt in range(1, _MAX_RETRIES + 1):
-                password = _ask("2FA password", secret=True)
+                password = _ask("2FA password")
                 if not password:
                     _err("Password cannot be empty.")
                     continue
@@ -569,6 +673,12 @@ async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
             _ok(f"Login successful — {me.first_name} (ID: {me.id})")
         except Exception as exc:
             _warn(f"Login succeeded but couldn't fetch user info: {exc}")
+
+        # Derive and persist the string-session equivalent of the fresh
+        # login. Purely additive: does not create another auth key, just
+        # backs up the one that was just created so account.json alone
+        # can recover access if the .session file is ever lost.
+        _save_string_session(cfg, account_dir, client)
         return True
 
     except KeyboardInterrupt:
@@ -589,44 +699,263 @@ async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
 
 # ── Menu Actions ──────────────────────────────────────────────────────────────
 
+def _cleanup_if_empty(account_dir: Path) -> None:
+    """
+    Remove account_dir if it exists and is completely empty.
+
+    Used to clean up after a cancelled "Add new account" flow so that an
+    aborted attempt never leaves behind a dangling empty folder that
+    would otherwise show up as a phantom account (e.g. "accounts/3/"
+    with nothing in it) in the list/menu screens.
+
+    Safe to call unconditionally — silently does nothing if the folder
+    is missing, non-empty, or can't be removed for some reason (e.g. a
+    permissions issue); this is best-effort cleanup, never a hard error.
+    """
+    try:
+        if account_dir.exists() and account_dir.is_dir() and not any(account_dir.iterdir()):
+            account_dir.rmdir()
+    except OSError:
+        pass
+
+
 async def _action_add() -> None:
-    """Option 1: Add a brand-new account."""
+    """
+    Option 1: Add a brand-new account.
+
+    Offers two independent ways to add an account:
+      1) Full login  — phone + verification code (+ 2FA if enabled).
+                        Talks to Telegram and creates a new auth key.
+      2) String session — paste an existing Telethon StringSession you
+                        already have (e.g. backed up from another
+                        account.json, or generated elsewhere). No new
+                        login/auth key is created; the account is simply
+                        verified and registered.
+    """
+    _print_header("Add New Account")
+    print(f"  {C.BOLD}How do you want to add this account?{C.RESET}")
+    print(f"    {C.WHITE}1{C.RESET}  Full login (phone + code, new session)")
+    print(f"    {C.WHITE}2{C.RESET}  Import existing string session (no login)")
+    print(f"    {C.WHITE}3{C.RESET}  Cancel")
+    print()
+
+    try:
+        choice = _ask("Choice", default="1")
+    except (KeyboardInterrupt, EOFError):
+        print()
+        _info("Add cancelled.")
+        return
+
+    print()
+
+    if choice == "1":
+        await _action_add_full()
+    elif choice == "2":
+        await _action_add_string()
+    elif choice == "3":
+        _info("Add cancelled.")
+    else:
+        _err(f"Unknown choice: '{choice}'.")
+
+
+async def _action_add_full() -> None:
+    """Add-flow 1: create account.json, then run the full interactive login."""
     index = _next_index()
     account_dir = ACCOUNTS_DIR / str(index)
     account_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = _collect_info(index)
-    if cfg is None:
-        try:
-            if not any(account_dir.iterdir()):
-                account_dir.rmdir()
-        except OSError:
-            pass
-        return
+    try:
+        cfg = _collect_info(index)
+        if cfg is None:
+            return
 
-    if not _write_cfg(account_dir, cfg):
-        return
+        if not _write_cfg(account_dir, cfg):
+            return
 
-    _ok(f"Saved accounts/{index}/account.json")
-    print()
+        _ok(f"Saved accounts/{index}/account.json")
+        print()
 
-    if _confirm("Create session now?", default=True):
-        success = await _login(index, cfg, account_dir)
-        if success:
-            print()
-            _sep("═")
-            print(f"{C.GREEN}{C.BOLD}  Account #{index} added successfully!{C.RESET}")
-            _sep("═")
-            print(f"  📁  Path : accounts/{index}/")
-            print(f"  📱  Phone: {cfg['phone']}")
-            if cfg.get("label"):
-                print(f"  🏷   Label: {cfg['label']}")
-            print()
+        if _confirm("Create session now?", default=True):
+            success = await _login(index, cfg, account_dir)
+            if success:
+                print()
+                _sep("═")
+                print(f"{C.GREEN}{C.BOLD}  Account #{index} added successfully!{C.RESET}")
+                _sep("═")
+                print(f"  📁  Path : accounts/{index}/")
+                print(f"  📱  Phone: {cfg['phone']}")
+                if cfg.get("label"):
+                    print(f"  🏷   Label: {cfg['label']}")
+                print()
+            else:
+                _warn(f"Account #{index} saved but session was not created.")
+                _info("Run this script again and choose option 2 to retry login.")
         else:
-            _warn(f"Account #{index} saved but session was not created.")
-            _info("Run this script again and choose option 2 to retry login.")
-    else:
-        _info(f"Account #{index} saved. Run this script again to create the session.")
+            _info(f"Account #{index} saved. Run this script again to create the session.")
+    finally:
+        # Runs on every exit path — normal return, cancelled input, or a
+        # raised KeyboardInterrupt/EOFError from anywhere inside
+        # _collect_info() — so a folder created above never survives
+        # empty. If account.json was written, the folder is non-empty
+        # and this is a no-op.
+        _cleanup_if_empty(account_dir)
+
+
+async def _action_add_string() -> None:
+    """
+    Add-flow 2: register an account from an existing Telethon
+    StringSession, with no phone/code/2FA login step at all.
+
+    api_id/api_hash/session_string are required. Phone number and name
+    are fetched automatically from Telegram after connecting (via
+    get_me()) so the user doesn't have to re-type anything they've
+    already authenticated with — the phone field is only ever used
+    for display/reference in this project, never for a new sign-in.
+    """
+    index = _next_index()
+    account_dir = ACCOUNTS_DIR / str(index)
+    account_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _print_header(f"➕ New Account #{index} — String Session Import")
+        print()
+
+        # ── api_id ──────────────────────────────────────────────────
+        api_id = None
+        for attempt in range(1, _MAX_RETRIES + 1):
+            raw = _ask("api_id")
+            api_id = _validate_api_id(raw)
+            if api_id is not None:
+                break
+            _err(
+                f"api_id must be an integer between {_API_ID_MIN:,} and "
+                f"{_API_ID_MAX:,}. (Attempt {attempt}/{_MAX_RETRIES})"
+            )
+        else:
+            _err("Too many invalid attempts. Aborting.")
+            return
+
+        # ── api_hash ────────────────────────────────────────────────
+        api_hash = None
+        for attempt in range(1, _MAX_RETRIES + 1):
+            raw = _ask("api_hash")
+            api_hash = _validate_api_hash(raw)
+            if api_hash is not None:
+                break
+            _err(
+                "api_hash must be exactly 32 hexadecimal characters. "
+                f"(Attempt {attempt}/{_MAX_RETRIES})"
+            )
+        else:
+            _err("Too many invalid attempts. Aborting.")
+            return
+
+        # ── session_string ──────────────────────────────────────────
+        session_string = None
+        for attempt in range(1, _MAX_RETRIES + 1):
+            raw = _ask("String session").strip()
+            if len(raw) >= _SESSION_STRING_MIN_LEN:
+                session_string = raw
+                break
+            _err(
+                f"That doesn't look like a valid string session (too short). "
+                f"(Attempt {attempt}/{_MAX_RETRIES})"
+            )
+        else:
+            _err("Too many invalid attempts. Aborting.")
+            return
+
+        # ── label (nickname, optional) ─────────────────────────────
+        print()
+        _info(f"Label (nickname) is optional. Press Enter to skip (max {_LABEL_MAX_LEN} chars).")
+        label = _validate_label(_ask("Label / Nickname"))
+
+        cfg = {
+            "api_id": api_id,
+            "api_hash": api_hash,
+            "phone": "",  # filled in automatically below, on success
+            "label": label,
+            "session_string": session_string,
+        }
+
+        # ── Connect and verify the string session actually works ────
+        try:
+            from telethon import errors as tl_errors
+        except ImportError:
+            _err("telethon is not installed. Run: pip install telethon")
+            return
+
+        print()
+        _info(f"Connecting to Telegram for account #{index} to verify the session...")
+        client = _build_client(cfg, account_dir)
+
+        try:
+            await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT)
+
+            try:
+                authorized = await asyncio.wait_for(
+                    client.is_user_authorized(), timeout=_GET_ME_TIMEOUT
+                )
+            except TimeoutError:
+                _err("Authorization check timed out.")
+                return
+
+            if not authorized:
+                _err(
+                    "This string session is not authorized (expired, revoked, "
+                    "or logged out). Please generate/obtain a fresh one."
+                )
+                return
+
+            try:
+                me = await asyncio.wait_for(client.get_me(), timeout=_GET_ME_TIMEOUT)
+                cfg["phone"] = f"+{me.phone}" if me.phone else ""
+                _ok(f"String session verified — {me.first_name} (ID: {me.id})")
+                if cfg["phone"]:
+                    _ok(f"Phone: {cfg['phone']}")
+            except TimeoutError:
+                _warn("Session authorized but couldn't fetch user info (timed out).")
+            except Exception as exc:
+                _warn(f"Session authorized but couldn't fetch user info: {exc}")
+
+        except tl_errors.AuthKeyError:
+            _err("This string session's auth key is invalid.")
+            return
+        except TimeoutError:
+            _err(f"Connection timed out after {_CONNECT_TIMEOUT}s.")
+            return
+        except Exception as exc:
+            _err(f"Verification failed: {exc}")
+            return
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+        if not _write_cfg(account_dir, cfg):
+            return
+
+        print()
+        _sep("═")
+        print(f"{C.GREEN}{C.BOLD}  Account #{index} added successfully (via string session)!{C.RESET}")
+        _sep("═")
+        print(f"  📁  Path : accounts/{index}/")
+        if cfg.get("phone"):
+            print(f"  📱  Phone: {cfg['phone']}")
+        if cfg.get("label"):
+            print(f"  🏷   Label: {cfg['label']}")
+        print(f"  {C.DIM}No local session file needed — this account connects directly")
+        print(f"  from the session_string stored in account.json.{C.RESET}")
+        print()
+
+    except (KeyboardInterrupt, EOFError):
+        print()
+        _warn("Add via string session cancelled.")
+    finally:
+        # Same guarantee as the full-login flow: never leave an empty
+        # accounts/N/ folder behind after a cancelled/failed attempt.
+        _cleanup_if_empty(account_dir)
 
 
 async def _action_relogin() -> None:
@@ -652,6 +981,12 @@ async def _action_relogin() -> None:
     print()
     _warn(f"You are about to re-login account #{idx} ({label_or_phone}).")
     _info("This will delete the current session and request a new code.")
+    if cfg.get("session_string"):
+        _info(
+            "The stored session_string will also be cleared and replaced "
+            "with a fresh one from the new login, so this always forces a "
+            "brand-new auth key instead of silently reusing the old one."
+        )
     if not _confirm("Continue?", default=True):
         _info("Re-login cancelled.")
         return
@@ -659,6 +994,13 @@ async def _action_relogin() -> None:
     backup = _backup_cfg(account_dir)
     if backup:
         _info(f"Backup created: {backup.name}")
+
+    # Force a genuinely fresh login: drop any existing string session too,
+    # otherwise _build_client() would happily reconnect with the old
+    # (still-valid) string session and skip the new login entirely — which
+    # would defeat the purpose of explicitly asking to re-login.
+    cfg["session_string"] = ""
+    _write_cfg(account_dir, cfg)
 
     sess_files = _session_files(account_dir)
     for p in sess_files:
@@ -706,6 +1048,8 @@ async def _action_edit() -> None:
     print(f"    api_hash : {str(cfg.get('api_hash', ''))[:6]}…")
     print(f"    phone    : {cfg.get('phone', 'N/A')}")
     print(f"    label    : {cfg.get('label') or f'{C.DIM}(not set){C.RESET}'}")
+    sess_tag, _has_any = _session_status(account_dir, cfg)
+    print(f"    session  : {sess_tag}")
     print()
 
     # Ask user which field to edit
@@ -774,6 +1118,18 @@ async def _action_edit() -> None:
                 "Changing api_id or api_hash will invalidate the existing session. "
                 "You will need to re-login (option 2) afterwards."
             )
+            # A string session's auth key is tied to the api_id/api_hash it
+            # was created with — drop the now-stale one instead of leaving
+            # an invalid value sitting in account.json.
+            new_cfg["session_string"] = ""
+        else:
+            # _collect_info() only returns api_id/api_hash/phone/label; it
+            # doesn't know about session_string. Since credentials didn't
+            # change, carry the existing string session forward instead
+            # of silently dropping it when this dict overwrites the file.
+            existing_session_string = cfg.get("session_string", "")
+            if existing_session_string:
+                new_cfg["session_string"] = existing_session_string
 
         backup = _backup_cfg(account_dir)
         if backup:
@@ -857,29 +1213,21 @@ async def _action_verify() -> None:
         _err(f"accounts/{idx}/account.json not found or unreadable.")
         return
 
-    session_file = account_dir / "session.session"
-    if not session_file.exists():
-        _err(f"No session file found for account #{idx}. Use option 2 to login.")
+    if not _has_file_session(account_dir) and not _has_string_session(cfg):
+        _err(f"No session (file or string) found for account #{idx}. Use option 2 to login.")
         return
 
     try:
-        from telethon import TelegramClient
         from telethon import errors as tl_errors
-        from telethon.network.connection import ConnectionTcpAbridged
     except ImportError:
         _err("telethon is not installed. Run: pip install telethon")
         return
 
     label_or_phone = cfg.get("label") or cfg.get("phone", "?")
-    _info(f"Verifying session for account #{idx} ({label_or_phone})...")
+    sess_tag, _has_any = _session_status(account_dir, cfg)
+    _info(f"Verifying session for account #{idx} ({label_or_phone}) — source: {sess_tag}...")
 
-    session_path = str(account_dir / "session")
-    client = TelegramClient(
-        session_path,
-        cfg["api_id"],
-        cfg["api_hash"],
-        connection=ConnectionTcpAbridged,
-    )
+    client = _build_client(cfg, account_dir)
 
     try:
         await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT)
@@ -927,7 +1275,7 @@ async def _main() -> None:
 
     while True:
         print(f"  {C.BOLD}Options:{C.RESET}")
-        print(f"    {C.WHITE}1{C.RESET}  Add new account")
+        print(f"    {C.WHITE}1{C.RESET}  Add new account (full login or string session)")
         print(f"    {C.WHITE}2{C.RESET}  Re-login / recreate session")
         print(f"    {C.WHITE}3{C.RESET}  Edit account details (incl. label)")
         print(f"    {C.WHITE}4{C.RESET}  Remove account")

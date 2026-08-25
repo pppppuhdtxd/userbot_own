@@ -356,7 +356,16 @@ based on strict priority. This ensures consistent behavior across all modules
 python add_account.py
 ```
 
-Follow the interactive prompts to enter your API credentials and phone number.
+Option 1 ("Add new account") offers two ways in:
+- **Full login** — the classic phone + code (+ 2FA) flow.
+- **Import existing string session** — paste an already-authorized Telethon
+  `StringSession` (plus `api_id`/`api_hash`) instead of logging in again; no
+  new Telegram auth key is created, and phone/name are auto-filled from the
+  account itself.
+
+On every successful login (new account or re-login), the tool also derives
+and saves a `StringSession` backup of that login into `account.json`
+automatically — see the `session_string` field below.
 
 ### Manual
 
@@ -375,6 +384,13 @@ Then restart the bot.
 An optional `"label"` field is supported for your own reference when using
 `python add_account.py`'s account list (option 5); it isn't read by the bot
 itself.
+
+An optional `"session_string"` field (added in v3.1.3) holds a Telethon
+`StringSession` value. When present, it takes priority over the file-based
+`session.session` for that account — useful as a backup so you don't have to
+repeat phone + code + 2FA if `session.session` is ever lost or corrupted.
+When absent, nothing changes: the account uses the file-based session exactly
+as before.
 
 ---
 

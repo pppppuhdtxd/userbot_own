@@ -5,6 +5,118 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.1.4] — 2026-08-25
+
+**Source:** AI (follow-up to v3.1.3 per project owner request)
+
+### Changed — 2FA password and string session are now shown while typing
+
+- `account_management/cli.py`: the "2FA password" prompt (during login)
+  and the "String session" prompt (during string-session import) no
+  longer use `getpass`-style hidden input. Both are now plain, visible
+  input like every other field, so you can see and double-check exactly
+  what you pasted/typed before submitting — particularly useful for the
+  string session field, where a silent typo/bad paste would otherwise
+  only surface as a confusing connection failure. Requested explicitly
+  by the project owner for this single-user, local-machine tool where
+  shoulder-surfing / terminal-recording exposure is a non-issue.
+- `_ask()`'s `secret` parameter/`getpass` code path is left in place
+  (unused for now) in case masked input is ever wanted again for some
+  other field.
+
+---
+
+## [3.1.3] — 2026-08-25
+
+**Source:** AI (account-management review requested by the project owner,
+focused specifically on `account_management/cli.py` — string-session
+support, richer session-status reporting, and a reported empty-folder
+bug, all verified end-to-end against a real telethon install before
+release)
+
+### Added — Optional StringSession support (additive, opt-in per account)
+
+- **`account.json` schema** gains an optional `session_string` field
+  (Telethon `StringSession` value). Absent on every account created
+  before this release — behavior for those accounts is 100% unchanged.
+- **`core/telegram_client.py`** — `_build_connection_kwargs()` now
+  builds the client from `StringSession(cfg.session_string)` when that
+  field is set, otherwise falls back to the file-based session exactly
+  as before. `config/models.py`'s `AccountConfig` gains the matching
+  `session_string: str = ""` field, populated by `config/loader.py`'s
+  `discover_accounts()` from `account.json`.
+- **`account_management/cli.py` — Option 1 ("Add new account") is now a
+  sub-menu with two independent paths:**
+  1. *Full login* — the original phone + code (+2FA) flow, unchanged.
+  2. *Import existing string session* — paste an already-authorized
+     `session_string` (plus `api_id`/`api_hash`); the tool connects
+     with it, verifies it's actually authorized via
+     `is_user_authorized()`, and auto-fills phone/name from `get_me()`.
+     No phone/code/2FA step, and no new Telegram auth key is created.
+- **Automatic string-session backup on every successful login.** Both
+  the full-login flow (`_login()`, used by "Add" and "Re-login") now
+  derive `StringSession.save(client.session)` from the just-created
+  file session and persist it into `account.json` right after login
+  succeeds. This does **not** create an additional Telegram auth
+  key/login — it only serializes the auth key the login step already
+  produced — so the point isn't fewer entries in Telegram's own Active
+  Sessions list, it's that `account.json` alone is now always enough to
+  recover access if the local `.session` file is ever lost or
+  corrupted, without repeating phone + code + 2FA.
+- **Re-login (option 2) now explicitly clears the old `session_string`**
+  before starting, so it always forces a genuinely fresh login/auth key
+  instead of `_build_client()` silently reconnecting with the old
+  (still-valid) string session and skipping the new login entirely.
+- **Edit → full re-entry (option 3 → 1)** no longer silently drops an
+  existing `session_string` when only label/phone are being touched; it
+  is only cleared when `api_id`/`api_hash` actually change (since a
+  string session's auth key is tied to the credentials it was created
+  with, same as the file session already was).
+- **Verify session (option 6)** now works for string-session-only
+  accounts too (no local `.session` file required), reusing the same
+  `_build_client()` resolution as normal login.
+
+### Changed — Session status reporting
+
+- **List accounts (option 5)** and the **Edit account** summary screen
+  now report one of four states per account instead of a binary
+  active/no-session flag: `✔ file+string`, `✔ file`, `✔ string`, or
+  `⏳ no session` — so it's clear at a glance whether an account can
+  recover from a lost `.session` file without re-authenticating.
+
+### Fixed — Empty account folder left behind on cancelled "Add account"
+
+- Previously, cancelling "Add new account" mid-flow (e.g. Ctrl+C while
+  typing `api_id`) raised `KeyboardInterrupt`/`EOFError` out of
+  `_collect_info()` and past the cleanup code at the end of
+  `_action_add()` entirely — skipping it — which left behind an empty
+  `accounts/N/` folder. That empty folder then showed up as a phantom
+  account entry in every subsequent list/menu screen (label/phone shown
+  as "missing or broken account.json"), and permanently consumed that
+  numeric slot.
+- Both add-flows (`_action_add_full()`, `_action_add_string()`) now wrap
+  their body in `try/finally` calling a new `_cleanup_if_empty()`
+  helper, which removes the account folder if — and only if — it's
+  still completely empty when the flow exits, on **every** exit path:
+  normal cancellation, a raised `KeyboardInterrupt`/`EOFError` from
+  anywhere inside input collection, or a failed `account.json` write.
+  Verified with a simulated Ctrl+C during the very first prompt: no
+  folder is left behind.
+
+### Notes
+
+- All code/comments/strings remain English-only, matching the rest of
+  the project — this release only touched `account_management/cli.py`,
+  `config/models.py`, `config/loader.py`, `core/telegram_client.py`,
+  this file, `README.md`, and `VERSION`.
+- No changes to the reconnector, modules, or any other subsystem.
+- Security hardening around `session_string` storage (e.g. encryption
+  at rest) was intentionally out of scope for this release per the
+  project owner's explicit request — `account.json` is treated the same
+  way it already was for `api_hash`: plain JSON on local disk.
+
+---
+
 ## [3.1.1] — 2026-08-15
 
 **Source:** AI (5-phase research pass — current architecture traced

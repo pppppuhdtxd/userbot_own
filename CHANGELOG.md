@@ -5,6 +5,88 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.1.5] — 2026-09-04
+
+**Source:** AI (bug investigation + fix requested by the project owner,
+scoped to `whois_handler.py` — numeric-ID lookup failure plus a set of
+general improvements, all reviewed and approved by the project owner
+before implementation)
+
+### Fixed — `whois <numeric_id>` no longer silently fails for most IDs
+
+- **Root cause**: `whois_handler.py` previously resolved numeric
+  identifiers with a bare `client.get_entity(int(identifier))` call.
+  Telethon only resolves a plain `int` against its **local session
+  entity cache** — it never issues a network request for one. Any ID
+  this account hadn't already encountered (via a prior dialog, message,
+  contact, or resolution this session) raised a raw, unhelpful exception
+  before any API call was even attempted. Additionally, the public
+  `-100xxxxxxxxxx` channel/supergroup ID format (the exact format
+  `whois` itself prints back when *showing* a channel's ID) was never
+  unwrapped on input, so even a copy-pasted ID from the bot's own output
+  could fail to resolve.
+- **Fix**: numeric lookups now go through a new
+  `helpers/utils.py::resolve_entity_by_id()` helper, which tries every
+  plausible peer shape for a given ID — public `-100`-prefixed channel
+  form, raw internal channel form, basic-group form, and user form — via
+  explicit `GetChannelsRequest` / `GetChatsRequest` / `GetUsersRequest`
+  calls, falling back to Telethon's own cache-based `get_entity()` last.
+- **Known, permanent limitation (protocol-level, not fixable client-side)**:
+  Telegram's MTProto layer requires an `access_hash` to resolve a
+  user/channel by numeric ID, and that `access_hash` can only be
+  obtained by this account having already legitimately encountered that
+  peer (a dialog, a message, a shared chat, a contact, a previous
+  successful resolution, etc.). An ID for a user/channel this account
+  has **never** interacted with will still fail to resolve — this is a
+  Telegram protocol constraint that applies to every MTProto client, not
+  a bug in this codebase. What changed in v3.1.5 is that (a) every
+  *resolvable* ID shape is now actually tried, including the public
+  `-100` form, and (b) an unresolvable ID now produces a clear, friendly
+  Persian message explaining the limitation and suggesting `@username`
+  or replying to a message from that user/chat instead of Telethon's raw
+  internal exception text.
+
+### Added
+
+- `helpers/utils.py`: new `resolve_entity_by_id(client, raw_id)` helper
+  and `EntityResolutionError` exception (carries both a user-facing
+  Persian message and a technical detail string for logging), following
+  the module's existing helper-extraction pattern
+  (`format_user_flags`/`format_user_status`/`get_profile_photos_safe`).
+- `whois_handler.py`: short-lived (90s TTL) local result cache, keyed by
+  resolved entity type+ID, storing the built info text alongside the
+  entity reference. Cuts redundant `GetFull*Request`/profile-photo calls
+  when the same target is looked up more than once in a short window —
+  same motivation as the existing caching in `reaction_commands.py` /
+  `clearer.py`, applied here for the first time. Purely an in-memory,
+  process-lifetime optimization; does not mask real profile changes for
+  more than the TTL window.
+- `whois_handler.py`: explicit text-message-length safety net
+  (`_MESSAGE_LIMIT = 4096`, matching Telegram's message-length ceiling),
+  mirroring the existing `_CAPTION_LIMIT` check that already protected
+  the photo-caption path.
+- `whois_handler.py`: a few additional channel/supergroup flags surfaced
+  directly from fields the API already returns — Slow mode
+  (on/off + duration once `GetFullChannelRequest` succeeds),
+  "join to send" (members-only posting), and hidden-stories status.
+- `whois_handler.py` help text: documents the accepted numeric-ID input
+  forms and the MTProto access-hash limitation explicitly, so end users
+  understand *why* some numeric lookups won't resolve rather than
+  assuming it's a bug.
+
+### Changed
+
+- `whois_handler.py`: command dispatch now goes through
+  `modules/router.py`'s `CommandRouter` instead of a hand-rolled
+  first-token string check, for consistency with the module contract
+  documented in `base.py` and used by every other multi-command module
+  in this codebase. Behavior is unchanged for all three input modes —
+  `whois @username`, `whois` (reply), and bare `whois` (current chat) —
+  verified with no regressions; only the dispatch mechanism moved, not
+  the parsing or command logic itself.
+
+---
+
 ## [3.1.4] — 2026-08-25
 
 **Source:** AI (follow-up to v3.1.3 per project owner request)

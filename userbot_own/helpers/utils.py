@@ -42,11 +42,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from telethon import errors
+from telethon.tl.functions.channels import GetChannelsRequest
+from telethon.tl.functions.messages import GetChatsRequest
+from telethon.tl.functions.users import GetUsersRequest
 from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeFilename,
     DocumentAttributeSticker,
     DocumentAttributeVideo,
+    InputChannel,
+    InputUser,
     KeyboardButtonUrl,
     MessageEntityTextUrl,
     MessageEntityUrl,
@@ -98,6 +103,9 @@ __all__ = [
     "format_user_status",
     "truncate",
     "get_profile_photos_safe",
+    # Numeric-ID entity resolution (v3.1.5)
+    "resolve_entity_by_id",
+    "EntityResolutionError",
 ]
 
 
@@ -901,3 +909,162 @@ async def get_profile_photos_safe(client, entity, limit: int = 1) -> list:
     except Exception as exc:
         log.debug("get_profile_photos_safe failed for %s: %s", entity, exc)
         return []
+
+
+# ── Numeric-ID entity resolution (v3.1.5) ─────────────────────────────────────
+
+class EntityResolutionError(Exception):
+    """
+    Raised by :func:`resolve_entity_by_id` when a numeric ID could not be
+    resolved to an entity.
+
+    Carries a ready-to-display, user-facing Persian message
+    (``.user_message``) separate from the technical detail (``.detail``,
+    used for logging only) — callers should show ``.user_message`` to the
+    end user rather than the raw underlying exception, which is usually a
+    low-level Telethon/MTProto error that means nothing to a non-technical
+    reader.
+    """
+
+    def __init__(self, user_message: str, detail: str = "") -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
+        self.detail = detail or user_message
+
+
+async def resolve_entity_by_id(client, raw_id: int):
+    """
+    Resolve a bare numeric ID (as typed by a human — user ID, basic-group
+    ID, or channel/supergroup ID in either its raw or public ``-100``-
+    prefixed form) to a Telethon entity, trying every plausible ID shape
+    instead of relying solely on ``client.get_entity(int)``.
+
+    Background — why this exists (v3.1.5, replaces the old
+    ``whois_handler`` behavior of calling ``client.get_entity(int(...))``
+    directly): Telethon's ``get_entity()`` only resolves a *bare* ``int``
+    against its local session entity cache. It never issues a network
+    request for a plain integer, because ``InputUser``/``InputChat``/
+    ``InputChannel`` construction requires an ``access_hash`` (for users
+    and channels) that Telethon has no way to invent — it only has one on
+    hand if this account has already encountered that peer via a dialog,
+    a message, a contact, or a prior successful resolution this session.
+    This is a genuine MTProto/TL-schema constraint, not a Telethon bug or
+    something a client-side fix can fully eliminate; see the Telegram TL
+    schema's ``InputUser``/``InputChannel`` definitions and Telethon's own
+    entity-resolution documentation.
+
+    What this function *does* improve on the old bare call:
+      - Accepts the public ``-100xxxxxxxxxx`` channel/supergroup ID form
+        (the same form ``whois`` itself prints back to the user) by
+        stripping the prefix before resolution, in addition to the raw
+        internal form.
+      - Tries the ID against every plausible peer type (channel, basic
+        group, user) via explicit ``Get*Request`` calls, instead of a
+        single opaque ``get_entity()`` call — this covers a few cases a
+        bare ``get_entity(int)`` cache-miss would not (e.g. an ID that
+        *is* resolvable via ``GetUsersRequest``'s ``InputUser`` with a
+        zero access_hash for basic public profile info, when Telethon's
+        own cache lookup would have refused to even try).
+      - On total failure, raises :class:`EntityResolutionError` with a
+        clear, actionable Persian message instead of letting a raw
+        Telethon ``ValueError``/RPC error reach the end user.
+
+    What it still cannot do: conjure an ``access_hash`` for a private
+    entity this account has never legitimately encountered. That case
+    still fails — deliberately — with a helpful message rather than a
+    silent or confusing one.
+
+    Args:
+        client:  Active ``TelegramClient``.
+        raw_id:  The numeric ID as parsed from user input (may be
+                 positive, plain negative, or ``-100``-prefixed negative).
+
+    Returns:
+        A resolved ``User``/``Chat``/``Channel`` entity.
+
+    Raises:
+        EntityResolutionError: if no resolution strategy succeeds.
+        errors.FloodWaitError: re-raised as-is (never swallowed) so
+            callers can surface a "please wait N seconds" message.
+    """
+    attempts_detail: list[str] = []
+
+    # ── Strategy 1: channel/supergroup, public "-100…" form or raw form ──
+    #
+    # Public channel IDs are conventionally shown/typed as -100XXXXXXXXXX.
+    # Telethon's *internal* channel ID is the positive XXXXXXXXXX part.
+    # We try both interpretations if the ID is negative and long enough to
+    # plausibly be a -100-prefixed channel ID.
+    if raw_id < 0:
+        str_id = str(raw_id)
+        candidates: list[int] = []
+        if str_id.startswith("-100"):
+            stripped = str_id[4:]
+            if stripped:
+                candidates.append(int(stripped))
+        # Also try the raw magnitude in case it's already the internal
+        # (non-prefixed) channel ID form.
+        magnitude = -raw_id
+        if magnitude not in candidates:
+            candidates.append(magnitude)
+
+        for channel_id in candidates:
+            try:
+                result = await client(GetChannelsRequest(
+                    id=[InputChannel(channel_id=channel_id, access_hash=0)]
+                ))
+                if result and getattr(result, "chats", None):
+                    return result.chats[0]
+            except errors.FloodWaitError:
+                raise
+            except Exception as exc:
+                attempts_detail.append(f"channel({channel_id}): {exc}")
+
+        # ── Strategy 2: basic (non-super) group — plain negative ID ──
+        try:
+            result = await client(GetChatsRequest(id=[magnitude]))
+            if result and getattr(result, "chats", None):
+                return result.chats[0]
+        except errors.FloodWaitError:
+            raise
+        except Exception as exc:
+            attempts_detail.append(f"chat({magnitude}): {exc}")
+
+    else:
+        # ── Strategy 3: user — positive ID ──
+        try:
+            result = await client(GetUsersRequest(
+                id=[InputUser(user_id=raw_id, access_hash=0)]
+            ))
+            if result:
+                return result[0]
+        except errors.FloodWaitError:
+            raise
+        except Exception as exc:
+            attempts_detail.append(f"user({raw_id}): {exc}")
+
+    # ── Last resort: give Telethon's own cache-based resolver a try too —
+    # covers the case where this ID *is* already cached (e.g. the account
+    # recently interacted with it), which the explicit attempts above
+    # don't specifically special-case. ──
+    try:
+        return await client.get_entity(raw_id)
+    except errors.FloodWaitError:
+        raise
+    except Exception as exc:
+        attempts_detail.append(f"get_entity({raw_id}): {exc}")
+
+    log.debug(
+        "resolve_entity_by_id(%s) failed after %d attempt(s): %s",
+        raw_id,
+        len(attempts_detail),
+        " | ".join(attempts_detail),
+    )
+    raise EntityResolutionError(
+        user_message=(
+            f"⚠️ این اکانت قبلاً با شناسه `{raw_id}` تعاملی نداشته است.\n"
+            "لطفاً از `@username` استفاده کنید یا به یکی از پیام‌های این "
+            "کاربر/گروه پاسخ دهید."
+        ),
+        detail=" | ".join(attempts_detail) or "no resolution strategy attempted",
+    )

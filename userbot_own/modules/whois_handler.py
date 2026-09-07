@@ -7,6 +7,7 @@ Whois Handler — نمایش اطلاعات کامل کاربر/کانال/گر�
 - `whois`                  — اطلاعات کامل چت فعلی
 - `whois @username`        — اطلاعات کاربر/کانال/گروه با username
 - `whois 123456789`        — اطلاعات با ID عددی
+- `whois -1001234567890`   — اطلاعات کانال/سوپرگروه با ID عمومی (-100)
 - `whois` (reply)          — اطلاعات فرستنده پیام reply شده
 
 Features:
@@ -43,9 +44,32 @@ Privacy note: this module only ever displays what Telethon's normal
 privacy settings. If a user has hidden their profile photo or last-seen
 status, the API returns null/empty and the corresponding detail is simply
 omitted — no attempt is made to bypass or circumvent those settings.
+
+Numeric-ID resolution (v3.1.5):
+`whois <numeric_id>` now goes through `helpers.utils.resolve_entity_by_id`,
+which tries every plausible peer shape (channel — both the public `-100…`
+form and the raw internal form —, basic group, user) instead of a single
+bare `client.get_entity(int)` call. This still cannot resolve an ID this
+account has never legitimately encountered (Telegram requires an
+access_hash for users/channels that only comes from a prior dialog,
+message, contact, or resolution — a protocol-level constraint, not
+something client-side code can work around); in that case a clear,
+actionable Persian error message is shown instead of a raw exception. See
+CHANGELOG.md v3.1.5 for the full explanation of this limitation.
+
+Result caching (v3.1.5):
+Built whois results (info text + entity) are cached per-resolved-entity
+for a short TTL (`_CACHE_TTL_SECONDS`) to avoid redundant
+`GetFull*Request`/profile-photo calls when the same entity is looked up
+repeatedly in a short window. This is purely a performance/FloodWait-risk
+mitigation — it intentionally does not persist across process restarts
+and is short-lived enough that it won't meaningfully mask real-time
+profile changes.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
+
+import time
 
 from telethon import TelegramClient, errors, events
 from telethon.tl.functions.channels import GetFullChannelRequest
@@ -60,12 +84,15 @@ from telethon.tl.types import (
 
 from userbot_own.core.context import ModuleContext
 from userbot_own.helpers.utils import (
+    EntityResolutionError,
     format_user_flags,
     format_user_status,
     get_profile_photos_safe,
+    resolve_entity_by_id,
     truncate,
 )
 from userbot_own.modules.base import Module
+from userbot_own.modules.router import CommandRouter
 
 # Logging is provided by Module._log_* helpers; no module-level logger needed.
 
@@ -74,6 +101,20 @@ from userbot_own.modules.base import Module
 # either fail or silently truncate server-side — safer to fall back to the
 # existing text-only message in that case than to lose information.
 _CAPTION_LIMIT = 1024
+
+# Telegram's message-length limit for regular text messages is ~4096
+# characters. This is the text-only-path equivalent safety net to
+# `_CAPTION_LIMIT` above (v3.1.5) — without it, an entity with a maximal
+# bio/description plus many flags/restriction reasons could in principle
+# produce a message Telegram itself would reject or truncate server-side.
+_MESSAGE_LIMIT = 4096
+
+# How long a built whois result (info text + entity) stays in the local
+# cache before a fresh lookup is forced again (v3.1.5). Short enough that
+# it won't meaningfully mask real-time profile changes; long enough to
+# absorb repeated/accidental re-runs of `whois` on the same target within
+# a short window without re-issuing GetFull*Request/photo calls.
+_CACHE_TTL_SECONDS = 90.0
 
 
 # ── Module ──────────────────────────────────────────────────────────────────
@@ -85,16 +126,45 @@ class WhoisHandler(Module):
     category = "info"
     desc = "اطلاعات کاربر و چت"
 
+    def __init__(self, context: ModuleContext) -> None:
+        super().__init__(context)
+
+        # cache_key -> (expires_at_monotonic, info_text, entity)
+        # cache_key is the resolved entity's Telethon-internal id, prefixed
+        # by its class name to avoid any (extremely unlikely) collision
+        # between a User id and a Channel id that happen to share a number.
+        self._result_cache: dict[str, tuple[float, str, object]] = {}
+
+        self._router = CommandRouter()
+        self._router.register("whois", handler=self._on_command)
+
     def setup(self, client: TelegramClient) -> None:
-        self._add_handler(client, events.NewMessage(outgoing=True), self._on_command)
+        self._add_handler(client, events.NewMessage(outgoing=True), self._on_dispatch)
         self._log_info("WhoisHandler ready.")
 
     # ── Command dispatcher ─────────────────────────────────────────────────
+
+    async def _on_dispatch(self, event) -> None:
+        """
+        Thin entry point registered with Telethon — hands off to
+        `CommandRouter` (v3.1.5) for consistency with the rest of the
+        codebase's module contract. `whois` currently has a single root
+        command with free-form trailing arguments (unlike e.g. `enemy.py`'s
+        multiple literal commands), so this migration doesn't change
+        dispatch behavior — the router still just matches the lowercased
+        first token and calls `_on_command`, which parses the remainder
+        exactly as before.
+        """
+        await self._router.dispatch(event)
 
     async def _on_command(self, event) -> None:
         text = (event.raw_text or "").strip()
         parts = text.split(maxsplit=1)
 
+        # CommandRouter already matched the first token as "whois" before
+        # calling us, but this guard is kept intentionally — it costs
+        # nothing and keeps _on_command safe to call directly (e.g. from
+        # tests) without going through the router first.
         if not parts or parts[0].lower() != "whois":
             return
 
@@ -131,23 +201,53 @@ class WhoisHandler(Module):
     # ── By identifier (@username or numeric ID) ──────────────────────────
 
     async def _whois_by_identifier(self, client: TelegramClient, identifier: str):
-        """Resolve identifier (username or numeric ID) and fetch info."""
-        # Normalize username
+        """
+        Resolve identifier (username or numeric ID) and fetch info.
+
+        v3.1.5: numeric identifiers no longer go through a bare
+        `client.get_entity(int(...))` call (see module docstring / bug
+        history for why that silently failed for any ID this account
+        hadn't already cached). They're routed through
+        `resolve_entity_by_id`, which tries every plausible peer shape —
+        including the public `-100`-prefixed channel/supergroup form —
+        before giving up with a clear, actionable message.
+        """
         if identifier.startswith("@"):
-            target = identifier[1:]
+            target: str | int = identifier[1:]
         else:
-            # Try to parse as numeric ID
             try:
                 target = int(identifier)
             except ValueError:
                 target = identifier
 
+        cache_key = None
+        if isinstance(target, int):
+            cached = self._get_cached_by_raw_id(target)
+            if cached is not None:
+                return cached
+
         try:
-            entity = await client.get_entity(target)
+            if isinstance(target, int):
+                entity = await resolve_entity_by_id(client, target)
+            else:
+                entity = await client.get_entity(target)
+        except EntityResolutionError as exc:
+            self._log_debug(
+                "Numeric ID resolution failed for %s: %s", identifier, exc.detail
+            )
+            return exc.user_message, None
+        except errors.FloodWaitError:
+            raise
         except Exception as exc:
             return f"❌ **یافت نشد:** `{identifier}`\n\nخطا: `{exc}`", None
 
+        cache_key = self._cache_key_for(entity)
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
         info_text = await self._build_entity_info(client, entity)
+        self._store_cache(cache_key, info_text, entity)
         return info_text, entity
 
     # ── By reply sender ──────────────────────────────────────────────────
@@ -171,7 +271,13 @@ class WhoisHandler(Module):
         if sender is None:
             return "❌ فرستنده پیام یافت نشد.", None
 
+        cache_key = self._cache_key_for(sender)
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
         info_text = await self._build_entity_info(client, sender)
+        self._store_cache(cache_key, info_text, sender)
         return info_text, sender
 
     # ── Current chat ─────────────────────────────────────────────────────
@@ -183,8 +289,57 @@ class WhoisHandler(Module):
         except Exception as exc:
             return f"❌ خطا در دریافت اطلاعات چت: `{exc}`", None
 
+        cache_key = self._cache_key_for(entity)
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
         info_text = await self._build_entity_info(client, entity)
+        self._store_cache(cache_key, info_text, entity)
         return info_text, entity
+
+    # ── Result cache (v3.1.5) ──────────────────────────────────────────────
+
+    @staticmethod
+    def _cache_key_for(entity) -> str:
+        """Build a collision-safe cache key from an entity's type + id."""
+        return f"{type(entity).__name__}:{getattr(entity, 'id', id(entity))}"
+
+    def _get_cached(self, cache_key: str):
+        """Return (info_text, entity) if a fresh cache entry exists, else None."""
+        entry = self._result_cache.get(cache_key)
+        if entry is None:
+            return None
+        expires_at, info_text, entity = entry
+        if time.monotonic() >= expires_at:
+            self._result_cache.pop(cache_key, None)
+            return None
+        self._log_debug("Whois cache hit for %s (resolved via cache).", cache_key)
+        return info_text, entity
+
+    def _get_cached_by_raw_id(self, raw_id: int):
+        """
+        Best-effort cache lookup keyed only by a raw numeric ID before an
+        entity object even exists — covers the common case of the exact
+        same numeric identifier being looked up twice in a row. Checks
+        both User and Channel key shapes since we don't yet know the type.
+        """
+        for prefix in ("User", "Channel", "Chat"):
+            hit = self._get_cached(f"{prefix}:{raw_id}")
+            if hit is not None:
+                return hit
+            # Also check the -100-stripped / magnitude form for channels.
+            hit = self._get_cached(f"{prefix}:{abs(raw_id)}")
+            if hit is not None:
+                return hit
+        return None
+
+    def _store_cache(self, cache_key: str, info_text: str, entity) -> None:
+        self._result_cache[cache_key] = (
+            time.monotonic() + _CACHE_TTL_SECONDS,
+            info_text,
+            entity,
+        )
 
     # ── Entity info builder (dispatcher) ─────────────────────────────────
 
@@ -229,6 +384,10 @@ class WhoisHandler(Module):
         the placeholder. Falls back to editing the placeholder to a
         text-only message if no photo is available, the caption would
         exceed Telegram's length limit, or the photo send itself fails.
+
+        v3.1.5: the text-only fallback is now also truncated to
+        `_MESSAGE_LIMIT` as a safety net, mirroring the existing
+        `_CAPTION_LIMIT` check on the photo-caption path.
         """
         photo = None
         if entity is not None:
@@ -256,7 +415,8 @@ class WhoisHandler(Module):
                 # was already lost from view, but the command doesn't crash.
                 self._log_debug("Photo attach failed for %s: %s", entity, exc)
 
-        await self._safe_edit(event, info_text)
+        safe_text = truncate(info_text, _MESSAGE_LIMIT)
+        await self._safe_edit(event, safe_text)
 
     # ── User info ────────────────────────────────────────────────────────
 
@@ -371,7 +531,9 @@ class WhoisHandler(Module):
             lines.append(f"• **یوزرنیم:** @{username}")
             lines.append(f"• **لینک:** t.me/{username}")
 
-        # ID (convert to public format with -100 prefix)
+        # ID (public "-100..." form — unchanged display format; v3.1.5 only
+        # changes what forms are *accepted* on input, see
+        # resolve_entity_by_id in helpers/utils.py)
         public_id = int(f"-100{channel.id}")
         lines.append(f"• **ID:** `{public_id}`")
 
@@ -418,6 +580,16 @@ class WhoisHandler(Module):
         if dc_id:
             lines.append(f"• **DC ID:** `{dc_id}`")
 
+        # v3.1.5: a few extra channel/group flags surfaced directly from
+        # the basic Channel object — these don't require GetFullChannelRequest
+        # at all, so they're shown here alongside the other basic flags.
+        if getattr(channel, "slowmode_enabled", False):
+            lines.append("• **Slow mode:** ✅ فعال")
+        if getattr(channel, "join_to_send", False):
+            lines.append("• **ارسال پیام فقط برای اعضا:** ✅")
+        if getattr(channel, "stories_hidden", False):
+            lines.append("• **استوری‌ها:** 🙈 مخفی")
+
         # Try to fetch full channel info for extra details.
         # Re-raise FloodWaitError so the caller can surface it to the user.
         try:
@@ -443,6 +615,12 @@ class WhoisHandler(Module):
             online_count = getattr(full, "online_count", None)
             if online_count:
                 lines.append(f"• **آنلاین:** `{online_count:,}`")
+
+            # Slow-mode seconds, if enabled (extra detail beyond the basic
+            # boolean already shown above)
+            slowmode_seconds = getattr(full, "slowmode_seconds", None)
+            if slowmode_seconds:
+                lines.append(f"• **مدت Slow mode:** `{slowmode_seconds}` ثانیه")
 
             # Linked chat (discussion group)
             linked_chat_id = getattr(full, "linked_chat_id", None)
@@ -576,6 +754,7 @@ help_extra = (
     "• `whois` | اطلاعات کامل چت فعلی\n"
     "• `whois @username` | اطلاعات کاربر/کانال/گروه با username\n"
     "• `whois 123456789` | اطلاعات با ID عددی\n"
+    "• `whois -1001234567890` | اطلاعات کانال/سوپرگروه با ID عمومی\n"
     "• `whois` (reply) | اطلاعات فرستنده پیام reply شده\n\n"
     "اطلاعات کاربران:\n"
     "• نام کامل، یوزرنیم، ID\n"
@@ -596,6 +775,7 @@ help_extra = (
     "• تاریخ ساخت\n"
     "• لینک چت Discussion (در صورت وجود)\n"
     "• وضعیت Verified / Scam / Fake\n"
+    "• Slow mode، ارسال پیام فقط برای اعضا، وضعیت استوری‌ها\n"
     "• محدودیت‌های محتوایی (در صورت وجود)\n\n"
     "اطلاعات گروه‌ها:\n"
     "• عنوان، ID\n"
@@ -610,6 +790,15 @@ help_extra = (
     "• اگر کاربر عکس پروفایل خود را مخفی کرده یا عکسی نداشته باشد، یا "
     "متن اطلاعات بیش از حد مجاز کپشن تلگرام باشد، فقط متن اطلاعات "
     "نمایش داده می‌شود (بدون هیچ تلاشی برای دور زدن تنظیمات حریم خصوصی)\n\n"
+    "دربارهٔ جستجو با ID عددی:\n"
+    "• هر دو فرمت ID عمومی کانال (`-100...`) و ID داخلی خام پذیرفته "
+    "می‌شوند\n"
+    "• به دلیل محدودیت پروتکل تلگرام، ID عددی فقط برای کاربر/گروه/کانالی "
+    "قابل جستجو است که این اکانت قبلاً با آن تعامل داشته (پیام، چت مشترک، "
+    "مخاطب و...) — این محدودیت MTProto است و از سمت این ماژول قابل دور "
+    "زدن نیست\n"
+    "• در صورت شکست جستجو با ID، به‌جای آن از `@username` استفاده کنید یا "
+    "روی یکی از پیام‌های آن کاربر/گروه ریپلای بزنید\n\n"
     "مثال‌ها:\n"
     "• `whois` در یک کانال | نمایش اطلاعات کانال\n"
     "• `whois @durov` | اطلاعات Pavel Durov\n"
@@ -622,6 +811,8 @@ help_extra = (
     "• وضعیت آنلاین دقیق فقط برای مخاطبین قابل مشاهده است\n"
     "• عکس پروفایل فقط در صورتی نمایش داده می‌شود که تنظیمات حریم "
     "خصوصی هدف اجازه دهد\n"
+    "• نتیجهٔ هر جستجو تا ۹۰ ثانیه به‌صورت محلی کش می‌شود تا از "
+    "درخواست‌های تکراری غیرضروری جلوگیری شود\n"
 )
 
 WhoisHandler.help_text = help_text

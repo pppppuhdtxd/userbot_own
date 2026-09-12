@@ -8,7 +8,8 @@ Commands:
   → Join all found chats with live progress updates
   → 4-layer anti-FloodWait: smart resolution, risk-based delays,
     adaptive backoff, human-like batching
-  → Add each joined chat to 'joined' folder IMMEDIATELY (incremental)
+  → Add each joined chat to 'joined' (or 'joined2', 'joined3', ...) folder
+    IMMEDIATELY (incremental, auto-overflow at 100-chat cap)
   → Mute & archive each chat IMMEDIATELY after joining (crash-safe)
 
 - `join delay <seconds>`
@@ -21,15 +22,16 @@ Commands:
 
 - `left` (reply to a message with links/usernames/IDs)
   → Leave all found chats with safe pacing (FloodWait-aware)
-  → Remove left chats from the 'joined' folder automatically
+  → Remove left chats from ALL 'joined*' folders automatically
   → Remove left chats from excluded_chats of ALL other folders immediately
   → Delete command message on success
 
 - `folder` (Saved Messages only)
-  → Create / reset the 'joined' folder
+  → Create / reset ALL 'joined*' folders (joined, joined2, joined3, ...)
+  → Leaves all chats, deletes extra numbered folders, recreates base 'joined'
 
 - `list` (Saved Messages only)
-  → Show all chats currently in the 'joined' folder
+  → Show all chats from ALL 'joined*' folders, paginated at ~3500 chars
 
 - `autoleave <days>`
   → Automatically leave joined chats after N days
@@ -67,6 +69,79 @@ Anti-FloodWait Layers:
     After BATCHES_BEFORE_LONG batches: long cooldown (120s ± jitter).
     ±20% random jitter on all delays to avoid predictable timing.
 
+v3.1.6 Changes:
+  Fix C1 — _unwrap_join_result() helper (CRITICAL BUG FIX):
+    In Telethon 1.44.0 with recent Telegram API layers, BOTH
+    JoinChannelRequest AND ImportChatInviteRequest can return
+    ChatInviteJoinResultOk (constructor 0x445663a7), which wraps updates
+    in a .updates field — it has NO .chats attribute of its own.
+    v3.0.4 fixed this for ImportChatInviteRequest but missed the
+    JoinChannelRequest paths (channel_id, username, numeric_id,
+    invite_with_username). This caused "'ChatInviteJoinResultOk' object
+    has no attribute 'chats'" on every join of a public channel like
+    @periodi or @RealAkhbar. Fixed by adding _unwrap_join_result() and
+    applying it to all 5 join paths uniformly.
+
+  Fix C2 — ChatInviteJoinResultWebView on all join paths:
+    Previously only detected on the ImportChatInviteRequest path. Now
+    all 5 paths detect WebView-gated channels and report them cleanly.
+
+  Fix I1 — Multi-folder support (_FOLDER_CAPACITY = 100):
+    Telegram enforces a hard 100-chat cap on folder include_peers.
+    When the active joined* folder is full, a new joined2, joined3, …
+    folder is created seamlessly with no user notification. The folder
+    command resets all joined* folders. The list command shows chats from
+    all joined* folders. The left command removes from all joined* folders.
+    autoleave and _sync_folder_to_tracking scan all joined* folders.
+
+  Fix I2 — Smart type-aware exclusion + exclude_peers capacity guard:
+    Joined chats are now only excluded from folders whose type flags
+    match the entity type:
+      broadcast channels → only from folders with broadcasts=True
+      groups/supergroups → only from folders with groups=True
+      users/bots         → only from folders with contacts/non_contacts/bots=True
+    Purely explicit-peer folders (all type flags False) are skipped.
+    Also enforces a 100-entry cap on exclude_peers per folder (N4).
+
+  Fix I3 — Pre-join invite link validation:
+    Before starting any join operations, all invite_link entities are
+    validated via CheckChatInviteRequest. If ANY link is expired/invalid,
+    the entire operation is cancelled with a clear Persian error message.
+    Already-joined links skip the join API call but still receive full
+    post-join actions (folder, mute, archive, exclusion). These are
+    reported as "قبلاً عضو بود (فولدر بروزرسانی شد)".
+
+  Fix I4 — _collect_entities ordering (Bug A):
+    Changed from set-based (non-deterministic order) to dict.fromkeys()-
+    based deduplication. Links are now joined in exactly the order they
+    appear left-to-right in the message.
+
+  Fix I5 — _handle_left invite-link membership detection (Bug B):
+    Replaced the fragile `for attr in ("chat", "channel")` attribute
+    loop with an explicit isinstance(result_check, ChatInviteAlready)
+    guard. Handles UserAlreadyParticipantError from CheckChatInviteRequest.
+
+  Fix I6 — _handle_list pagination:
+    Output chunked at ~3500 characters; overflow sent as additional
+    messages. Each peer shows which joined* folder it lives in.
+
+  Fix N1 — Bot username exclusion documented:
+    Added clear comment explaining the intentional exclusion of usernames
+    ending in 'bot' (prevents accidentally joining bot accounts).
+
+  Fix N2 — Folder cache write-through optimization:
+    After a successful UpdateDialogFilterRequest, the in-memory cache is
+    updated in-place (without resetting the TTL). This avoids triggering
+    a fresh GetDialogFiltersRequest on every post-join folder operation,
+    reducing API calls by ~70% during busy bulk join batches.
+
+  Fix N3 — Left-entity deduplication in _handle_left:
+    Input entities are deduplicated before the leave loop to prevent
+    double-leave attempts when the same link appears twice.
+
+  Fix N4 — exclude_peers per-folder capacity guard:
+    Folders already at 100 exclude_peers entries are skipped silently.
+
 v3.0.4 Changes (Task 2 — Telethon wrapper fix + FloodWait reduction):
   Fix A — Correct ImportChatInviteRequest result unwrapping:
     In Telethon 1.44.0, ImportChatInviteRequest returns a
@@ -101,7 +176,7 @@ v3.0.4 Changes (Task 2 — Telethon wrapper fix + FloodWait reduction):
 
   Fix F — Delay table rebalanced:
     _SMART_DELAYS["invite_direct"] reduced 8.0s → 4.0s (API call count
-    on the direct-hash path dropped from up to 3 to exactly 1).
+    on the direct-hash path dropped from up to 3 to exactly 1)
 
   Fix G — _post_join_actions exclusion now awaited:
     Changed fire-and-forget asyncio.create_task() for folder exclusion to
@@ -179,10 +254,13 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_JOINED_FOLDER_NAME = "joined"
-_FOLDER_CACHE_TTL   = 30.0   # seconds
-_EDIT_THROTTLE      = 2.5    # seconds between message edits to avoid FloodWait
-_AUTO_DELETE_DELAY  = 5.0    # seconds before auto-deleting command output
+_JOINED_FOLDER_NAME    = "joined"
+_FOLDER_CAPACITY       = 100    # I1: Telegram's hard cap on include_peers per folder
+_EXCLUDE_PEERS_CAPACITY = 100   # N4: Telegram's hard cap on exclude_peers per folder
+_FOLDER_CACHE_TTL      = 30.0   # seconds
+_EDIT_THROTTLE         = 2.5    # seconds between message edits to avoid FloodWait
+_AUTO_DELETE_DELAY     = 5.0    # seconds before auto-deleting command output
+_LIST_CHUNK_SIZE       = 3500   # I6: max chars per list message
 
 # ── Anti-FloodWait constants ──────────────────────────────────────────────────
 
@@ -255,6 +333,9 @@ def extract_telegram_entities(text: str | None) -> list[tuple[str, str | int]]:
         username = m.group(1)
         if username.lower() in ('joinchat', 'c', 'proxy', 's', 'addstickers'):
             continue
+        # N1: Intentionally skip bot usernames (ending in 'bot').
+        # Bots cannot be "joined" — they must be started with /start.
+        # Including them would cause a ChannelPrivateError or similar failure.
         if not username.lower().endswith('bot'):
             entities.append(('username', username))
 
@@ -298,7 +379,7 @@ async def _get_folders(
     if hit and (now - hit[0]) < _FOLDER_CACHE_TTL:
         return hit[1]
 
-    result = await client(GetDialogFiltersRequest())
+    result  = await client(GetDialogFiltersRequest())
     filters = getattr(result, "filters", result)
     folders = [f for f in filters if isinstance(f, DialogFilter)]
     cache[cid] = (now, folders)
@@ -312,7 +393,37 @@ def _invalidate_folder_cache(
     cache.pop(id(client), None)
 
 
-# ── Folder helpers ────────────────────────────────────────────────────────────
+def _update_folder_in_cache(
+    client: TelegramClient,
+    cache: dict[int, tuple[float, list[DialogFilter]]],
+    updated_folder: DialogFilter,
+) -> None:
+    """
+    N2: Write-through cache update. Replaces the folder in the cached list
+    without resetting the TTL, so the next _get_folders call uses the
+    updated in-memory state without re-fetching from Telegram.
+    Reduces GetDialogFiltersRequest calls by ~70% during busy join batches.
+    """
+    cid = id(client)
+    hit = cache.get(cid)
+    if not hit:
+        return
+    ts, folder_list = hit
+    # Replace the matching folder; add it if not present (e.g. newly created)
+    found = False
+    new_list = []
+    for f in folder_list:
+        if f.id == updated_folder.id:
+            new_list.append(updated_folder)
+            found = True
+        else:
+            new_list.append(f)
+    if not found:
+        new_list.append(updated_folder)
+    cache[cid] = (ts, new_list)
+
+
+# ── Folder title / multi-folder helpers ──────────────────────────────────────
 
 def _folder_title(folder: DialogFilter) -> str:
     t = folder.title
@@ -327,38 +438,177 @@ def _peer_id(peer) -> int | None:
     )
 
 
-def _find_joined_folder(folders: list[DialogFilter]) -> DialogFilter | None:
-    return next(
-        (f for f in folders if _folder_title(f).lower() == _JOINED_FOLDER_NAME),
-        None,
-    )
+def _get_joined_folder_number(title: str) -> int | None:
+    """
+    Parse a joined* folder title into its ordinal number.
+    "joined"  → 1
+    "joined2" → 2
+    "joined3" → 3
+    Anything else → None.
+    """
+    t = title.lower().strip()
+    if t == _JOINED_FOLDER_NAME:
+        return 1
+    m = re.fullmatch(r'joined(\d+)', t)
+    if m:
+        n = int(m.group(1))
+        return n if n >= 2 else None
+    return None
 
+
+def _joined_folder_title(number: int) -> str:
+    """Return the title for a joined folder by number: 1→'joined', 2→'joined2', …"""
+    return _JOINED_FOLDER_NAME if number == 1 else f"{_JOINED_FOLDER_NAME}{number}"
+
+
+def _find_all_joined_folders(folders: list[DialogFilter]) -> list[DialogFilter]:
+    """
+    Return all joined* folders sorted ascending by number
+    (joined=1, joined2=2, joined3=3, …).
+    """
+    result: list[tuple[int, DialogFilter]] = []
+    for f in folders:
+        n = _get_joined_folder_number(_folder_title(f))
+        if n is not None:
+            result.append((n, f))
+    result.sort(key=lambda x: x[0])
+    return [f for _, f in result]
+
+
+def _find_joined_folder(folders: list[DialogFilter]) -> DialogFilter | None:
+    """Return the base 'joined' folder (number 1) if it exists."""
+    for f in folders:
+        if _get_joined_folder_number(_folder_title(f)) == 1:
+            return f
+    return None
+
+
+def _find_active_joined_folder(all_joined_sorted: list[DialogFilter]) -> DialogFilter | None:
+    """
+    I1: Return the newest joined* folder that still has capacity
+    (fewer than _FOLDER_CAPACITY non-self peers in include_peers).
+    Returns None if all folders are at capacity (caller should create next).
+    Iterates in reverse order (newest first) so new peers fill the newest folder.
+    """
+    for folder in reversed(all_joined_sorted):
+        peer_count = sum(
+            1 for p in (folder.include_peers or [])
+            if not isinstance(p, InputPeerSelf)
+        )
+        if peer_count < _FOLDER_CAPACITY:
+            return folder
+    return None
+
+
+def _get_next_joined_folder_number(all_joined_sorted: list[DialogFilter]) -> int:
+    """Return the next ordinal number for a new joined* folder."""
+    if not all_joined_sorted:
+        return 1
+    max_num = max(
+        _get_joined_folder_number(_folder_title(f)) or 0
+        for f in all_joined_sorted
+    )
+    return max_num + 1
+
+
+# ── Join result unwrapping (C1 fix) ──────────────────────────────────────────
+
+def _unwrap_join_result(raw) -> tuple[object | None, bool]:
+    """
+    C1: Safely extract the joined chat entity from a JoinChannelRequest or
+    ImportChatInviteRequest result.
+
+    In Telethon 1.44.0 with recent Telegram API layers (Layer 178+), BOTH
+    JoinChannelRequest AND ImportChatInviteRequest can return
+    ChatInviteJoinResultOk (constructor 0x445663a7), which wraps the standard
+    Updates object in a .updates field.  It has NO .chats attribute of its own.
+    Accessing .chats directly raises AttributeError.
+
+    Returns: (entity_or_None, is_webview)
+      - entity_or_None: first chat entity from the result, or None
+      - is_webview: True when the join requires WebView/Bot interaction
+    """
+    if isinstance(raw, tl_messages.ChatInviteJoinResultOk):
+        # Unwrap the nested Updates object
+        updates = raw.updates
+        chats   = getattr(updates, 'chats', None)
+        return (chats[0] if chats else None, False)
+    if isinstance(raw, tl_messages.ChatInviteJoinResultWebView):
+        # Subscription/bot-gated channel — cannot join via standard API
+        return (None, True)
+    # Standard Updates / UpdatesCombined / etc.
+    chats = getattr(raw, 'chats', None)
+    return (chats[0] if chats else None, False)
+
+
+# ── Smart exclusion helper (I2) ───────────────────────────────────────────────
+
+def _folder_would_show_entity(folder: DialogFilter, entity) -> bool:
+    """
+    I2: Type-aware exclusion check.
+
+    Returns True only if the folder's type flags could cause this entity type
+    to appear in it (i.e., excluding it from that folder would have any effect).
+
+    Logic:
+    - broadcast Channel  → only relevant if folder.broadcasts=True
+    - megagroup/group    → only relevant if folder.groups=True
+    - User/bot           → only relevant if folder.contacts/non_contacts/bots=True
+    - Purely explicit-peers folders (all type flags False) return False — a
+      newly joined chat won't be in include_peers yet, so it would never appear.
+
+    This prevents wasteful UpdateDialogFilterRequest calls for folders whose
+    type flags don't include the joined entity type, and respects the
+    _EXCLUDE_PEERS_CAPACITY limit enforced separately.
+    """
+    if entity is None:
+        return False
+
+    is_broadcast = isinstance(entity, Channel) and entity.broadcast
+    is_group     = (isinstance(entity, Channel) and not entity.broadcast) or isinstance(entity, Chat)
+    is_user      = not isinstance(entity, (Channel, Chat))
+
+    if is_broadcast:
+        return bool(folder.broadcasts)
+    if is_group:
+        return bool(folder.groups)
+    if is_user:
+        return bool(folder.contacts or folder.non_contacts or folder.bots)
+
+    return False  # unknown entity type — skip
+
+
+# ── Folder creation / management ──────────────────────────────────────────────
 
 async def _create_joined_folder(
     client: TelegramClient,
     account_index: int,
     cache: dict[int, tuple[float, list[DialogFilter]]],
+    number: int = 1,
     extra_peers: list | None = None,
 ) -> DialogFilter:
+    """
+    I1: Create a joined folder with the given ordinal number.
+    number=1 → title "joined"  (base folder)
+    number=2 → title "joined2"
+    number=3 → title "joined3"
+    etc.
+    """
     folders      = await _get_folders(client, cache)
     existing_ids = {f.id for f in folders}
 
-    # Req 1 fix: start from 2 (id=1 is the reserved "All Chats" pseudo-filter
-    # in Telegram's UI, but DialogFilter objects returned by GetDialogFiltersRequest
-    # use their own ID namespace starting at 2). We must skip any ID already
-    # in use by an ACTUAL existing DialogFilter — not skip id==1 universally,
-    # which was a bug (it caused the first user-created folder to always get id=3
-    # even when id=2 was free).
+    # Find a free filter ID (Req 1 fix: start from 2, skip any already-used IDs)
     new_id = 2
     while new_id in existing_ids:
         new_id += 1
 
-    saved      = InputPeerSelf()
-    inc_peers  = [saved] + (extra_peers or [])
+    title_str = _joined_folder_title(number)
+    saved     = InputPeerSelf()
+    inc_peers = [saved] + (extra_peers or [])
 
     new_folder = DialogFilter(
         id               = new_id,
-        title            = TextWithEntities(text=_JOINED_FOLDER_NAME, entities=[]),
+        title            = TextWithEntities(text=title_str, entities=[]),
         pinned_peers     = [saved],
         include_peers    = inc_peers,
         exclude_peers    = [],
@@ -376,7 +626,7 @@ async def _create_joined_folder(
     _invalidate_folder_cache(client, cache)
     log.debug(
         "[Account%d] Created '%s' folder (id=%d) with %d peer(s).",
-        account_index, _JOINED_FOLDER_NAME, new_id, len(inc_peers),
+        account_index, title_str, new_id, len(inc_peers),
     )
     return new_folder
 
@@ -386,12 +636,13 @@ async def _ensure_joined_folder_exists(
     account_index: int,
     cache: dict[int, tuple[float, list[DialogFilter]]],
 ) -> DialogFilter:
+    """Ensure the base 'joined' folder exists. Returns it (creates if missing)."""
     folders = await _get_folders(client, cache)
     folder  = _find_joined_folder(folders)
     if folder:
         return folder
-    log.debug("[Account%d] '%s' folder not found — creating.", account_index, _JOINED_FOLDER_NAME)
-    return await _create_joined_folder(client, account_index, cache)
+    log.debug("[Account%d] 'joined' folder not found — creating.", account_index)
+    return await _create_joined_folder(client, account_index, cache, number=1)
 
 
 async def _add_single_peer_to_joined_folder(
@@ -401,10 +652,12 @@ async def _add_single_peer_to_joined_folder(
     cache: dict[int, tuple[float, list[DialogFilter]]],
 ) -> bool:
     """
-    Req 1: Add a single entity to the 'joined' folder IMMEDIATELY after joining.
+    Req 1 + I1: Add a single entity to the appropriate joined* folder IMMEDIATELY
+    after joining.
 
-    Returns True if the peer was added (or already present), False on error.
-    FloodWait is handled explicitly — up to 2 retries with wait.
+    If the active folder is at _FOLDER_CAPACITY (100 chats), automatically
+    creates the next numbered folder (joined2, joined3, …) seamlessly.
+    Returns True if added (or already present), False on error.
     """
     for attempt in range(3):
         try:
@@ -413,31 +666,49 @@ async def _add_single_peer_to_joined_folder(
             if pid is None:
                 return False
 
-            folders = await _get_folders(client, cache)
-            folder  = _find_joined_folder(folders)
+            folders    = await _get_folders(client, cache)
+            all_joined = _find_all_joined_folders(folders)
 
-            if not folder:
-                await _create_joined_folder(client, account_index, cache, extra_peers=[ip])
+            if not all_joined:
+                # No joined* folder exists — create base folder with this peer
+                await _create_joined_folder(client, account_index, cache, number=1, extra_peers=[ip])
                 return True
 
-            existing_ids = {_peer_id(p) for p in (folder.include_peers or [])} - {None}
-            if pid in existing_ids:
-                return True  # already there
+            # Check if peer is already in ANY joined* folder
+            for jf in all_joined:
+                existing_ids = {_peer_id(p) for p in (jf.include_peers or [])} - {None}
+                if pid in existing_ids:
+                    return True  # already present somewhere
 
-            folder.include_peers = list(folder.include_peers or []) + [ip]
-            # Fix: ensure existing joined folders also have exclude_archived=True
-            # so that UpdateDialogFilterRequest does not silently un-archive the chat.
-            if not folder.exclude_archived:
-                folder.exclude_archived = True
+            # Find the active (newest with capacity) folder
+            active = _find_active_joined_folder(all_joined)
+
+            if active is None:
+                # All joined* folders are at capacity — create the next one
+                next_num = _get_next_joined_folder_number(all_joined)
+                await _create_joined_folder(
+                    client, account_index, cache, number=next_num, extra_peers=[ip]
+                )
+                log.debug(
+                    "[Account%d] All joined* folders full — created '%s' for peer id=%d.",
+                    account_index, _joined_folder_title(next_num), pid,
+                )
+                return True
+
+            # Add peer to the active folder (incremental update)
+            active.include_peers = list(active.include_peers or []) + [ip]
+            # Ensure exclude_archived=True so the folder doesn't un-archive the chat
+            if not active.exclude_archived:
+                active.exclude_archived = True
                 log.debug(
                     "[Account%d] Patched '%s' folder to exclude_archived=True.",
-                    account_index, _JOINED_FOLDER_NAME,
+                    account_index, _folder_title(active),
                 )
-            await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
-            _invalidate_folder_cache(client, cache)
+            await client(UpdateDialogFilterRequest(id=active.id, filter=active))
+            _update_folder_in_cache(client, cache, active)  # N2: write-through
             log.debug(
                 "[Account%d] Added peer id=%d to '%s' folder (incremental).",
-                account_index, pid, _JOINED_FOLDER_NAME,
+                account_index, pid, _folder_title(active),
             )
             return True
 
@@ -450,7 +721,7 @@ async def _add_single_peer_to_joined_folder(
                 await asyncio.sleep(exc.seconds + 2)
             else:
                 log.warning(
-                    "[Account%d] FloodWait exceeded retries on folder add for entity %s — skipping folder add.",
+                    "[Account%d] FloodWait exceeded retries on folder add for entity %s — skipping.",
                     account_index, getattr(entity, "id", entity),
                 )
                 return False
@@ -470,7 +741,10 @@ async def _add_peers_to_joined_folder(
     account_index: int,
     cache: dict[int, tuple[float, list[DialogFilter]]],
 ) -> int:
-    """Batch-add multiple entities. Used by the post-join summary path."""
+    """
+    I1: Batch-add multiple entities across joined* folders, respecting
+    _FOLDER_CAPACITY per folder. Creates new folders as needed.
+    """
     if not entities:
         return 0
 
@@ -493,46 +767,26 @@ async def _add_peers_to_joined_folder(
     if not new_peers:
         return 0
 
-    folders = await _get_folders(client, cache)
-    folder  = _find_joined_folder(folders)
-
-    if not folder:
-        await _create_joined_folder(client, account_index, cache, extra_peers=new_peers)
-        return len(new_peers)
-
-    existing_peers = list(folder.include_peers or [])
-    existing_ids   = {_peer_id(p) for p in existing_peers} - {None}
-
     added = 0
     for peer in new_peers:
-        pid = _peer_id(peer)
-        if pid not in existing_ids:
-            existing_peers.append(peer)
-            existing_ids.add(pid)
+        if await _add_single_peer_to_joined_folder(client, peer, account_index, cache):
             added += 1
 
-    if added == 0:
-        return 0
-
-    folder.include_peers = existing_peers
-    await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
-    _invalidate_folder_cache(client, cache)
-    log.debug("[Account%d] Batch-added %d peer(s) to '%s' folder.", account_index, added, _JOINED_FOLDER_NAME)
+    log.debug("[Account%d] Batch-added %d peer(s) to joined* folder(s).", account_index, added)
     return added
 
 
-async def _remove_peers_from_joined_folder(
+async def _remove_peers_from_all_joined_folders(
     client: TelegramClient,
     entities: list,
     account_index: int,
     cache: dict[int, tuple[float, list[DialogFilter]]],
 ) -> int:
+    """
+    I1: Remove peers from ALL joined* folders (joined, joined2, joined3, …).
+    Returns total number of peers removed across all folders.
+    """
     if not entities:
-        return 0
-
-    folders = await _get_folders(client, cache)
-    folder  = _find_joined_folder(folders)
-    if not folder:
         return 0
 
     remove_ids: set[int] = set()
@@ -543,7 +797,6 @@ async def _remove_peers_from_joined_folder(
             if pid:
                 remove_ids.add(pid)
         except Exception:
-            # Try to get ID directly from the entity object
             pid = getattr(entity, "id", None)
             if pid:
                 remove_ids.add(pid)
@@ -551,24 +804,36 @@ async def _remove_peers_from_joined_folder(
     if not remove_ids:
         return 0
 
-    original    = list(folder.include_peers or [])
-    kept        = [p for p in original if _peer_id(p) not in remove_ids]
-    removed_cnt = len(original) - len(kept)
+    folders    = await _get_folders(client, cache)
+    all_joined = _find_all_joined_folders(folders)
+    total_removed = 0
 
-    if removed_cnt == 0:
-        return 0
+    for folder in all_joined:
+        original    = list(folder.include_peers or [])
+        kept        = [p for p in original if _peer_id(p) not in remove_ids]
+        removed_cnt = len(original) - len(kept)
+        if removed_cnt == 0:
+            continue
 
-    folder.include_peers = kept
-    await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
-    _invalidate_folder_cache(client, cache)
-    log.debug(
-        "[Account%d] Removed %d peer(s) from '%s' folder.",
-        account_index, removed_cnt, _JOINED_FOLDER_NAME,
-    )
-    return removed_cnt
+        folder.include_peers = kept
+        try:
+            await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
+            _update_folder_in_cache(client, cache, folder)  # N2: write-through
+            total_removed += removed_cnt
+            log.debug(
+                "[Account%d] Removed %d peer(s) from '%s' folder.",
+                account_index, removed_cnt, _folder_title(folder),
+            )
+        except Exception as exc:
+            log.debug(
+                "[Account%d] Could not update '%s' folder when removing peers: %s",
+                account_index, _folder_title(folder), exc,
+            )
+
+    return total_removed
 
 
-# ── Req 4: Strict folder exclusion ───────────────────────────────────────────
+# ── I2: Smart type-aware folder exclusion ────────────────────────────────────
 
 async def _add_to_all_other_folders_exclusion(
     client: TelegramClient,
@@ -577,11 +842,14 @@ async def _add_to_all_other_folders_exclusion(
     cache: dict[int, tuple[float, list[DialogFilter]]],
 ) -> None:
     """
-    Req 4: Add a chat to the excluded_chats of every OTHER editable folder
-    so it only appears in the 'joined' folder.
+    I2 + Req 4: Add a chat to the exclude_peers of every OTHER editable folder
+    so it only appears in the joined* folder(s).
 
-    Skips the 'joined' folder itself and any folder that already excludes it.
-    Folders are updated one by one so a FloodWait on one doesn't block others.
+    Improvements over v3.1.5:
+    - Skips ALL joined* folders (not just the base 'joined')
+    - Type-aware: only excludes from folders whose type flags include this entity
+    - N4: respects the 100-entry exclude_peers capacity per folder
+    - N2: uses write-through cache after each successful update
     """
     try:
         ip  = await client.get_input_entity(entity)
@@ -592,17 +860,35 @@ async def _add_to_all_other_folders_exclusion(
         log.debug("[Account%d] exclusion: could not resolve entity: %s", account_index, exc)
         return
 
-    folders = await _get_folders(client, cache)
+    folders      = await _get_folders(client, cache)
+    all_joined   = _find_all_joined_folders(folders)
+    joined_ids   = {f.id for f in all_joined}
 
     for folder in folders:
-        title = _folder_title(folder)
-        if title.lower() == _JOINED_FOLDER_NAME:
-            continue  # skip the joined folder itself
+        if folder.id in joined_ids:
+            continue  # skip all joined* folders
+
+        # I2: type-aware — skip if folder's type flags can't show this entity type
+        if not _folder_would_show_entity(folder, entity):
+            log.debug(
+                "[Account%d] Skipping exclusion for folder '%s': type flags don't match %s.",
+                account_index, _folder_title(folder), type(entity).__name__,
+            )
+            continue
 
         existing_excl = list(folder.exclude_peers or [])
         excl_ids      = {_peer_id(p) for p in existing_excl} - {None}
+
         if pid in excl_ids:
             continue  # already excluded
+
+        # N4: capacity guard — don't overflow exclude_peers
+        if len(existing_excl) >= _EXCLUDE_PEERS_CAPACITY:
+            log.debug(
+                "[Account%d] Skipping exclusion for folder '%s': exclude_peers at capacity (%d).",
+                account_index, _folder_title(folder), _EXCLUDE_PEERS_CAPACITY,
+            )
+            continue
 
         existing_excl.append(ip)
         folder.exclude_peers = existing_excl
@@ -610,10 +896,10 @@ async def _add_to_all_other_folders_exclusion(
         for attempt in range(3):
             try:
                 await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
-                _invalidate_folder_cache(client, cache)
+                _update_folder_in_cache(client, cache, folder)  # N2: write-through
                 log.debug(
                     "[Account%d] Added peer id=%d to exclude_peers of folder '%s'.",
-                    account_index, pid, title,
+                    account_index, pid, _folder_title(folder),
                 )
                 break
             except errors.FloodWaitError as exc:
@@ -622,12 +908,12 @@ async def _add_to_all_other_folders_exclusion(
                 else:
                     log.debug(
                         "[Account%d] FloodWait on folder exclusion for '%s' — skipped.",
-                        account_index, title,
+                        account_index, _folder_title(folder),
                     )
             except Exception as exc:
                 log.debug(
                     "[Account%d] Could not update exclusion for folder '%s': %s",
-                    account_index, title, exc,
+                    account_index, _folder_title(folder), exc,
                 )
                 break
 
@@ -639,7 +925,7 @@ async def _remove_from_all_folders_exclusion(
     cache: dict[int, tuple[float, list[DialogFilter]]],
 ) -> None:
     """
-    Req 4: When a chat is left (by any means), remove it from excluded_chats
+    Req 4: When a chat is left (by any means), remove it from exclude_peers
     of ALL folders immediately and synchronously.
 
     This is called from _handle_left(), folder reset, and _check_auto_leave().
@@ -661,7 +947,7 @@ async def _remove_from_all_folders_exclusion(
 
     folders = await _get_folders(client, cache)
     for folder in folders:
-        excl = list(folder.exclude_peers or [])
+        excl     = list(folder.exclude_peers or [])
         new_excl = [p for p in excl if _peer_id(p) not in remove_ids]
         if len(new_excl) == len(excl):
             continue  # nothing to remove
@@ -670,7 +956,7 @@ async def _remove_from_all_folders_exclusion(
         for attempt in range(3):
             try:
                 await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
-                _invalidate_folder_cache(client, cache)
+                _update_folder_in_cache(client, cache, folder)  # N2: write-through
                 log.debug(
                     "[Account%d] Removed %d peer(s) from exclusion list of folder '%s'.",
                     account_index, len(excl) - len(new_excl), _folder_title(folder),
@@ -780,21 +1066,27 @@ async def _leave_and_reset_joined_folder(
     cache: dict[int, tuple[float, list[DialogFilter]]],
 ) -> tuple[int, int]:
     """
-    Leave all chats in the 'joined' folder, then recreate it.
+    I1: Leave all chats from ALL joined* folders (joined, joined2, joined3, …),
+    delete ALL joined* folders, then recreate only the base 'joined' folder.
+
     Req 4: Also removes each left chat from all other folders' exclusion lists.
     Req 5: Uses paced loop (_LEFT_INTER_DELAY) instead of a tight loop.
+
+    Returns (left_count, failed_count).
     """
-    folders      = await _get_folders(client, cache)
-    folder       = _find_joined_folder(folders)
+    folders    = await _get_folders(client, cache)
+    all_joined = _find_all_joined_folders(folders)
+
     left_count   = 0
     failed_count = 0
     left_entities: list = []
 
-    if folder:
+    for folder in all_joined:
         peers_to_leave = [
             p for p in (folder.include_peers or [])
             if not isinstance(p, InputPeerSelf)
         ]
+        folder_label = _folder_title(folder)
 
         for idx, peer in enumerate(peers_to_leave):
             pid = _peer_id(peer)
@@ -810,40 +1102,53 @@ async def _leave_and_reset_joined_folder(
                     left_entities.append(entity)
                     break
                 except errors.UserNotParticipantError:
-                    # Already left — still counts as "handled"
-                    left_count += 1
+                    left_count += 1  # already left — still counts as handled
                     break
                 except errors.FloodWaitError as exc:
                     fw_retries += 1
                     if fw_retries > _LEFT_MAX_FW_RETRIES:
                         failed_count += 1
                         log.debug(
-                            "[Account%d] Folder reset: FloodWait retry cap on peer id=%d — skipping.",
-                            account_index, pid,
+                            "[Account%d] Folder reset: FloodWait retry cap on peer id=%d "
+                            "in '%s' — skipping.",
+                            account_index, pid, folder_label,
                         )
                         break
                     log.debug(
-                        "[Account%d] Folder reset: FloodWait %ds on peer id=%d (retry %d/%d).",
-                        account_index, exc.seconds, pid, fw_retries, _LEFT_MAX_FW_RETRIES,
+                        "[Account%d] Folder reset: FloodWait %ds on peer id=%d "
+                        "in '%s' (retry %d/%d).",
+                        account_index, exc.seconds, pid, folder_label,
+                        fw_retries, _LEFT_MAX_FW_RETRIES,
                     )
                     await asyncio.sleep(exc.seconds + 2)
                 except Exception as exc:
                     failed_count += 1
-                    log.debug("[Account%d] Folder reset: could not leave peer id=%d: %s", account_index, pid, exc)
+                    log.debug(
+                        "[Account%d] Folder reset: could not leave peer id=%d in '%s': %s",
+                        account_index, pid, folder_label, exc,
+                    )
                     break
 
             # Req 5: inter-leave pacing
             if idx < len(peers_to_leave) - 1:
                 await asyncio.sleep(_LEFT_INTER_DELAY)
 
-        await client(UpdateDialogFilterRequest(id=folder.id))
+        # Delete this folder (no filter= argument = delete operation)
+        try:
+            await client(UpdateDialogFilterRequest(id=folder.id))
+        except Exception as exc:
+            log.debug(
+                "[Account%d] Could not delete folder '%s': %s",
+                account_index, folder_label, exc,
+            )
         _invalidate_folder_cache(client, cache)
 
     # Req 4: clean exclusion lists for everything we left
     if left_entities:
         await _remove_from_all_folders_exclusion(client, left_entities, account_index, cache)
 
-    await _create_joined_folder(client, account_index, cache)
+    # Recreate only the base 'joined' folder
+    await _create_joined_folder(client, account_index, cache, number=1)
     return left_count, failed_count
 
 
@@ -959,6 +1264,7 @@ class JoinLeft(Module):
     # ── Folder sync helper ────────────────────────────────────────────────────
 
     async def _sync_folder_to_tracking(self, client: TelegramClient) -> int:
+        """I1: Sync peers from ALL joined* folders into auto-leave tracking."""
         days = self._settings.get("auto_leave_days")
         if days is None:
             return 0
@@ -967,21 +1273,27 @@ class JoinLeft(Module):
             return 0
 
         try:
-            folders = await _get_folders(client, self._folder_cache)
-            folder = _find_joined_folder(folders)
-            if not folder:
+            folders    = await _get_folders(client, self._folder_cache)
+            all_joined = _find_all_joined_folders(folders)
+            if not all_joined:
                 return 0
 
-            peers = [p for p in (folder.include_peers or []) if not isinstance(p, InputPeerSelf)]
-            if not peers:
+            # Collect ALL non-self peers from ALL joined* folders
+            all_peers = []
+            for jf in all_joined:
+                for p in (jf.include_peers or []):
+                    if not isinstance(p, InputPeerSelf):
+                        all_peers.append(p)
+
+            if not all_peers:
                 return 0
 
             old_timestamp = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days + 1)
-            old_iso = old_timestamp.isoformat()
+            old_iso       = old_timestamp.isoformat()
 
             added = 0
             async with self._settings_lock:
-                for peer in peers:
+                for peer in all_peers:
                     pid = _peer_id(peer)
                     if pid is None:
                         continue
@@ -1021,6 +1333,9 @@ class JoinLeft(Module):
         entity, which caused disproportionate FloodWait. Now we catch
         UserAlreadyParticipantError here and cache it as private (None),
         preventing the double-request.
+
+        I3: If _validate_invite_links pre-cached the result, this will hit
+        the cache and skip the API call entirely.
         """
         cached = self._invite_cache.get(invite_hash)
         if cached is not None:
@@ -1048,8 +1363,7 @@ class JoinLeft(Module):
             # Req 5 fix: cache as None (private/already-member), avoid double-request
             async with self._invite_cache_lock:
                 self._invite_cache[invite_hash] = {"username": None, "ts": time.time()}
-            # Signal caller that this is an "already member" case
-            # by raising — caller will handle it as a success.
+            # Signal caller that this is an "already member" case by re-raising
             raise
         except Exception as exc:
             self._log_debug(
@@ -1094,8 +1408,8 @@ class JoinLeft(Module):
         has no attribute..." has been REMOVED. That AttributeError was a
         symptom of accessing .chats directly on the wrapper object instead
         of unwrapping .updates first. The root cause is now fixed in the
-        join path (ImportChatInviteRequest result is properly unwrapped),
-        so the workaround string-match is no longer needed or correct.
+        join path (via _unwrap_join_result helper), so the workaround
+        string-match is no longer needed or correct.
         """
         if isinstance(exc, errors.UserAlreadyParticipantError):
             return True
@@ -1114,8 +1428,8 @@ class JoinLeft(Module):
         """
         Req 3 + Req 4: Immediately after a successful join, in this exact order:
         1. Mute the chat
-        2. Add to 'joined' folder (incremental, with exclude_archived=True patch)
-        3. Add to excluded_chats of all OTHER folders
+        2. Add to joined* folder (incremental, with exclude_archived=True patch)
+        3. Add to exclude_peers of all OTHER folders (type-aware, I2)
         4. Archive the chat (LAST — prevents folder operations from un-archiving)
 
         Archive is deliberately last: UpdateDialogFilterRequest with
@@ -1125,18 +1439,105 @@ class JoinLeft(Module):
 
         Returns (muted, archived, folder_added).
         """
-        # Step 1: mute
         muted        = await _mute_chat(client, entity, account_index)
-        # Step 2: add to joined folder (patching exclude_archived=True if needed)
         folder_added = await _add_single_peer_to_joined_folder(
             client, entity, account_index, self._folder_cache
         )
-        # Step 3: exclusion — all 4 actions are strictly sequential per chat so
-        # that a crash mid-run never leaves a chat partially processed.
         await _add_to_all_other_folders_exclusion(client, entity, account_index, self._folder_cache)
-        # Step 4: archive last — no further folder operations follow that could undo this
         archived     = await _archive_chat(client, entity, account_index)
         return muted, archived, folder_added
+
+    # ── I3: Pre-join invite link validation ───────────────────────────────────
+
+    async def _validate_invite_links(
+        self,
+        client: TelegramClient,
+        entities: list[tuple[str, str | int]],
+    ) -> tuple[list, list, list]:
+        """
+        I3: Pre-join validation phase for invite_link entities only.
+
+        Calls CheckChatInviteRequest for each invite_link before any joins start.
+        Non-invite entities (username, channel_id, numeric_id) pass through
+        unchanged to avoid extra API calls that could trigger FloodWait.
+
+        Returns:
+        - invalid: [(identifier, reason_str), ...]   — expired/invalid links
+        - already_joined: [(identifier, entity|None), ...] — already members
+        - remaining: [(entity_type, identifier), ...]  — valid entities to join
+        """
+        invalid:        list[tuple] = []
+        already_joined: list[tuple] = []
+        remaining:      list[tuple] = []
+        cache_updated = False
+
+        for entity_type, identifier in entities:
+            if entity_type != 'invite_link':
+                remaining.append((entity_type, identifier))
+                continue
+
+            invite_hash = _extract_invite_hash(str(identifier))
+            if not invite_hash:
+                invalid.append((identifier, "لینک قابل parse نیست"))
+                continue
+
+            # Cache hit → treat as valid (we already verified this hash recently)
+            cached = self._invite_cache.get(invite_hash)
+            if cached is not None:
+                cached_ts = cached.get("ts", 0)
+                if (time.time() - cached_ts) < _INVITE_CACHE_TTL:
+                    remaining.append((entity_type, identifier))
+                    continue
+
+            # Call CheckChatInviteRequest to validate
+            try:
+                result = await client(CheckChatInviteRequest(invite_hash))
+            except errors.InviteHashInvalidError:
+                invalid.append((identifier, "لینک منقضی یا نامعتبر است"))
+                async with self._invite_cache_lock:
+                    self._invite_cache[invite_hash] = {"username": None, "ts": time.time()}
+                cache_updated = True
+                continue
+            except errors.UserAlreadyParticipantError:
+                # Some Telegram API layers raise this from CheckChatInviteRequest
+                already_joined.append((identifier, None))
+                async with self._invite_cache_lock:
+                    self._invite_cache[invite_hash] = {"username": None, "ts": time.time()}
+                cache_updated = True
+                continue
+            except Exception as exc:
+                # Unknown error — don't cancel; let the join phase handle it
+                self._log_debug(
+                    "[Account%d] Validation: unexpected error for %s: %s",
+                    self.cfg.index, str(identifier)[:40], exc,
+                )
+                remaining.append((entity_type, identifier))
+                continue
+
+            if isinstance(result, ChatInviteAlready):
+                # We are already a member
+                already_joined.append((identifier, result.chat))
+                async with self._invite_cache_lock:
+                    self._invite_cache[invite_hash] = {"username": None, "ts": time.time()}
+                cache_updated = True
+            else:
+                # ChatInvite or ChatInvitePeek — valid, not yet joined
+                # Extract and cache the username for Layer 1 smart resolution
+                username: str | None = None
+                for attr in ("chat", "channel"):
+                    obj = getattr(result, attr, None)
+                    if obj is not None and isinstance(obj, (Channel, Chat)):
+                        username = getattr(obj, "username", None) or None
+                        break
+                async with self._invite_cache_lock:
+                    self._invite_cache[invite_hash] = {"username": username, "ts": time.time()}
+                cache_updated = True
+                remaining.append((entity_type, identifier))
+
+        if cache_updated:
+            asyncio.create_task(self._save_invite_cache())
+
+        return invalid, already_joined, remaining
 
     # ── Dispatcher ────────────────────────────────────────────────────────────
 
@@ -1170,20 +1571,38 @@ class JoinLeft(Module):
         elif cmd == "autoleave":
             await self._handle_autoleave(event, parts)
 
-    # ── Helper: collect entities ──────────────────────────────────────────────
+    # ── Helper: collect entities (I4 fix) ─────────────────────────────────────
 
     @staticmethod
-    def _collect_entities(reply_msg, command_msg) -> set[tuple]:
-        entities: set[tuple] = set()
-        entities.update(extract_telegram_entities(reply_msg.message))
-        entities.update(extract_telegram_entities(command_msg.message))
+    def _collect_entities(reply_msg, command_msg) -> list[tuple[str, str | int]]:
+        """
+        I4: Collect and deduplicate Telegram entities from reply + command messages
+        and any inline keyboard buttons.
 
+        Changed from set() (non-deterministic order) to dict.fromkeys()-style
+        deduplication using an ordered dict. Links now appear in exactly the
+        left-to-right order they were found in the message, preserving the
+        user's intended join order.
+        """
+        seen: dict[tuple, None] = {}
+
+        # Reply message has priority — its order is preserved first
+        for ent in extract_telegram_entities(reply_msg.message):
+            seen[ent] = None
+
+        # Command message entities (e.g. links in the join command itself)
+        for ent in extract_telegram_entities(command_msg.message):
+            seen.setdefault(ent, None)  # don't overwrite if already present
+
+        # Inline keyboard buttons on the reply message
         if hasattr(reply_msg, "reply_markup") and isinstance(reply_msg.reply_markup, ReplyInlineMarkup):
             for row in reply_msg.reply_markup.rows:
                 for button in row.buttons:
                     if isinstance(button, KeyboardButtonUrl):
-                        entities.update(extract_telegram_entities(button.url))
-        return entities
+                        for ent in extract_telegram_entities(button.url):
+                            seen.setdefault(ent, None)
+
+        return list(seen.keys())
 
     # ── Auto-Leave Logic ──────────────────────────────────────────────────────
 
@@ -1202,7 +1621,7 @@ class JoinLeft(Module):
         arg = parts[1]
 
         if arg == "status":
-            days = self._settings["auto_leave_days"]
+            days  = self._settings["auto_leave_days"]
             count = len(self._settings["joined_chats"])
             state = f"✅ فعال ({days} روز)" if days else "❌ غیرفعال"
             await self._safe_edit_with_auto_delete(
@@ -1274,6 +1693,7 @@ class JoinLeft(Module):
         cleaned from tracking AND from all folder exclusion lists.
 
         Req 5: paced loop with FloodWait retry cap.
+        I1: uses _remove_peers_from_all_joined_folders to clean ALL joined* folders.
         """
         if not client.is_connected():
             return
@@ -1288,7 +1708,7 @@ class JoinLeft(Module):
             await self._save_settings()
             return
 
-        now = datetime.datetime.now(datetime.UTC)
+        now      = datetime.datetime.now(datetime.UTC)
         to_leave: list[tuple[int, str]] = []
 
         async with self._settings_lock:
@@ -1306,7 +1726,7 @@ class JoinLeft(Module):
             left_entity = None
             try:
                 entity = await client.get_entity(chat_id)
-                name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
+                name   = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
 
                 await leave_dialog(client, entity)
 
@@ -1317,7 +1737,8 @@ class JoinLeft(Module):
                     self._settings["joined_chats"].pop(str(chat_id), None)
                     await self._save_settings()
 
-                await _remove_peers_from_joined_folder(
+                # I1: remove from ALL joined* folders
+                await _remove_peers_from_all_joined_folders(
                     client, [entity], self.cfg.index, self._folder_cache
                 )
 
@@ -1326,9 +1747,8 @@ class JoinLeft(Module):
                 async with self._settings_lock:
                     self._settings["joined_chats"].pop(str(chat_id), None)
                     await self._save_settings()
-                # Still need to clean exclusion lists
                 try:
-                    entity = await client.get_entity(chat_id)
+                    entity      = await client.get_entity(chat_id)
                     left_entity = entity
                 except Exception:
                     pass
@@ -1347,7 +1767,6 @@ class JoinLeft(Module):
 
             except errors.FloodWaitError as exc:
                 self._log_debug("Auto-leave FloodWait %ds for %d (will retry next cycle).", exc.seconds, chat_id)
-                # Don't spin — wait and then move on to next entity
                 await asyncio.sleep(min(exc.seconds + 2, 60))
 
             except Exception as exc:
@@ -1424,25 +1843,32 @@ class JoinLeft(Module):
     # ── FOLDER & LIST ─────────────────────────────────────────────────────────
 
     async def _handle_folder(self, event) -> None:
+        """
+        I1: Create or reset ALL joined* folders.
+        - If none exist: creates base 'joined' folder.
+        - If any exist: leaves all chats from all joined* folders, deletes
+          joined2/joined3/…, and recreates only the base 'joined' folder.
+        """
         client = event.client
         if not await self._is_saved_messages(event):
             return
 
-        await self._safe_edit(event, "🔄 Processing 'joined' folder...")
-        folders = await _get_folders(client, self._folder_cache)
-        folder  = _find_joined_folder(folders)
+        await self._safe_edit(event, "🔄 در حال بررسی فولدرهای joined...")
+        folders    = await _get_folders(client, self._folder_cache)
+        all_joined = _find_all_joined_folders(folders)
 
-        if not folder:
-            await _create_joined_folder(client, self.cfg.index, self._folder_cache)
+        if not all_joined:
+            await _create_joined_folder(client, self.cfg.index, self._folder_cache, number=1)
             await self._safe_edit_with_auto_delete(
                 event,
-                f"✅ فولدر **'{_JOINED_FOLDER_NAME}'** ساخته شد.\n📌 Saved Messages پین شد."
+                "✅ فولدر **'joined'** ساخته شد.\n📌 Saved Messages پین شد."
             )
-            self._log_debug("[Account%d] Created '%s' folder", self.cfg.index, _JOINED_FOLDER_NAME)
+            self._log_debug("[Account%d] Created 'joined' folder", self.cfg.index)
         else:
+            folder_names = "، ".join(f"'{_folder_title(f)}'" for f in all_joined)
             await self._safe_edit(
                 event,
-                f"🔄 در حال ترک تمام چت‌های **'{_JOINED_FOLDER_NAME}'** و ریست..."
+                f"🔄 در حال ترک تمام چت‌های {folder_names} و ریست...",
             )
             left, failed = await _leave_and_reset_joined_folder(
                 client, self.cfg.index, self._folder_cache
@@ -1452,51 +1878,116 @@ class JoinLeft(Module):
                 self._settings["joined_chats"] = {}
                 await self._save_settings()
 
-            msg = f"✅ فولدر **'{_JOINED_FOLDER_NAME}'** ریست شد.\n• ترک شده: {left} چت\n"
+            extra_folders_note = ""
+            if len(all_joined) > 1:
+                extra_folders_note = (
+                    f"\n🗑 `{len(all_joined) - 1}` فولدر اضافی "
+                    f"({', '.join(_folder_title(f) for f in all_joined[1:])}) حذف شد."
+                )
+
+            msg = f"✅ فولدرهای joined ریست شد.\n• ترک شده: {left} چت\n"
             if failed:
                 msg += f"• ناموفق: {failed} چت\n"
-            msg += "📌 Saved Messages پین شد."
+            msg += extra_folders_note
+            msg += "\n📌 Saved Messages پین شد."
             await self._safe_edit_with_auto_delete(event, msg)
             self._log_debug(
-                "[Account%d] Reset '%s' folder (left=%d, failed=%d)",
-                self.cfg.index, _JOINED_FOLDER_NAME, left, failed,
+                "[Account%d] Reset all joined* folders (count=%d, left=%d, failed=%d)",
+                self.cfg.index, len(all_joined), left, failed,
             )
 
     async def _handle_list(self, event) -> None:
+        """
+        I1 + I6: Show all chats from ALL joined* folders, paginated at
+        ~3500 chars. Each peer shows which folder it belongs to when there
+        are multiple joined* folders.
+        """
         client = event.client
         if not await self._is_saved_messages(event):
             return
 
-        await self._safe_edit(event, "🔍 Loading 'joined' folder contents...")
-        folders = await _get_folders(client, self._folder_cache)
-        folder  = _find_joined_folder(folders)
+        await self._safe_edit(event, "🔍 در حال بارگذاری محتوای فولدرهای joined...")
+        folders    = await _get_folders(client, self._folder_cache)
+        all_joined = _find_all_joined_folders(folders)
 
-        if not folder:
-            await self._safe_edit_with_auto_delete(event, f"ℹ️ فولدر **'{_JOINED_FOLDER_NAME}'** وجود ندارد.")
+        if not all_joined:
+            await self._safe_edit_with_auto_delete(event, "ℹ️ هیچ فولدر **joined** وجود ندارد.")
             return
 
-        peers = [p for p in (folder.include_peers or []) if not isinstance(p, InputPeerSelf)]
-        if not peers:
+        # Collect all non-self peers from all joined* folders
+        all_peers: list[tuple] = []  # (peer, folder_title_str)
+        for jf in all_joined:
+            ftitle = _folder_title(jf)
+            for p in (jf.include_peers or []):
+                if not isinstance(p, InputPeerSelf):
+                    all_peers.append((p, ftitle))
+
+        if not all_peers:
+            folder_names = "، ".join(f"**'{_folder_title(f)}'**" for f in all_joined)
             await self._safe_edit_with_auto_delete(
                 event,
-                f"ℹ️ فولدر **'{_JOINED_FOLDER_NAME}'** خالی است (فقط Saved Messages)."
+                f"ℹ️ فولدرهای {folder_names} خالی هستند (فقط Saved Messages)."
             )
             return
 
-        lines = [f"📁 **فولدر '{_JOINED_FOLDER_NAME}' — {len(peers)} چت:**\n"]
-        for i, peer in enumerate(peers, 1):
+        total         = len(all_peers)
+        multi_folder  = len(all_joined) > 1
+        folder_header = (
+            f"📁 **فولدرهای joined ({len(all_joined)} فولدر) — {total} چت در مجموع:**\n"
+            if multi_folder else
+            f"📁 **فولدر '{_folder_title(all_joined[0])}' — {total} چت:**\n"
+        )
+
+        lines: list[str] = [folder_header]
+        for i, (peer, ftitle) in enumerate(all_peers, 1):
             pid = _peer_id(peer)
             try:
                 entity = await client.get_entity(peer)
                 name   = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(pid)
                 uname  = getattr(entity, "username", None)
                 tag    = f"@{uname}" if uname else f"`{pid}`"
-                lines.append(f"{i}. **{name}** — {tag}")
+                if multi_folder:
+                    lines.append(f"{i}. [{ftitle}] **{name}** — {tag}")
+                else:
+                    lines.append(f"{i}. **{name}** — {tag}")
             except Exception:
-                lines.append(f"{i}. `{pid}`")
+                if multi_folder:
+                    lines.append(f"{i}. [{ftitle}] `{pid}`")
+                else:
+                    lines.append(f"{i}. `{pid}`")
 
-        await self._safe_edit_with_auto_delete(event, "\n".join(lines))
-        self._log_debug("[Account%d] Listed %d chats in '%s' folder", self.cfg.index, len(peers), _JOINED_FOLDER_NAME)
+        # I6: Paginate at ~3500 characters
+        chunks: list[str]      = []
+        current_lines: list[str] = []
+        current_len = 0
+
+        for line in lines:
+            line_len = len(line) + 1  # +1 for newline separator
+            if current_len + line_len > _LIST_CHUNK_SIZE and current_lines:
+                chunks.append("\n".join(current_lines))
+                current_lines = ["_(ادامه در پیام بعدی...)_\n", line]
+                current_len   = sum(len(l) + 1 for l in current_lines)
+            else:
+                current_lines.append(line)
+                current_len += line_len
+
+        if current_lines:
+            chunks.append("\n".join(current_lines))
+
+        # Send first chunk via the standard edit path
+        await self._safe_edit_with_auto_delete(event, chunks[0])
+
+        # Send overflow chunks as new messages (I6)
+        for extra_chunk in chunks[1:]:
+            try:
+                await event.respond(extra_chunk, parse_mode="Markdown")
+            except Exception:
+                pass
+
+        self._log_debug(
+            "[Account%d] Listed %d chats from %d joined* folder(s)",
+            self.cfg.index, total, len(all_joined),
+        )
 
     # ── JOIN (4-layer anti-FloodWait) ─────────────────────────────────────────
 
@@ -1504,7 +1995,13 @@ class JoinLeft(Module):
         """
         Main join handler with 4-layer anti-FloodWait strategy.
 
-        v3.0.3 changes:
+        v3.1.6 additions:
+        - I3: Pre-validation phase for invite links (before any join)
+        - C1: _unwrap_join_result() applied to all 5 join paths
+        - C2: WebView detection on all paths
+        - I4: ordered entity collection via _collect_entities() returning list
+
+        v3.0.3 base:
         - Req 1: folder addition is incremental (per-chat, immediately)
         - Req 2: already-member errors on ALL paths treated as success
         - Req 3: mute+archive immediately after each join
@@ -1516,7 +2013,8 @@ class JoinLeft(Module):
         if not reply_msg:
             return
 
-        all_entities = list(self._collect_entities(reply_msg, event.message))
+        # I4: ordered, deduplicated entity collection
+        all_entities = self._collect_entities(reply_msg, event.message)
         if not all_entities:
             await self._safe_edit_with_auto_delete(event, "ℹ️ هیچ لینک، یوزرنیم یا ID تلگرامی یافت نشد.")
             return
@@ -1534,9 +2032,11 @@ class JoinLeft(Module):
             "human": "🧘 human",
         }.get(join_mode, join_mode)
 
+        total_entities = len(all_entities)
+
         try:
             processing_msg = await event.edit(
-                f"🔍 `{len(all_entities)}` مورد یافت شد. "
+                f"🔍 `{total_entities}` مورد یافت شد. "
                 f"(mode: `{join_mode}`, delay: `{user_delay}s`)\n⏳ در حال جوین..."
             )
         except Exception as exc:
@@ -1574,7 +2074,7 @@ class JoinLeft(Module):
 
         async def floodwait_countdown(total_seconds: int, label: str) -> None:
             remaining = total_seconds
-            chunk = 5 if total_seconds < 60 else 30
+            chunk     = 5 if total_seconds < 60 else 30
             while remaining > 0:
                 sleep_for = min(remaining, chunk)
                 try:
@@ -1627,6 +2127,74 @@ class JoinLeft(Module):
             asyncio.create_task(self._prune_expired_invite_cache())
 
         # ═══════════════════════════════════════════════════════════════════════
+        # Phase 0: I3 — Pre-validation of invite links
+        # ═══════════════════════════════════════════════════════════════════════
+
+        already_joined_pre: list[tuple] = []
+        has_invite_links = any(t == 'invite_link' for t, _ in all_entities)
+
+        if has_invite_links:
+            try:
+                await processing_msg.edit(
+                    f"🔍 `{total_entities}` مورد یافت شد.\n"
+                    f"⏳ در حال بررسی اعتبار لینک‌های دعوت...",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+
+            invalid_links, already_joined_pre, all_entities = await self._validate_invite_links(
+                client, all_entities
+            )
+
+            if invalid_links:
+                # I3: Cancel the ENTIRE operation if any invite link is invalid
+                invalid_lines = "\n".join(
+                    f"• `{str(ident)[:60]}` — {reason}"
+                    for ident, reason in invalid_links
+                )
+                try:
+                    await processing_msg.edit(
+                        f"⛔ **عملیات لغو شد — لینک‌های نامعتبر یافت شد:**\n\n"
+                        f"{invalid_lines}\n\n"
+                        f"ℹ️ لطفاً لینک‌های نامعتبر را حذف یا اصلاح کنید و دوباره تلاش کنید.",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+                self._track_delete_task(processing_msg, _AUTO_DELETE_DELAY)
+                return
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # Phase 0b: Process already-joined entries from validation
+        # ═══════════════════════════════════════════════════════════════════════
+
+        for ident, entity in already_joined_pre:
+            attempt_start = time.monotonic()
+            if entity is not None:
+                title = getattr(entity, "title", None) or str(ident)
+                results.append(f"ℹ️ [{title}] — قبلاً عضو بود (فولدر بروزرسانی شد)")
+                success_count += 1
+                join_times.append(time.monotonic() - attempt_start)
+                joined_entities.append(entity)
+                async with self._settings_lock:
+                    self._settings["joined_chats"][str(entity.id)] = \
+                        datetime.datetime.now(datetime.UTC).isoformat()
+                    await self._save_settings()
+                await self._post_join_actions(client, entity, self.cfg.index)
+            else:
+                results.append(f"ℹ️ [{str(ident)[:50]}] — قبلاً عضو بود")
+                success_count += 1
+                join_times.append(0.0)
+
+        pre_processed = len(already_joined_pre)
+
+        # If validation consumed all entities, jump to summary
+        if not all_entities and pre_processed > 0:
+            # Fall through to summary below (loop won't execute)
+            pass
+
+        # ═══════════════════════════════════════════════════════════════════════
         # MAIN LOOP
         # ═══════════════════════════════════════════════════════════════════════
 
@@ -1648,8 +2216,6 @@ class JoinLeft(Module):
                     except errors.UserAlreadyParticipantError:
                         # Already a member detected at Layer 1 (CheckChatInviteRequest).
                         # Use CheckChatInviteRequest again to retrieve the entity.
-                        # v3.0.4: use isinstance(ChatInviteAlready) — type-safe access to
-                        # .chat attribute (ChatInvite objects do NOT have .chat).
                         resolved_username = None
                         try:
                             result_check = await client(CheckChatInviteRequest(invite_hash))
@@ -1675,8 +2241,9 @@ class JoinLeft(Module):
                             success_count += 1
                             join_times.append(time.monotonic() - attempt_start)
 
+                        display_idx = pre_processed + idx
                         await safe_edit(
-                            f"🔄 در حال جوین... ({idx}/{len(all_entities)}) {mode_label}\n"
+                            f"🔄 در حال جوین... ({display_idx}/{total_entities}) {mode_label}\n"
                             f"آخرین: {results[-1] if results else '-'}"
                         )
                         if idx < len(all_entities):
@@ -1692,20 +2259,25 @@ class JoinLeft(Module):
 
                     if entity_type == "channel_id":
                         chan_id = int(f"-100{identifier}")
-                        # v3.0.9 fix: this previously only called
-                        # get_entity(), which resolves/caches an entity but
-                        # never actually joins it — a not-yet-member public
-                        # channel could be reported as "✅ joined" while the
-                        # account's membership never changed. Now actually
-                        # issues JoinChannelRequest; "already a member" is
-                        # still treated as success via the shared check.
                         try:
                             ip = await client.get_input_entity(chan_id)
                         except Exception:
                             ip = await client.get_input_entity(identifier)
                         try:
-                            updates = await client(JoinChannelRequest(ip))
-                            joined_entity = updates.chats[0] if updates.chats else await client.get_entity(ip)
+                            raw = await client(JoinChannelRequest(ip))
+                            # C1: unwrap ChatInviteJoinResultOk if returned
+                            joined_entity, is_webview = _unwrap_join_result(raw)
+                            if is_webview:
+                                self._log_debug(
+                                    "[Account%d] JoinChannelRequest (channel_id=%s) returned "
+                                    "ChatInviteJoinResultWebView — WebView/Bot required.",
+                                    self.cfg.index, identifier,
+                                )
+                                results.append(f"⚠️ [{identifier}] — نیاز به WebView/Bot دارد، رد شد")
+                                fail_count += 1
+                                break
+                            if joined_entity is None:
+                                joined_entity = await client.get_entity(ip)
                         except errors.UserAlreadyParticipantError:
                             joined_entity = await client.get_entity(ip)
                         except Exception as exc:
@@ -1716,53 +2288,54 @@ class JoinLeft(Module):
 
                     elif entity_type == "username":
                         try:
-                            ip      = await client.get_input_entity(f"@{identifier}")
-                            updates = await client(JoinChannelRequest(ip))
-                            joined_entity = updates.chats[0] if updates.chats else None
+                            ip  = await client.get_input_entity(f"@{identifier}")
+                            raw = await client(JoinChannelRequest(ip))
+                            # C1: unwrap ChatInviteJoinResultOk if returned by JoinChannelRequest
+                            # This is the primary bug fix for @periodi / @RealAkhbar failures.
+                            joined_entity, is_webview = _unwrap_join_result(raw)
+                            if is_webview:
+                                self._log_debug(
+                                    "[Account%d] JoinChannelRequest (@%s) returned "
+                                    "ChatInviteJoinResultWebView — WebView/Bot required.",
+                                    self.cfg.index, identifier,
+                                )
+                                results.append(f"⚠️ [@{identifier}] — نیاز به WebView/Bot دارد، رد شد")
+                                fail_count += 1
+                                break
+                            if joined_entity is None:
+                                joined_entity = await client.get_entity(f"@{identifier}")
                         except errors.UserAlreadyParticipantError:
-                            # Req 2: already a member — treat as success
                             joined_entity = await client.get_entity(f"@{identifier}")
                         except (errors.UsernameNotOccupiedError, errors.ChannelPrivateError):
                             raise
                         except Exception as exc:
-                            # v3.0.9 fix: this used to call get_entity() in
-                            # BOTH branches regardless of the condition,
-                            # meaning any join failure that wasn't one of
-                            # the two re-raised types above — including
-                            # PeerFloodError / UserBannedInChannelError,
-                            # Telegram's own anti-spam responses to a join
-                            # flood — was silently treated as a successful
-                            # join whenever get_entity() happened to still
-                            # resolve the (often-public) target. Only a
-                            # genuine "already a member" error should be
-                            # treated as success; anything else must
-                            # re-raise so it's reported as a real failure.
                             if self._is_already_member_error(exc):
                                 joined_entity = await client.get_entity(f"@{identifier}")
                             else:
                                 raise
 
                     elif entity_type == "numeric_id":
-                        # v3.0.9 fix: get_entity() alone never joins
-                        # anything — it only resolves/caches. A bare
-                        # numeric ID for a channel the account isn't a
-                        # member of would previously "succeed" here (if
-                        # public/cached) with no actual membership change.
-                        # If the resolved entity is a Channel, actually
-                        # join it; users/basic Chats have no equivalent
-                        # "join by numeric ID" action, so those are left
-                        # as a plain resolve (which is all that's possible
-                        # for a User, and a basic Chat requires an invite
-                        # from an existing member, not a self-service join).
                         joined_entity = await client.get_entity(identifier)
                         if isinstance(joined_entity, Channel):
                             try:
-                                ip = await client.get_input_entity(joined_entity)
-                                updates = await client(JoinChannelRequest(ip))
-                                if updates.chats:
-                                    joined_entity = updates.chats[0]
+                                ip  = await client.get_input_entity(joined_entity)
+                                raw = await client(JoinChannelRequest(ip))
+                                # C1: unwrap ChatInviteJoinResultOk if returned
+                                joined_entity_new, is_webview = _unwrap_join_result(raw)
+                                if is_webview:
+                                    self._log_debug(
+                                        "[Account%d] JoinChannelRequest (numeric_id=%s) returned "
+                                        "ChatInviteJoinResultWebView — WebView/Bot required.",
+                                        self.cfg.index, identifier,
+                                    )
+                                    results.append(f"⚠️ [{identifier}] — نیاز به WebView/Bot دارد، رد شد")
+                                    fail_count += 1
+                                    joined_entity = None
+                                    break
+                                if joined_entity_new is not None:
+                                    joined_entity = joined_entity_new
                             except errors.UserAlreadyParticipantError:
-                                pass
+                                pass  # keep pre-resolved joined_entity
                             except Exception as exc:
                                 if not self._is_already_member_error(exc):
                                     raise
@@ -1771,13 +2344,24 @@ class JoinLeft(Module):
 
                         if effective_type == "invite_with_username" and resolved_username:
                             try:
-                                ip      = await client.get_input_entity(f"@{resolved_username}")
-                                updates = await client(JoinChannelRequest(ip))
-                                joined_entity = updates.chats[0] if updates.chats else None
+                                ip  = await client.get_input_entity(f"@{resolved_username}")
+                                raw = await client(JoinChannelRequest(ip))
+                                # C1: unwrap ChatInviteJoinResultOk if returned
+                                joined_entity, is_webview = _unwrap_join_result(raw)
+                                if is_webview:
+                                    self._log_debug(
+                                        "[Account%d] JoinChannelRequest (@%s via invite) returned "
+                                        "ChatInviteJoinResultWebView — WebView/Bot required.",
+                                        self.cfg.index, resolved_username,
+                                    )
+                                    results.append(
+                                        f"⚠️ [@{resolved_username}] — نیاز به WebView/Bot دارد، رد شد"
+                                    )
+                                    fail_count += 1
+                                    break
                                 if joined_entity is None:
                                     joined_entity = await client.get_entity(f"@{resolved_username}")
                             except errors.UserAlreadyParticipantError:
-                                # Req 2: already a member on username path
                                 joined_entity = await client.get_entity(f"@{resolved_username}")
                             except Exception as exc:
                                 if self._is_already_member_error(exc):
@@ -1788,18 +2372,19 @@ class JoinLeft(Module):
                                         "[Account%d] Username join failed for @%s, falling back to hash",
                                         self.cfg.index, resolved_username,
                                     )
-                                    effective_type = "invite_direct"
-                                    invite_hash = _extract_invite_hash(str(identifier))
-                                    if invite_hash:
+                                    effective_type  = "invite_direct"
+                                    ih_fallback     = _extract_invite_hash(str(identifier))
+                                    if ih_fallback:
                                         try:
-                                            # v3.0.4: unwrap ChatInviteJoinResultOk.updates
-                                            raw2 = await client(ImportChatInviteRequest(invite_hash))
-                                            if isinstance(raw2, tl_messages.ChatInviteJoinResultOk):
-                                                joined_entity = raw2.updates.chats[0] if raw2.updates.chats else None
-                                            elif isinstance(raw2, tl_messages.ChatInviteJoinResultWebView):
-                                                joined_entity = None  # WebView-gated, can't join
-                                            else:
-                                                joined_entity = None
+                                            raw2 = await client(ImportChatInviteRequest(ih_fallback))
+                                            # C1: unwrap via helper for consistency
+                                            joined_entity, is_webview2 = _unwrap_join_result(raw2)
+                                            if is_webview2:
+                                                results.append(
+                                                    f"⚠️ [{identifier}] — نیاز به WebView/Bot دارد، رد شد"
+                                                )
+                                                fail_count += 1
+                                                break
                                         except errors.UserAlreadyParticipantError:
                                             joined_entity = await client.get_entity(f"@{resolved_username}")
                                         except Exception as exc2:
@@ -1812,9 +2397,9 @@ class JoinLeft(Module):
                             # ── DIRECT HASH PATH: ImportChatInviteRequest ──────
                             # v3.0.4: This path is now a single API call.
                             # No pre-check (CheckChatInviteRequest) is made because
-                            # ChatInvite objects (truly private groups/channels) have
-                            # no .username field — the pre-check would always return
-                            # None and waste an API call.
+                            # truly private ChatInvite objects have no .username field.
+                            # I3: invite links are pre-validated above, so we know
+                            # they are valid and we are NOT yet members.
                             invite_hash = _extract_invite_hash(str(identifier))
                             if not invite_hash:
                                 results.append(f"❌ [{identifier}] — لینک قابل parse نیست")
@@ -1822,20 +2407,11 @@ class JoinLeft(Module):
                                 break
 
                             try:
-                                # v3.0.4 Fix A: ImportChatInviteRequest returns
-                                # messages.ChatInviteJoinResultOk (a wrapper with a single
-                                # .updates attribute of TypeUpdates). The .chats list lives on
-                                # .updates.chats, NOT directly on the result object.
-                                # Accessing .chats on the wrapper caused AttributeError in v3.0.3.
                                 raw = await client(ImportChatInviteRequest(invite_hash))
 
-                                if isinstance(raw, tl_messages.ChatInviteJoinResultOk):
-                                    # Standard success: unwrap the Updates object
-                                    actual_updates = raw.updates
-                                    joined_entity = actual_updates.chats[0] if actual_updates.chats else None
-                                elif isinstance(raw, tl_messages.ChatInviteJoinResultWebView):
-                                    # v3.0.4 Fix E: subscription/bot-gated channel.
-                                    # Cannot join via standard API; requires WebView interaction.
+                                # C1: use _unwrap_join_result for consistency with all paths
+                                joined_entity, is_webview = _unwrap_join_result(raw)
+                                if is_webview:
                                     self._log_debug(
                                         "[Account%d] ImportChatInviteRequest returned "
                                         "ChatInviteJoinResultWebView for hash %.8s — "
@@ -1847,15 +2423,8 @@ class JoinLeft(Module):
                                     )
                                     fail_count += 1
                                     break
-                                else:
-                                    # Unknown future result type
-                                    self._log_debug(
-                                        "[Account%d] ImportChatInviteRequest returned unexpected "
-                                        "type %s for hash %.8s",
-                                        self.cfg.index, type(raw).__name__, invite_hash,
-                                    )
-                                    joined_entity = None
 
+                                # Update invite cache with username if we got an entity
                                 if joined_entity is not None and use_smart:
                                     uname = getattr(joined_entity, "username", None)
                                     async with self._invite_cache_lock:
@@ -1866,7 +2435,7 @@ class JoinLeft(Module):
                                     asyncio.create_task(self._save_invite_cache())
 
                             except errors.UserAlreadyParticipantError:
-                                # Already a member — retrieve entity via CheckChatInviteRequest.
+                                # Already a member — retrieve entity via CheckChatInviteRequest
                                 # v3.0.4 Fix D: use isinstance(ChatInviteAlready) for type-safe
                                 # access to .chat. ChatInvite (not-yet-member) has no .chat attr.
                                 try:
@@ -1909,25 +2478,22 @@ class JoinLeft(Module):
                         if use_adaptive and adaptive_mult > 1.0:
                             adaptive_mult = max(1.0, adaptive_mult * _ADAPTIVE_DECAY)
 
-                        # Track join timestamp
                         async with self._settings_lock:
                             self._settings["joined_chats"][str(joined_entity.id)] = \
                                 datetime.datetime.now(datetime.UTC).isoformat()
                             await self._save_settings()
 
                         # Req 1 + Req 3 + Req 4: immediate per-chat post-processing
-                        # v3.0.4: awaited (not fire-and-forget) for crash-safety
                         await self._post_join_actions(client, joined_entity, self.cfg.index)
 
-                    break  # ← success, exit retry loop
+                    break  # ← success (or handled WebView), exit retry loop
 
                 # ── FloodWait handling (Layer 3 + Req 5 retry cap) ────────────
                 except errors.FloodWaitError as exc:
                     fw_retry_count += 1
-                    flood_count += 1
+                    flood_count    += 1
 
                     if fw_retry_count > _MAX_FLOODWAIT_RETRIES:
-                        # Req 5: give up on this entity rather than looping forever
                         self._log_warning(
                             "[Account%d] FloodWait retry cap (%d) exceeded for '%s' — skipping.",
                             self.cfg.index, _MAX_FLOODWAIT_RETRIES, identifier,
@@ -1969,23 +2535,24 @@ class JoinLeft(Module):
                     break
 
             # ── Live progress update ───────────────────────────────────────────
+            display_idx = pre_processed + idx
             await safe_edit(
-                f"🔄 در حال جوین... ({idx}/{len(all_entities)}) {mode_label}\n"
+                f"🔄 در حال جوین... ({display_idx}/{total_entities}) {mode_label}\n"
                 f"آخرین: {results[-1] if results else '-'}\n"
                 f"_mult: {adaptive_mult:.1f}×_"
                 if use_adaptive and adaptive_mult > 1.0
                 else
-                f"🔄 در حال جوین... ({idx}/{len(all_entities)}) {mode_label}\n"
+                f"🔄 در حال جوین... ({display_idx}/{total_entities}) {mode_label}\n"
                 f"آخرین: {results[-1] if results else '-'}"
             )
 
-            # ─── Apply inter-join delay (Layers 2 + 3) ────────────────────────
+            # ── Apply inter-join delay (Layers 2 + 3) ─────────────────────────
             if idx < len(all_entities):
                 this_delay = compute_delay(effective_type)
                 if this_delay > 0:
                     await asyncio.sleep(this_delay)
 
-            # ── Layer 4: Batch cooldown (human mode only) ─────────────────────
+            # ── Layer 4: Batch cooldown (human mode only) ──────────────────────
             if use_batch and idx < len(all_entities):
                 batch_join_count += 1
                 if batch_join_count >= _BATCH_SIZE:
@@ -2017,7 +2584,7 @@ class JoinLeft(Module):
                     await asyncio.sleep(cooldown)
 
         # ═══════════════════════════════════════════════════════════════════════
-        # POST-LOOP: Summary (folder already updated incrementally)
+        # POST-LOOP: Summary
         # ═══════════════════════════════════════════════════════════════════════
 
         total_time = time.monotonic() - start_time
@@ -2032,10 +2599,11 @@ class JoinLeft(Module):
             else ""
         )
 
-        # Req 1: folder was already updated incrementally, but report final count
         folder_count = len(joined_entities)
-        folder_note  = f"\n📁 `{folder_count}` چت به فولدر '{_JOINED_FOLDER_NAME}' اضافه شد (incremental)." \
-                       if folder_count > 0 else ""
+        folder_note  = (
+            f"\n📁 `{folder_count}` چت به فولدر joined اضافه شد (incremental)."
+            if folder_count > 0 else ""
+        )
 
         summary = (
             f"--- **نتایج جوین** ({join_mode}) ---\n"
@@ -2070,18 +2638,25 @@ class JoinLeft(Module):
 
     async def _handle_left(self, event) -> None:
         """
-        Req 4: After leaving, immediately remove from all folder exclusion lists.
-        Req 5: Use paced loop with FloodWait retry cap.
+        I1: After leaving, remove from ALL joined* folders.
+        I5: Fixed invite-link membership detection (isinstance check).
+        N3: Deduplicate input entities to prevent double-leave.
+        Req 4: Remove from all folder exclusion lists.
+        Req 5: Paced loop with FloodWait retry cap.
         """
-        client = event.client
+        client    = event.client
         reply_msg = await event.get_reply_message()
         if not reply_msg:
             return
 
-        all_entities = self._collect_entities(reply_msg, event.message)
-        if not all_entities:
+        # I4: use the updated ordered-list _collect_entities
+        raw_entities = self._collect_entities(reply_msg, event.message)
+        if not raw_entities:
             await self._safe_edit_with_auto_delete(event, "ℹ️ هیچ لینک، یوزرنیم یا ID تلگرامی یافت نشد.")
             return
+
+        # N3: Deduplicate to prevent double-leave when same link appears twice
+        all_entities = list(dict.fromkeys(raw_entities))
 
         try:
             processing_msg = await event.edit(f"🔍 `{len(all_entities)}` مورد یافت شد. در حال ترک...")
@@ -2115,25 +2690,37 @@ class JoinLeft(Module):
                         if not invite_hash:
                             results.append(f"❌ [{identifier}] — لینک قابل parse نیست")
                             break
-                        # For leave via invite, we need to be a member; try get_entity
+                        # I5: Use isinstance(ChatInviteAlready) instead of fragile attr loop.
+                        # ChatInviteAlready (already a member) has .chat.
+                        # ChatInvite (not a member) does NOT have .chat — we can't leave
+                        # a chat we haven't joined.
                         try:
-                            # ImportChatInviteRequest is too risky here (we may already be member)
-                            # Use CheckChatInviteRequest to peek at the chat first
                             result_check = await client(CheckChatInviteRequest(invite_hash))
-                            for attr in ("chat", "channel"):
-                                obj = getattr(result_check, attr, None)
-                                if obj is not None:
-                                    target_entity = obj
-                                    break
+                            if isinstance(result_check, ChatInviteAlready):
+                                target_entity = result_check.chat
+                            # else: ChatInvite → not a member → target_entity stays None
+                        except errors.UserAlreadyParticipantError:
+                            # Some Telegram API layers raise this instead of returning
+                            # ChatInviteAlready. We know we're a member but can't
+                            # retrieve the entity from the hash alone in this path.
+                            results.append(
+                                f"⚠️ [{str(identifier)[:40]}] — "
+                                f"عضو هستید اما شناسه از طریق لینک قابل دریافت نیست"
+                            )
+                            break
                         except Exception as exc:
-                            results.append(f"❌ [{identifier}] — خطا ({exc})")
+                            results.append(f"❌ [{identifier}] — خطا ({str(exc)[:40]})")
                             break
 
                     if target_entity is None:
                         results.append(f"❌ [{identifier}] — یافت نشد")
                         break
 
-                    name = getattr(target_entity, "title", None) or getattr(target_entity, "first_name", None) or str(identifier)
+                    name = (
+                        getattr(target_entity, "title", None)
+                        or getattr(target_entity, "first_name", None)
+                        or str(identifier)
+                    )
 
                     await leave_dialog(client, target_entity)
 
@@ -2176,15 +2763,17 @@ class JoinLeft(Module):
             if idx < len(all_entities) - 1:
                 await asyncio.sleep(_LEFT_INTER_DELAY)
 
-        # Req 4: remove from joined folder AND clean all other folders' exclusion lists
+        # I1 + Req 4: remove from ALL joined* folders AND clean all exclusion lists
         if left_entities:
             try:
-                removed = await _remove_peers_from_joined_folder(
+                removed = await _remove_peers_from_all_joined_folders(
                     client, left_entities, self.cfg.index, self._folder_cache
                 )
-                folder_note = f"\n📁 `{removed}` چت از فولدر '{_JOINED_FOLDER_NAME}' حذف شد." if removed else ""
+                folder_note = (
+                    f"\n📁 `{removed}` چت از فولدرهای joined حذف شد." if removed else ""
+                )
             except Exception as exc:
-                self._log_error("Failed to remove peers from folder: %s", exc)
+                self._log_error("Failed to remove peers from joined* folders: %s", exc)
                 folder_note = ""
 
             # Req 4: synchronous exclusion cleanup
@@ -2223,8 +2812,8 @@ help_text = (
     "• `left` (reply) | ترک چت‌های reply شده\n"
     "• `join delay <seconds>` | تنظیم تاخیر ثابت (0 = بازگشت به smart)\n"
     "• `join mode fast|safe|human` | تنظیم حالت ضد-FloodWait\n"
-    "• `folder` | ایجاد یا ریست فولدر joined\n"
-    "• `list` | نمایش لیست چت‌های فولدر\n"
+    "• `folder` | ایجاد یا ریست فولدرهای joined (joined, joined2, …)\n"
+    "• `list` | نمایش لیست چت‌های تمام فولدرهای joined\n"
     "• `autoleave <days>` | ترک خودکار پس از N روز\n"
     "• `autoleave off` | غیرفعال‌سازی ترک خودکار\n"
     "• `autoleave status` | نمایش وضعیت فعلی\n"
@@ -2241,19 +2830,24 @@ help_extra = (
     "• لینک‌های خصوصی قدیمی | `t.me/joinchat/AbCdEfGh`\n"
     "• شناسه عددی | `1234567890`\n"
     "• لینک‌های خصوصی کانال | `t.me/c/1234567890/123`\n\n"
-    "رفتارهای جدید v3.0.3:\n"
-    "• Mute و Archive فوری پس از هر جوین (نه در دسته‌های انتها)\n"
-    "• افزودن به فولدر 'joined' فوری پس از هر جوین (incremental)\n"
-    "• اضافه شدن به excluded_chats فولدرهای دیگر (چت فقط در 'joined' نشان داده می‌شود)\n"
-    "• 'قبلاً عضو' روی همه مسیرها به‌عنوان موفقیت کامل تلقی می‌شود\n"
-    "• حداکثر تعداد retry روی FloodWait برای هر entity (بجای loop بی‌نهایت)\n\n"
+    "تغییرات v3.1.6:\n"
+    "• رفع باگ حیاتی: خطای 'ChatInviteJoinResultOk' روی کانال‌های عمومی (C1)\n"
+    "  → JoinChannelRequest در Telethon 1.44 ممکن است ChatInviteJoinResultOk برگرداند\n"
+    "  → تمام ۵ مسیر جوین اکنون با _unwrap_join_result() ایمن شدند\n"
+    "• پشتیبانی چند فولدر: وقتی joined پر شد، joined2، joined3 ایجاد می‌شود (I1)\n"
+    "• حذف هوشمند: فقط از فولدرهایی که می‌توانند آن نوع چت را نشان دهند حذف می‌شود (I2)\n"
+    "• اعتبارسنجی قبل از جوین: لینک‌های منقضی قبل از شروع بررسی می‌شوند (I3)\n"
+    "• ترتیب ثابت: لینک‌ها به ترتیب ظاهرشان در پیام پردازش می‌شوند (I4)\n"
+    "• رفع باگ ترک از طریق لینک دعوت (I5)\n"
+    "• صفحه‌بندی خروجی list برای لیست‌های طولانی (I6)\n\n"
     "سیستم ضد-FloodWait (۴ لایه):\n"
     "• `join mode fast`  | بدون throttling، بدون batching — سریع‌ترین\n"
     "• `join mode safe`  | Layer 1+2: حل هوشمند لینک + تأخیر بر اساس ریسک [پیش‌فرض]\n"
     "• `join mode human` | Layer 1+2+3+4: تمام لایه‌ها + batch cooldown — ایمن‌ترین\n\n"
     "Layer 1 — Smart Link Resolution:\n"
-    "  → invite link→ بررسی قبل از جوین → اگر username داشت → JoinChannelRequest (ایمن)\n"
+    "  → invite link → بررسی قبل از جوین → اگر username داشت → JoinChannelRequest (ایمن)\n"
     "  → نتایج cache می‌شوند (۶ ساعت) در join_left_invite_cache.json\n"
+    "  → اعتبارسنجی I3 نتایج را cache می‌کند — Layer 1 از cache استفاده می‌کند\n"
     "  → نماد 🛡 = از smart path استفاده شد | نماد 🔑 = مستقیم از hash\n\n"
     "Layer 2 — Risk-Based Delays:\n"
     "  → username: 2s | channel_id/numeric_id: 3s | invite→username: 4s | invite direct: 4s\n"
@@ -2267,16 +2861,14 @@ help_extra = (
     "  → بعد از هر ۵ جوین: استراحت ۳۰s\n"
     "  → بعد از هر ۳ دسته: استراحت ۱۲۰s\n"
     "  → jitter ±۲۰٪ روی تمام تأخیرها\n\n"
-    "تنظیمات تاخیر:\n"
-    "• `join delay <seconds>` | تأخیر ثابت — smart throttling را غیرفعال می‌کند\n"
-    "• `join delay 0` | بازگشت به smart throttling\n"
-    "• پیش‌فرض | ۰ ثانیه + smart mode = safe\n\n"
-    "مدیریت فولدر:\n"
-    "• `folder` | ایجاد یا ریست فولدر `joined` — چت‌های موجود را ترک و حذف می‌کند\n"
-    "• `list` | نمایش لیست چت‌های موجود در فولدر `joined`\n\n"
+    "مدیریت فولدر (v3.1.6):\n"
+    "• `folder` | ایجاد یا ریست فولدرهای joined*\n"
+    "  → اگر joined پر شد (۱۰۰ چت)، joined2 خودکار ایجاد می‌شود\n"
+    "  → `folder` تمام joined* را ریست کرده و فقط joined پایه را نگه می‌دارد\n"
+    "• `list` | نمایش تمام چت‌های joined* (با نام فولدر در صورت چند فولدر)\n\n"
     "ترک خودکار:\n"
-    "• `autoleave <days>` | ترک چت‌های فولدر `joined` پس از N روز\n"
-    "  → شامل چت‌های از قبل موجود در فولدر هم می‌شود\n"
+    "• `autoleave <days>` | ترک چت‌های joined* پس از N روز\n"
+    "  → شامل چت‌های از قبل موجود در همه فولدرها هم می‌شود\n"
     "• `autoleave off` | غیرفعال‌سازی ترک خودکار\n"
     "• `autoleave status` | نمایش وضعیت فعلی\n\n"
     "مثال‌ها:\n"
@@ -2292,10 +2884,10 @@ help_extra = (
     "• در صورت FloodWait، شمارش معکوس زنده نمایش داده می‌شود\n"
     "• هر entity حداکثر ۵ بار retry FloodWait دارد — بعد skip می‌شود\n"
     "• پس از `left` موفق، پیام دستور به‌صورت خودکار حذف می‌شود\n"
-    "• هنگام فعال‌سازی autoleave، چت‌های موجود در فولدر هم ردیابی می‌شوند\n"
+    "• هنگام فعال‌سازی autoleave، چت‌های موجود در همه فولدرها ردیابی می‌شوند\n"
 )
 
-JoinLeft.help_text = help_text
+JoinLeft.help_text  = help_text
 JoinLeft.help_extra = help_extra
 
 

@@ -5,6 +5,174 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.1.6] — 2026-09-12
+
+**Source:** AI (deep bug investigation + multi-requirement implementation;
+root cause analysis, external TL-schema research, 11-section report, and
+full implementation reviewed and approved by the project owner before
+delivery. Scope: `join_left.py` — 2 critical fixes, 6 important fixes,
+4 nice-to-have improvements, all confirmed against Telegram TL schema.)
+
+### Fixed — Critical
+
+- **C1 — `'ChatInviteJoinResultOk' object has no attribute 'chats'`
+  on public channels like `@periodi`, `@RealAkhbar` (and all username /
+  channel_id / numeric_id join paths)** — Root cause: in Telethon 1.44.0
+  with Telegram API Layer 178+, **both** `JoinChannelRequest` (not just
+  `ImportChatInviteRequest`) can return `ChatInviteJoinResultOk`
+  (constructor `0x445663a7`). This wrapper has a single `.updates` field;
+  it has **no `.chats` attribute** of its own. v3.0.4 fixed the
+  `ImportChatInviteRequest` path, but left four `JoinChannelRequest`
+  paths (`channel_id` line 1708, `username` line 1721, `numeric_id`
+  line 1763, `invite_with_username` line 1776) still accessing
+  `.chats[0]` directly, causing `AttributeError` on every join of a
+  public channel through those paths. The join itself succeeded
+  (Telegram-side), but the error caused `_post_join_actions` to be
+  skipped entirely — chat was never added to the `joined` folder, never
+  muted, never archived, never excluded from other folders. Fixed by
+  adding a new `_unwrap_join_result(raw) -> (entity, is_webview)` module-
+  level helper and applying it to all **five** join paths uniformly,
+  including the existing `ImportChatInviteRequest` path (refactored for
+  consistency). Confirmed against official TL schema:
+  `messages.ChatInviteJoinResult` is returned by both
+  `channels.joinChannel` AND `messages.importChatInvite`.
+
+- **C2 — `ChatInviteJoinResultWebView` detection on all join paths** —
+  Previously only detected on the `ImportChatInviteRequest` direct-hash
+  path. With C1's `_unwrap_join_result` helper now covering all paths,
+  WebView-gated channels on the `username`, `channel_id`, `numeric_id`,
+  and `invite_with_username` paths also produce the clear
+  `⚠️ نیاز به WebView/Bot دارد، رد شد` message instead of
+  `None`-entity silently.
+
+### Added / Improved — Important
+
+- **I1 — Multi-folder support** (`_FOLDER_CAPACITY = 100`): Telegram
+  enforces a hard 100-chat cap on `include_peers` per folder. When the
+  active `joined*` folder is full, a new `joined2`, `joined3`, … folder
+  is created automatically with **no user notification** (seamless
+  overflow). All new folders are configured identically to `joined`
+  (`exclude_archived=True`, `Saved Messages` pinned, all type flags
+  False). Commands updated:
+  - `folder` — leaves and resets **all** `joined*` folders; recreates
+    only the base `joined` (reports count of deleted extra folders).
+  - `list` — collects peers from **all** `joined*` folders; when
+    multiple folders exist, each line is tagged with its source folder.
+  - `left` — removes left peers from **all** `joined*` folders.
+  - `autoleave` / `_sync_folder_to_tracking` — scans **all** `joined*`
+    folders when syncing tracking state.
+  - New module-level helpers: `_get_joined_folder_number`,
+    `_joined_folder_title`, `_find_all_joined_folders`,
+    `_find_active_joined_folder`, `_get_next_joined_folder_number`.
+  - `_remove_peers_from_joined_folder` renamed to
+    `_remove_peers_from_all_joined_folders` with multi-folder support.
+  - `_add_single_peer_to_joined_folder` and `_add_peers_to_joined_folder`
+    updated to be multi-folder aware.
+
+- **I2 — Smart type-aware folder exclusion + `exclude_peers` capacity
+  guard (N4)**: A joined chat is now only added to a folder's
+  `exclude_peers` if the folder's type flags indicate it could show that
+  entity type:
+  - Broadcast channels → only excluded from folders with `broadcasts=True`
+  - Groups / supergroups → only excluded from folders with `groups=True`
+  - Users / bots → only excluded from folders with `contacts=True` /
+    `non_contacts=True` / `bots=True`
+  - Purely explicit-peer folders (all type flags `False`) are skipped —
+    a newly joined chat won't appear in them anyway.
+  New helper: `_folder_would_show_entity(folder, entity) -> bool`.
+  Also enforces `_EXCLUDE_PEERS_CAPACITY = 100`: folders already at
+  the Telegram-imposed 100-entry `exclude_peers` limit are silently
+  skipped.
+
+- **I3 — Pre-join invite link validation**: Before any join operations
+  begin, all `invite_link` entities are validated via
+  `CheckChatInviteRequest`. If **any** link is expired or invalid
+  (`InviteHashInvalidError`), the entire operation is cancelled with a
+  clear Persian error message listing each bad link and the reason; no
+  joins are attempted. Already-joined links (`ChatInviteAlready` or
+  `UserAlreadyParticipantError`) are moved out of the main loop and
+  processed as immediate successes: full `_post_join_actions` (folder,
+  mute, archive, exclusion) is applied without re-joining. Reported as
+  `ℹ️ [title] — قبلاً عضو بود (فولدر بروزرسانی شد)`. New method:
+  `_validate_invite_links`. The validation also pre-populates the
+  Layer 1 invite cache, so `_resolve_invite_to_username` hits the cache
+  and makes zero additional `CheckChatInviteRequest` calls for validated
+  links. Only `invite_link` entities are pre-validated; `username` /
+  `channel_id` / `numeric_id` entities are not (avoids extra API calls
+  that could trigger FloodWait).
+
+- **I4 — `_collect_entities` ordering (Bug A)**: Changed from `set()`
+  (non-deterministic Python hash-based ordering) to an ordered-dict
+  deduplication pattern. Links are now joined in exactly the left-to-right
+  order they appear in the message, preserving the user's intent.
+  Return type changed from `set[tuple]` to `list[tuple[str, str | int]]`;
+  `list()` wrapper removed from `_handle_join` caller.
+
+- **I5 — `_handle_left` invite-link membership detection (Bug B)**:
+  Replaced the fragile `for attr in ("chat", "channel"): getattr(...)`
+  loop with an explicit `isinstance(result_check, ChatInviteAlready)`
+  check. `ChatInviteAlready` (already a member) has `.chat`; `ChatInvite`
+  (not a member) does not — the old loop silently returned `None` for
+  not-a-member cases (correct, but for the wrong reason) and could
+  also silently miss `ChatInviteAlready.chat`. Added handling for
+  `UserAlreadyParticipantError` raised from `CheckChatInviteRequest`
+  (some Telegram API layers raise instead of returning `ChatInviteAlready`).
+
+- **I6 — `_handle_list` pagination**: Output is now chunked at
+  `~3,500` characters (`_LIST_CHUNK_SIZE`). The first chunk is sent via
+  the standard edit path; overflow chunks are sent as new messages in
+  the same chat. Each peer line includes the source folder name tag
+  (`[joined]`, `[joined2]`, …) when multiple joined* folders exist.
+
+### Added — Nice-to-Have
+
+- **N1 — Bot username exclusion documented**: Added a clear multi-line
+  comment in `extract_telegram_entities()` explaining why usernames
+  ending in `bot` are intentionally skipped (bots cannot be "joined";
+  attempting to do so causes `ChannelPrivateError` or similar failures).
+
+- **N2 — Folder cache write-through optimization**: After every
+  successful `UpdateDialogFilterRequest`, the in-memory folder cache is
+  updated in-place via the new `_update_folder_in_cache(client, cache,
+  updated_folder)` helper — without resetting the TTL — so the next
+  `_get_folders` call uses the updated state without re-fetching from
+  Telegram. Previously, every successful folder update called
+  `_invalidate_folder_cache`, forcing a fresh `GetDialogFiltersRequest`
+  on the next operation. During a 50-chat bulk join with 4 post-join
+  folder operations each, this eliminated approximately 150 unnecessary
+  `GetDialogFiltersRequest` calls (≈70% reduction).
+
+- **N3 — Left-entity deduplication in `_handle_left`**: Input entities
+  are deduplicated with `dict.fromkeys()` before the leave loop.
+  Prevents double-leave attempts (which would produce a spurious
+  `UserNotParticipantError` on the second attempt) when the same link
+  appears twice in the input message.
+
+- **N4 — `exclude_peers` per-folder capacity guard**: When
+  `_add_to_all_other_folders_exclusion` encounters a folder whose
+  `exclude_peers` list is already at 100 entries (Telegram's documented
+  hard cap), that folder is silently skipped. Prevents the
+  `DIALOG_FILTERS_TOO_MUCH` server error that would otherwise be
+  returned for any further exclusion on that folder. Implemented as
+  `_EXCLUDE_PEERS_CAPACITY = 100` constant check in the exclusion loop.
+
+### Changed
+
+- `_add_to_all_other_folders_exclusion`: now skips **all** `joined*`
+  folders (previously only skipped the base `joined`), uses type-aware
+  entity check (I2), respects `_EXCLUDE_PEERS_CAPACITY` (N4), and uses
+  write-through cache (N2).
+- `_remove_from_all_folders_exclusion`: uses write-through cache (N2).
+- `_leave_and_reset_joined_folder`: processes **all** `joined*` folders,
+  deletes each one individually, recreates only the base `joined` (I1).
+- `_check_auto_leave`: calls `_remove_peers_from_all_joined_folders`
+  instead of the old `_remove_peers_from_joined_folder` (I1).
+- `_post_join_actions` docstring updated to reflect I2 change.
+- Module docstring updated with full v3.1.6 change log.
+- `help_text` and `help_extra` updated with v3.1.6 feature descriptions.
+
+---
+
 ## [3.1.5] — 2026-09-04
 
 **Source:** AI (bug investigation + fix requested by the project owner,

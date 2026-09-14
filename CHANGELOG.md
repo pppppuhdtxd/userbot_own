@@ -5,6 +5,133 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.1.7] — 2026-09-12
+
+**Source:** AI (systematic cross-module investigation; classification consistency
+audit of `info_handler.py`, `clearer.py`, `auto_clearer.py`, and `helpers/utils.py`;
+7-phase research report with full cross-module consistency matrix, confirmed against
+Telethon 1.44.0 TL schema; scope approved by project owner before delivery.)
+
+### Fixed — Critical
+
+- **F1 — `_clear_past` in `auto_clearer.py` ignored `scope`, causing
+  silent data loss during historical cleanup sweeps** — When a filter was
+  enabled via `autoclear <type> on <scope>`, the immediate historical sweep
+  (`_clear_past`) deleted ALL messages of the given type regardless of the
+  configured scope (1=bot, 2=user, 3=both). The `_scope_matches()` function
+  that was correctly called in `_try_auto_delete` (real-time deletion) was
+  never called in `_clear_past`. Effect:
+  - `autoclear txt on 1` (bot only) → also deleted the user's own text messages
+  - `autoclear txt on 2` (user only) → left bot text messages intact that
+    should have been deleted
+  Fixed by adding `_scope_matches(cfg["scope"], bool(getattr(msg, "out", False)))`
+  to the `_clear_past` loop, identical to the pattern in `_try_auto_delete`.
+  `msg.out` is a boolean attribute on every Telethon `Message` object —
+  `True` when the message was sent by this account.
+
+### Fixed — Important
+
+- **F2 — `_photo_details` in `info_handler.py` returned empty for
+  document-photos** — `classify_message()` returns `"pic"` for both native
+  `MessageMediaPhoto` objects AND `MessageMediaDocument` objects whose filename
+  has an image extension (.jpg, .jpeg, .png, .bmp, .webp) with no
+  `DocumentAttributeVideo` or `DocumentAttributeSticker`. `_photo_details`
+  previously checked `isinstance(media, MessageMediaPhoto)` only and returned
+  `""` for the document case, leaving the detail section silently empty when a
+  user replied to an image sent as a file attachment. Now handles both cases:
+  - `MessageMediaPhoto`: Photo ID, max dimensions, size (unchanged)
+  - `MessageMediaDocument`: File ID, size, MIME type, filename, extension,
+    image dimensions (`DocumentAttributeImageSize` if present)
+  Added `DocumentAttributeImageSize` to imports.
+
+- **F3 — Removed permanently unreachable dead code from `_file_details` in
+  `info_handler.py`** — The `elif isinstance(attr, DocumentAttributeAudio)`
+  branches (lines 307–318 in v3.1.6) inside `_file_details` could never be
+  reached: `is_file()` in `utils.py` explicitly calls `is_audio()` and returns
+  `False` if it is True, so any document with `DocumentAttributeAudio` is
+  classified as `"other"`, never `"file"`. `_file_details` is only called when
+  `msg_type == "file"`, so these branches were permanently unreachable. Removed.
+  As a companion fix, the audio detail display (artist, title, duration) has
+  been **moved to `_other_details()`** where audio documents actually arrive,
+  making the long-missing detail section for `.mp3`/`.flac` files finally
+  reachable and functional. Added a `DocumentAttributeAudio` (voice=False) branch
+  to `_other_details` showing type label "Audio File", artist, title, duration.
+
+- **F4 — `_link_details` in `info_handler.py` showed no content for
+  messages classified as `link` via inline keyboard URL buttons** —
+  `is_link()` in `utils.py` classifies a message as `"link"` via three paths:
+  (1) `MessageMediaWebPage`, (2) URL entities, (3) `KeyboardButtonUrl` in
+  `ReplyInlineMarkup`. `_link_details` previously only rendered output for
+  paths 1 and 2. A message classified via path 3 (glass/inline-keyboard buttons
+  only, no WebPage and no URL entities) showed the section header
+  "🔗 جزئیات لینک:" with no content beneath it. Now lists each `KeyboardButtonUrl`
+  entry: button label and URL (capped at 5 buttons, URLs truncated at 100 chars
+  for readability). Added `ReplyInlineMarkup` and `KeyboardButtonUrl` to imports.
+
+- **F5 — Audio file classification not documented in user-facing help text** —
+  Audio file attachments (`.mp3`, `.flac`, `.ogg` with `DocumentAttributeAudio`)
+  are classified as `"other"` by `classify_message()`, not `"file"`, because
+  `is_file()` explicitly excludes documents for which `is_audio()` is True. The
+  README priority table documented this correctly ("Document with filename, no
+  video/audio/sticker attributes"), but the `help_extra` text in both
+  `clearer.py` and `auto_clearer.py` gave no indication that audio files would
+  NOT be caught by `clear file` or `autoclear file`. Added a clearly marked
+  📌 note to both modules' `help_extra`.
+
+### Added — Nice-to-Have
+
+- **F6 — Added `other` type to `auto_clearer.py`** — Previously `_TYPES`
+  contained only `{pic, txt, vid, file, media, link}` with no `"other"` type.
+  There was no way to auto-clear stickers, polls, contacts, locations, voice
+  messages, or audio files via auto_clearer (asymmetric with `clearer.py`
+  which supports `clear all`). Added `"other"` to `_SINGLE_TYPES`, `_TYPES`,
+  `_DEFAULT`, and the status display. Default state is `off` to prevent
+  accidental deletion of stickers and voice messages. Existing settings files
+  without the `"other"` key are auto-migrated on next load (the migration
+  logic at `_DEFAULT.keys() <= old_keys` now covers both `link` and `other`
+  simultaneously). Help text updated with `other` description and usage example.
+
+- **F7 — Self-delete guard for `autoclear` command messages** — When `txt`
+  or `link` filter with scope=2 (user) or scope=3 (both) was active in a bot
+  chat, sending an `autoclear` command (which is classified as `txt`) caused
+  `_on_outgoing` to delete the command message immediately after `_on_command`
+  processed it — the message disappeared with no visible confirmation in that
+  chat. Fixed by checking in `_try_auto_delete` whether the outgoing message
+  text starts with `"autoclear"` and was sent within the last 5 seconds; if so,
+  auto-deletion is skipped for that event. The `import time` statement has been
+  added. Uses `msg.date.timestamp()` for age calculation.
+
+### Changed
+
+- `auto_clearer._clear_past`: Added `_scope_matches(cfg["scope"], msg.out)` guard
+  before `_message_matches_filter` call. Now identical scope semantics to
+  `_try_auto_delete`. (F1)
+- `auto_clearer._try_auto_delete`: Added F7 self-delete guard block before the
+  filter loop. Added `import time` at module level.
+- `auto_clearer._DEFAULT`: Added `"other": {"state": False, "scope": 3}`. (F6)
+- `auto_clearer._TYPES`: Added `"other"`. (F6)
+- `auto_clearer._SINGLE_TYPES`: Added `"other"`. (F6)
+- `auto_clearer._load`: Migration check updated to `not (_DEFAULT.keys() <= old_keys)`.
+  Migration log message updated to "added missing types (link, other)". (F6)
+- `auto_clearer._cmd_status`: Added `"other"` to `type_order` and `type_labels`. (F6)
+- `info_handler._photo_details`: Added `elif isinstance(media, MessageMediaDocument)`
+  branch with document-photo details. (F2)
+- `info_handler._file_details`: Removed unreachable `DocumentAttributeAudio` branches.
+  Added explanatory comment. Kept `DocumentAttributeAnimated` branch (reachable for
+  GIF files sent as document attachments). (F3)
+- `info_handler._other_details`: Added `DocumentAttributeAudio` with `voice=False`
+  branch showing "Audio File" label, artist, title, duration. (F3 companion)
+- `info_handler._link_details`: Added `ReplyInlineMarkup` / `KeyboardButtonUrl`
+  section at end of function. (F4)
+- `info_handler` imports: Added `DocumentAttributeImageSize`, `KeyboardButtonUrl`,
+  `ReplyInlineMarkup`. (F2, F4)
+- `clearer.py` `help_extra`: Added audio-as-`other` 📌 note. (F5)
+- `auto_clearer.py` `help_extra`: Added audio-as-`other` 📌 note + `other` type
+  entry and usage example. (F5, F6)
+- Module docstrings updated to reflect all v3.1.7 changes.
+
+---
+
 ## [3.1.6] — 2026-09-12
 
 **Source:** AI (deep bug investigation + multi-requirement implementation;

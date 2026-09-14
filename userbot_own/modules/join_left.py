@@ -842,12 +842,14 @@ async def _add_to_all_other_folders_exclusion(
     cache: dict[int, tuple[float, list[DialogFilter]]],
 ) -> None:
     """
-    I2 + Req 4: Add a chat to the exclude_peers of every OTHER editable folder
+    Req 4: Add a chat to the exclude_peers of every OTHER editable folder
     so it only appears in the joined* folder(s).
 
-    Improvements over v3.1.5:
     - Skips ALL joined* folders (not just the base 'joined')
-    - Type-aware: only excludes from folders whose type flags include this entity
+    - Excludes from ALL other editable folders unconditionally
+      (reverted from the v3.1.6 type-aware I2 approach which was too
+      conservative and caused newly joined chats to appear in other folders
+      when those folders had broadcasts/groups flags set to False)
     - N4: respects the 100-entry exclude_peers capacity per folder
     - N2: uses write-through cache after each successful update
     """
@@ -867,14 +869,6 @@ async def _add_to_all_other_folders_exclusion(
     for folder in folders:
         if folder.id in joined_ids:
             continue  # skip all joined* folders
-
-        # I2: type-aware — skip if folder's type flags can't show this entity type
-        if not _folder_would_show_entity(folder, entity):
-            log.debug(
-                "[Account%d] Skipping exclusion for folder '%s': type flags don't match %s.",
-                account_index, _folder_title(folder), type(entity).__name__,
-            )
-            continue
 
         existing_excl = list(folder.exclude_peers or [])
         excl_ids      = {_peer_id(p) for p in existing_excl} - {None}
@@ -1453,7 +1447,7 @@ class JoinLeft(Module):
         self,
         client: TelegramClient,
         entities: list[tuple[str, str | int]],
-    ) -> tuple[list, list, list]:
+    ) -> tuple[list, list]:
         """
         I3: Pre-join validation phase for invite_link entities only.
 
@@ -1461,14 +1455,19 @@ class JoinLeft(Module):
         Non-invite entities (username, channel_id, numeric_id) pass through
         unchanged to avoid extra API calls that could trigger FloodWait.
 
+        Purpose: ONLY detect invalid/expired links so the entire operation can
+        be cancelled early.  ChatInviteAlready and UserAlreadyParticipantError
+        are NOT treated as "already joined" here — they go to `remaining` so
+        the main loop's existing robust handlers deal with them.  This avoids
+        false "already a member" reports caused by stale Telegram server state
+        or a previous session's left-then-rejoin scenario.
+
         Returns:
-        - invalid: [(identifier, reason_str), ...]   — expired/invalid links
-        - already_joined: [(identifier, entity|None), ...] — already members
-        - remaining: [(entity_type, identifier), ...]  — valid entities to join
+        - invalid:   [(identifier, reason_str), ...] — expired/revoked links
+        - remaining: [(entity_type, identifier), ...] — all other entities
         """
-        invalid:        list[tuple] = []
-        already_joined: list[tuple] = []
-        remaining:      list[tuple] = []
+        invalid:   list[tuple] = []
+        remaining: list[tuple] = []
         cache_updated = False
 
         for entity_type, identifier in entities:
@@ -1481,7 +1480,7 @@ class JoinLeft(Module):
                 invalid.append((identifier, "لینک قابل parse نیست"))
                 continue
 
-            # Cache hit → treat as valid (we already verified this hash recently)
+            # Cache hit → already verified recently; skip the API call
             cached = self._invite_cache.get(invite_hash)
             if cached is not None:
                 cached_ts = cached.get("ts", 0)
@@ -1499,11 +1498,11 @@ class JoinLeft(Module):
                 cache_updated = True
                 continue
             except errors.UserAlreadyParticipantError:
-                # Some Telegram API layers raise this from CheckChatInviteRequest
-                already_joined.append((identifier, None))
-                async with self._invite_cache_lock:
-                    self._invite_cache[invite_hash] = {"username": None, "ts": time.time()}
-                cache_updated = True
+                # We are (or recently were) a member.  Let the main loop handle
+                # it — don't assume membership is still valid (the user may have
+                # left since the last session and Telegram's server might still
+                # transiently return this error).
+                remaining.append((entity_type, identifier))
                 continue
             except Exception as exc:
                 # Unknown error — don't cancel; let the join phase handle it
@@ -1515,14 +1514,16 @@ class JoinLeft(Module):
                 continue
 
             if isinstance(result, ChatInviteAlready):
-                # We are already a member
-                already_joined.append((identifier, result.chat))
-                async with self._invite_cache_lock:
-                    self._invite_cache[invite_hash] = {"username": None, "ts": time.time()}
-                cache_updated = True
+                # Telegram says we're a member — but this can be stale after
+                # leaving and re-checking within the same Telegram server cache
+                # window.  Route to remaining so the main loop verifies and
+                # handles it (UserAlreadyParticipantError → post-join actions).
+                remaining.append((entity_type, identifier))
             else:
-                # ChatInvite or ChatInvitePeek — valid, not yet joined
-                # Extract and cache the username for Layer 1 smart resolution
+                # ChatInvite or ChatInvitePeek — valid, not yet joined.
+                # Cache the username for Layer 1 smart resolution so that
+                # _resolve_invite_to_username hits the cache instead of making
+                # another CheckChatInviteRequest API call.
                 username: str | None = None
                 for attr in ("chat", "channel"):
                     obj = getattr(result, attr, None)
@@ -1537,7 +1538,7 @@ class JoinLeft(Module):
         if cache_updated:
             asyncio.create_task(self._save_invite_cache())
 
-        return invalid, already_joined, remaining
+        return invalid, remaining
 
     # ── Dispatcher ────────────────────────────────────────────────────────────
 
@@ -2127,10 +2128,9 @@ class JoinLeft(Module):
             asyncio.create_task(self._prune_expired_invite_cache())
 
         # ═══════════════════════════════════════════════════════════════════════
-        # Phase 0: I3 — Pre-validation of invite links
+        # Phase 0: I3 — Pre-validation of invite links (invalid/expired only)
         # ═══════════════════════════════════════════════════════════════════════
 
-        already_joined_pre: list[tuple] = []
         has_invite_links = any(t == 'invite_link' for t, _ in all_entities)
 
         if has_invite_links:
@@ -2143,7 +2143,10 @@ class JoinLeft(Module):
             except Exception:
                 pass
 
-            invalid_links, already_joined_pre, all_entities = await self._validate_invite_links(
+            # Returns only (invalid, remaining) — ChatInviteAlready and
+            # UserAlreadyParticipantError go to remaining so the main loop
+            # handles them; only truly expired/revoked links cancel the run.
+            invalid_links, all_entities = await self._validate_invite_links(
                 client, all_entities
             )
 
@@ -2164,35 +2167,6 @@ class JoinLeft(Module):
                     pass
                 self._track_delete_task(processing_msg, _AUTO_DELETE_DELAY)
                 return
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # Phase 0b: Process already-joined entries from validation
-        # ═══════════════════════════════════════════════════════════════════════
-
-        for ident, entity in already_joined_pre:
-            attempt_start = time.monotonic()
-            if entity is not None:
-                title = getattr(entity, "title", None) or str(ident)
-                results.append(f"ℹ️ [{title}] — قبلاً عضو بود (فولدر بروزرسانی شد)")
-                success_count += 1
-                join_times.append(time.monotonic() - attempt_start)
-                joined_entities.append(entity)
-                async with self._settings_lock:
-                    self._settings["joined_chats"][str(entity.id)] = \
-                        datetime.datetime.now(datetime.UTC).isoformat()
-                    await self._save_settings()
-                await self._post_join_actions(client, entity, self.cfg.index)
-            else:
-                results.append(f"ℹ️ [{str(ident)[:50]}] — قبلاً عضو بود")
-                success_count += 1
-                join_times.append(0.0)
-
-        pre_processed = len(already_joined_pre)
-
-        # If validation consumed all entities, jump to summary
-        if not all_entities and pre_processed > 0:
-            # Fall through to summary below (loop won't execute)
-            pass
 
         # ═══════════════════════════════════════════════════════════════════════
         # MAIN LOOP
@@ -2241,7 +2215,7 @@ class JoinLeft(Module):
                             success_count += 1
                             join_times.append(time.monotonic() - attempt_start)
 
-                        display_idx = pre_processed + idx
+                        display_idx = idx
                         await safe_edit(
                             f"🔄 در حال جوین... ({display_idx}/{total_entities}) {mode_label}\n"
                             f"آخرین: {results[-1] if results else '-'}"
@@ -2445,6 +2419,17 @@ class JoinLeft(Module):
                                 except Exception:
                                     pass
 
+                                # Fallback: if CheckChatInviteRequest failed to provide an
+                                # entity (e.g. raised an exception or returned ChatInvite),
+                                # and Layer 1 had resolved the invite to a public username,
+                                # use get_entity to obtain the entity so _post_join_actions
+                                # (archive, mute, folder, exclusion) can still run.
+                                if joined_entity is None and resolved_username:
+                                    try:
+                                        joined_entity = await client.get_entity(f"@{resolved_username}")
+                                    except Exception:
+                                        pass
+
                                 title = getattr(joined_entity, "title", None) if joined_entity else None
                                 results.append(f"ℹ️ [{title or identifier}] — قبلاً عضو بود (جوین موفق)")
                                 success_count += 1
@@ -2535,7 +2520,7 @@ class JoinLeft(Module):
                     break
 
             # ── Live progress update ───────────────────────────────────────────
-            display_idx = pre_processed + idx
+            display_idx = idx
             await safe_edit(
                 f"🔄 در حال جوین... ({display_idx}/{total_entities}) {mode_label}\n"
                 f"آخرین: {results[-1] if results else '-'}\n"

@@ -16,7 +16,7 @@ Scope:
     3 = both
 
 Types:
-    file | vid | pic | link | txt | media
+    file | vid | pic | link | txt | media | other
 
 Message Classification System (v1.6.1+)
 ────────────────────────────────────────
@@ -32,12 +32,24 @@ The `link` type detection covers:
 • MessageEntityUrl / MessageEntityTextUrl (clickable URLs in text)
 • KeyboardButtonUrl in ReplyInlineMarkup (inline keyboard URL buttons)
 • Raw URL patterns in text (fallback)
+
+The `other` type covers:
+• Stickers (static, animated TGS, premium WebM)
+• Voice messages
+• Audio files (.mp3, .flac, .ogg with DocumentAttributeAudio)
+• Polls, contacts, locations, venues, dice, games, invoices, etc.
+• Any message not matching file/vid/pic/link/txt
+
+Note: audio file attachments (.mp3, .flac, .ogg) are classified as
+`other` (not `file`) because is_file() excludes documents that have
+DocumentAttributeAudio. Use `autoclear other on 1` to auto-clear them.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from telethon import TelegramClient, events
 from telethon.tl.types import User
@@ -58,17 +70,22 @@ log = logging.getLogger(__name__)
 
 # ── Type / scope constants ────────────────────────────────────────────────────
 
-_SINGLE_TYPES: tuple[str, ...] = ("file", "vid", "pic", "link", "txt")
+# F6: Added "other" to _SINGLE_TYPES — covers stickers, voice, polls, contacts,
+# locations, audio files, and any other media type not in the named categories.
+_SINGLE_TYPES: tuple[str, ...] = ("file", "vid", "pic", "link", "txt", "other")
 
 _MEDIA_TYPES: frozenset[str] = frozenset({"pic", "vid", "file"})
 
-_TYPES: frozenset[str] = frozenset({"pic", "txt", "vid", "file", "media", "link"})
+# F6: Added "other" to _TYPES
+_TYPES: frozenset[str] = frozenset({"pic", "txt", "vid", "file", "media", "link", "other"})
 
 _SCOPES: frozenset[int] = frozenset({1, 2, 3})
 
 
 # ── Default per-type settings ─────────────────────────────────────────────────
 
+# F6: Added "other" with state=False (off by default to prevent accidental
+# deletion of stickers, voice messages, and other casual message types).
 _DEFAULT: dict[str, dict] = {
     "file":  {"state": False, "scope": 3},
     "vid":   {"state": False, "scope": 3},
@@ -76,6 +93,7 @@ _DEFAULT: dict[str, dict] = {
     "link":  {"state": False, "scope": 3},
     "txt":   {"state": False, "scope": 3},
     "media": {"state": False, "scope": 3},
+    "other": {"state": False, "scope": 3},
 }
 
 
@@ -138,7 +156,7 @@ class AutoClearer(Module):
     # ── Settings persistence ──────────────────────────────────────────────
 
     def _load(self) -> None:
-        """Load settings from disk, auto-migrating old files missing `link`."""
+        """Load settings from disk, auto-migrating old files missing `link` or `other`."""
         data, err = read_json_file(self._settings_file)
         if err is not None:
             self._log_error("AutoClearer load error: %s", err)
@@ -172,12 +190,13 @@ class AutoClearer(Module):
                     }
                 self._bots[bid] = entry
 
+            # F6: also trigger migration if "other" is missing (in addition to "link")
             old_keys = set(g.keys()) if "global" in data else set()
-            if old_keys and "link" not in old_keys:
+            if old_keys and not (_DEFAULT.keys() <= old_keys):
                 migrated = True
 
             if migrated:
-                self._log_info("Settings migrated: added `link` type.")
+                self._log_info("Settings migrated: added missing types (link, other).")
                 self._save()
 
         except Exception as exc:
@@ -230,6 +249,26 @@ class AutoClearer(Module):
         if getattr(msg, "pinned", False):
             return
 
+        # F7: Self-delete guard — prevent the `autoclear` command message
+        # itself from being deleted by an active txt/link filter (scope=2/3).
+        # When the user sends an `autoclear` command in a bot chat, both
+        # _on_command and _on_outgoing fire. If the command text is classified
+        # as `txt` or `link` and the matching filter + scope=2/3 is active,
+        # safe_delete would fire on the command message immediately after
+        # processing — the message would vanish with no confirmation visible.
+        # Guard: if the outgoing message starts with "autoclear" and was sent
+        # within the last 5 seconds, skip auto-deletion for this event.
+        if is_outgoing:
+            msg_text_raw = (
+                getattr(msg, "text", None) or getattr(msg, "message", None) or ""
+            ).strip()
+            if msg_text_raw.lower().startswith("autoclear"):
+                msg_date = getattr(msg, "date", None)
+                if msg_date is not None:
+                    age_seconds = time.time() - msg_date.timestamp()
+                    if age_seconds < 5.0:
+                        return
+
         bot = await self._is_bot_chat(event.client, event.chat_id)
         if bot is None:
             return
@@ -278,7 +317,7 @@ class AutoClearer(Module):
                 "❌ **فرمت نادرست.** استفاده:\n"
                 "• `autoclear <type> <on/off> <1/2/3>`\n"
                 "• `autoclear status`\n\n"
-                "**انواع:** `file`, `vid`, `pic`, `link`, `txt`, `media`"
+                "**انواع:** `file`, `vid`, `pic`, `link`, `txt`, `media`, `other`"
             )
             return
 
@@ -290,7 +329,7 @@ class AutoClearer(Module):
             await self._safe_edit(
                 event,
                 f"❌ نوع نامعتبر: `{ftype}`.\n"
-                f"**انواع مجاز:** `file`, `vid`, `pic`, `link`, `txt`, `media`"
+                f"**انواع مجاز:** `file`, `vid`, `pic`, `link`, `txt`, `media`, `other`"
             )
             return
         if action not in ("on", "off"):
@@ -386,7 +425,16 @@ class AutoClearer(Module):
     async def _clear_past(
         self, client: TelegramClient, entity, settings: dict[str, dict]
     ) -> int:
-        """Delete historical messages matching the given filter settings."""
+        """Delete historical messages matching the given filter settings.
+
+        F1 FIX (v3.1.7): Added scope check using msg.out before calling
+        _message_matches_filter. Previously, _clear_past deleted every message
+        matching the type filter regardless of the configured scope (1=bot,
+        2=user, 3=both), causing silent data loss when scope was not 3.
+        Example: `autoclear txt on 1` (bot messages only) would retroactively
+        delete the user's own text messages too. Now `_scope_matches()` is
+        called identically to how it is called in `_try_auto_delete()`.
+        """
         ids: list[int] = []
         history_limit = self.context.settings.history_limit
         try:
@@ -400,7 +448,13 @@ class AutoClearer(Module):
                 if getattr(msg, "pinned", False):
                     continue
                 for ftype, cfg in settings.items():
-                    if cfg["state"] and _message_matches_filter(msg, ftype):
+                    if not cfg["state"]:
+                        continue
+                    # F1: Respect the configured scope during historical cleanup.
+                    # msg.out is True when the message was sent by this account.
+                    if not _scope_matches(cfg["scope"], bool(getattr(msg, "out", False))):
+                        continue
+                    if _message_matches_filter(msg, ftype):
                         ids.append(msg.id)
                         break
         except Exception as exc:
@@ -419,7 +473,8 @@ class AutoClearer(Module):
     async def _cmd_status(self, event, client: TelegramClient) -> None:
         lines = ["📊 **وضعیت Auto-Clear:**\n", "**تنظیمات کلی:**"]
 
-        type_order = ["file", "vid", "pic", "link", "txt", "media"]
+        # F6: Added "other" to type_order and type_labels
+        type_order = ["file", "vid", "pic", "link", "txt", "media", "other"]
         type_labels = {
             "file":   "فایل",
             "vid":    "ویدیو",
@@ -427,6 +482,7 @@ class AutoClearer(Module):
             "link":   "لینک",
             "txt":    "متن",
             "media":  "رسانه (عکس+ویدیو+فایل)",
+            "other":  "سایر (استیکر/ویس/نظرسنجی/...)",
         }
         scope_labels = {1: "بات", 2: "شما", 3: "هر دو"}
 
@@ -479,12 +535,15 @@ help_extra = (
     "• `autoclear <type> off <scope>` | غیرفعال‌سازی پاک‌سازی خودکار\n"
     "• `autoclear status` | نمایش وضعیت فعلی\n\n"
     "انواع پیام (type):\n"
-    "• `file` | فایل‌های ضمیمه\n"
+    "• `file` | فایل‌های ضمیمه (PDF, ZIP, و غیره)\n"
     "• `vid` | ویدیوها و GIF\n"
     "• `pic` | عکس‌ها\n"
     "• `link` | پیام‌های حاوی لینک یا WebPage\n"
     "• `txt` | متن خالص بدون لینک\n"
-    "• `media` | عکس، ویدیو و فایل بدون لینک\n\n"
+    "• `media` | عکس، ویدیو و فایل بدون لینک\n"
+    "• `other` | سایر: استیکر، نظرسنجی، مخاطب، موقعیت مکانی، ویس و سایر\n\n"
+    "📌 فایل‌های صوتی (mp3, flac, ogg) به عنوان `other` طبقه‌بندی می‌شوند، نه `file`.\n"
+    "   برای پاک کردن خودکار آن‌ها از `autoclear other on 1` استفاده کنید.\n\n"
     "محدوده (scope):\n"
     "• `1` | فقط پیام‌های ربات\n"
     "• `2` | فقط پیام‌های شما\n"
@@ -497,6 +556,7 @@ help_extra = (
     "• `autoclear pic on 1` | پاک‌سازی فقط عکس‌های ربات\n"
     "• `autoclear link on 3` | پاک‌سازی خودکار لینک‌ها\n"
     "• `autoclear media off 3` | غیرفعال کردن رسانه‌ها\n"
+    "• `autoclear other on 1` | پاک‌سازی خودکار استیکر و ویس ربات\n"
     "• `autoclear status` | نمایش وضعیت فعلی\n\n"
     "سیستم طبقه‌بندی:\n"
     "هر پیام فقط یک نوع دارد بر اساس اولویت زیر:\n"
@@ -504,8 +564,11 @@ help_extra = (
     "نکات مهم:\n"
     "• `media` شامل `link` نمی‌شود\n"
     "• `link` شامل دکمه‌های شیشه‌ای با لینک هم می‌شود\n"
+    "• `other` شامل استیکر، ویس، نظرسنجی، مخاطب، موقعیت مکانی و صدا هم می‌شود\n"
+    "• `other` پیش‌فرض خاموش است تا از حذف تصادفی استیکر/ویس جلوگیری شود\n"
     "• تنظیمات در `autoclear.json` ذخیره می‌شوند\n"
     "• پیام‌های پین شده هرگز پاک نمی‌شوند\n"
+    "• هنگام فعال‌سازی، پیام‌های قدیمی‌ِ آن نوع هم پاک می‌شوند (با رعایت scope)\n"
 )
 
 AutoClearer.help_text = help_text

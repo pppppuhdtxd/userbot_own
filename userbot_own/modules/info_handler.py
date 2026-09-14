@@ -10,7 +10,7 @@ Features:
 - Basic info: ID, date, sender, chat type
 - Message classification: file/vid/pic/link/txt/other (priority system)
 - Media details: photo, video, file, sticker, voice, video note
-- Link details: WebPage preview info, URL entities
+- Link details: WebPage preview info, URL entities, inline keyboard URL buttons
 - Message flags: edited, forwarded, pinned, silent, mentioned
 - Text formatting entities: bold, italic, code, spoiler, mention, etc.
 - Reply chain: shows replied-to message info
@@ -23,6 +23,26 @@ Each message is classified into exactly ONE type based on priority:
 
 This module uses the shared `classify_message()` helper for consistency
 with `clearer.py` and `auto_clearer.py`.
+
+v3.1.7 Changes:
+  F2 — _photo_details now handles document-photos (images sent as document
+       attachments, e.g. photo.jpg). Previously it returned empty details for
+       any pic-classified message whose media was MessageMediaDocument instead
+       of MessageMediaPhoto. Now shows File ID, size, MIME type, filename,
+       extension, and image dimensions (DocumentAttributeImageSize if present).
+
+  F3 — Removed dead audio-handling branches from _file_details.
+       DocumentAttributeAudio checks (lines 307-318 in v3.1.6) were
+       permanently unreachable because is_file() explicitly returns False when
+       is_audio() is True. Audio documents are classified as 'other', never
+       'file'. The matching audio detail display has been moved to _other_details
+       where it is actually reachable.
+
+  F4 — _link_details now shows inline keyboard URL buttons (glass buttons /
+       دکمه‌های شیشه‌ای). Previously, a message classified as 'link' solely
+       because of KeyboardButtonUrl in its reply_markup showed only the section
+       header with no content. Now lists button labels and URLs (capped at 5,
+       URLs truncated at 100 chars).
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -34,8 +54,10 @@ from telethon.tl.types import (
     DocumentAttributeAnimated,
     DocumentAttributeAudio,
     DocumentAttributeFilename,
+    DocumentAttributeImageSize,
     DocumentAttributeSticker,
     DocumentAttributeVideo,
+    KeyboardButtonUrl,
     Message,
     MessageEntityBlockquote,
     MessageEntityBold,
@@ -64,6 +86,7 @@ from telethon.tl.types import (
     MessageMediaPoll,
     MessageMediaVenue,
     MessageMediaWebPage,
+    ReplyInlineMarkup,
     User,
     UserStatusOffline,
     UserStatusOnline,
@@ -278,7 +301,15 @@ class InfoHandler(Module):
         return ""
 
     def _file_details(self, msg: Message) -> str:
-        """Details for file-type messages."""
+        """Details for file-type messages.
+
+        NOTE (F3, v3.1.7): The DocumentAttributeAudio branches that existed
+        here in v3.1.6 were permanently unreachable dead code. is_file() in
+        utils.py explicitly returns False when is_audio() is True, so any
+        document with DocumentAttributeAudio is classified as 'other', never
+        'file'. The audio detail display has been moved to _other_details()
+        where is_audio documents actually arrive.
+        """
         media = msg.media
         if not isinstance(media, MessageMediaDocument) or not media.document:
             return ""
@@ -300,22 +331,13 @@ class InfoHandler(Module):
                 lines.append(f"• نام فایل: `{attr.file_name}`")
                 break
 
+        # DocumentAttributeAnimated: GIF file sent as document without
+        # DocumentAttributeVideo (e.g. uploaded as a .gif file attachment).
+        # This IS reachable: is_video() returns False (no AttributeVideo),
+        # is_file() returns True (has AttributeFilename, no audio/sticker).
         for attr in media.document.attributes:
             if isinstance(attr, DocumentAttributeAnimated):
                 lines.append("• نوع: **GIF (Animated)**")
-                break
-            elif isinstance(attr, DocumentAttributeAudio) and attr.voice:
-                # Voice message: already the most specific case — no further
-                # AudioAttribute fields (performer/title) apply to voice.
-                lines.append("• نوع: **Voice Message**")
-                break
-            elif isinstance(attr, DocumentAttributeAudio):
-                # Regular audio file (attr.voice is False in this branch).
-                lines.append("• نوع: **Audio**")
-                if attr.performer:
-                    lines.append(f"• Artist: `{attr.performer}`")
-                if attr.title:
-                    lines.append(f"• Title: `{attr.title}`")
                 break
 
         return "\n".join(lines)
@@ -348,28 +370,71 @@ class InfoHandler(Module):
         return "\n".join(lines)
 
     def _photo_details(self, msg: Message) -> str:
-        """Details for photo-type messages."""
+        """Details for photo-type messages.
+
+        F2 (v3.1.7): classify_message() can return 'pic' for two kinds of
+        media:
+        1. MessageMediaPhoto   — native photo sent via the photo UI
+        2. MessageMediaDocument — image file sent as a document attachment
+           (e.g. photo.jpg, image.png) that has an image extension but no
+           DocumentAttributeVideo or DocumentAttributeSticker.
+
+        Previously this method only handled case 1 and returned "" for case 2,
+        leaving the 'جزئیات عکس' section silently empty for document-photos.
+        Now both cases produce a details section.
+        """
         media = msg.media
-        if not isinstance(media, MessageMediaPhoto) or not media.photo:
-            return ""
 
-        lines = ["**🖼 جزئیات عکس:**"]
-        lines.append(f"• Photo ID: `{media.photo.id}`")
+        if isinstance(media, MessageMediaPhoto) and media.photo:
+            # ── Native photo (MessageMediaPhoto) ──────────────────────────
+            lines = ["**🖼 جزئیات عکس:**"]
+            lines.append(f"• Photo ID: `{media.photo.id}`")
 
-        if hasattr(media.photo, "sizes") and media.photo.sizes:
-            max_size = max(
-                (s for s in media.photo.sizes if hasattr(s, "w") and hasattr(s, "h")),
-                key=lambda s: getattr(s, "w", 0) * getattr(s, "h", 0),
-                default=None,
-            )
-            if max_size:
-                w = getattr(max_size, "w", "?")
-                h = getattr(max_size, "h", "?")
-                lines.append(f"• ابعاد: `{w}×{h}`")
-                if hasattr(max_size, "size"):
-                    lines.append(f"• حجم: `{get_file_size(max_size.size)}`")
+            if hasattr(media.photo, "sizes") and media.photo.sizes:
+                max_size = max(
+                    (s for s in media.photo.sizes if hasattr(s, "w") and hasattr(s, "h")),
+                    key=lambda s: getattr(s, "w", 0) * getattr(s, "h", 0),
+                    default=None,
+                )
+                if max_size:
+                    w = getattr(max_size, "w", "?")
+                    h = getattr(max_size, "h", "?")
+                    lines.append(f"• ابعاد: `{w}×{h}`")
+                    if hasattr(max_size, "size"):
+                        lines.append(f"• حجم: `{get_file_size(max_size.size)}`")
 
-        return "\n".join(lines)
+            return "\n".join(lines)
+
+        elif isinstance(media, MessageMediaDocument) and media.document:
+            # ── Document-photo (image file sent as document attachment) ───
+            # is_photo() returns True for MessageMediaDocument whose filename
+            # ends in .jpg/.jpeg/.png/.bmp/.webp AND has no DocumentAttribute-
+            # Video or DocumentAttributeSticker. Show document-level details.
+            lines = ["**🖼 جزئیات عکس (فایل سند):**"]
+            lines.append(f"• File ID: `{media.document.id}`")
+
+            doc_size = getattr(media.document, "size", None)
+            if doc_size is not None:
+                lines.append(f"• حجم: `{get_file_size(doc_size)}`")
+
+            mime = getattr(media.document, "mime_type", None)
+            if mime:
+                lines.append(f"• MIME: `{mime}`")
+
+            for attr in (media.document.attributes or []):
+                if isinstance(attr, DocumentAttributeFilename):
+                    lines.append(f"• نام فایل: `{attr.file_name}`")
+                    ext = get_file_extension(media)
+                    if ext:
+                        lines.append(f"• فرمت: `{ext}`")
+                elif isinstance(attr, DocumentAttributeImageSize):
+                    # DocumentAttributeImageSize carries the pixel dimensions
+                    # of image documents (fields: w, h).
+                    lines.append(f"• ابعاد: `{attr.w}×{attr.h}`")
+
+            return "\n".join(lines)
+
+        return ""
 
     @staticmethod
     def _utf16_slice(text: str, offset: int, length: int) -> str:
@@ -391,7 +456,16 @@ class InfoHandler(Module):
             return text[offset:offset + length]
 
     def _link_details(self, msg: Message) -> str:
-        """Details for link-type messages (WebPage or URL entities)."""
+        """Details for link-type messages (WebPage or URL entities).
+
+        F4 (v3.1.7): Added inline keyboard URL button display. is_link() in
+        utils.py has three detection paths: (1) MessageMediaWebPage,
+        (2) URL entities, (3) KeyboardButtonUrl in ReplyInlineMarkup. Previously
+        only paths 1 and 2 produced output here. A message classified as 'link'
+        solely via path 3 would show only the section header with no content.
+        Now, if reply_markup contains KeyboardButtonUrl entries, they are listed
+        (capped at 5, URLs truncated at 100 chars for readability).
+        """
         lines = ["**🔗 جزئیات لینک:**"]
 
         media = msg.media
@@ -440,10 +514,44 @@ class InfoHandler(Module):
                     lines.append(f"  - `{url_text}`")
                 shown += 1
 
+        # F4: Inline keyboard URL buttons (glass/web buttons — دکمه‌های شیشه‌ای)
+        # is_link() classifies a message as 'link' when ReplyInlineMarkup
+        # contains at least one KeyboardButtonUrl. Display those buttons here.
+        reply_markup = getattr(msg, "reply_markup", None)
+        if isinstance(reply_markup, ReplyInlineMarkup):
+            url_buttons: list = []
+            for row in (getattr(reply_markup, "rows", None) or []):
+                for button in (getattr(row, "buttons", None) or []):
+                    if isinstance(button, KeyboardButtonUrl):
+                        url_buttons.append(button)
+
+            if url_buttons:
+                lines.append(f"• 🔘 دکمه‌های لینک (inline keyboard): `{len(url_buttons)}`")
+                shown = 0
+                for btn in url_buttons:
+                    if shown >= 5:
+                        remaining = len(url_buttons) - 5
+                        if remaining > 0:
+                            lines.append(f"  … و `{remaining}` دکمه دیگر")
+                        break
+                    label = (getattr(btn, "text", "") or "?")
+                    url   = (getattr(btn, "url",  "") or "")
+                    if len(url) > 100:
+                        url = url[:100] + "…"
+                    lines.append(f"  - `{label}` → `{url}`")
+                    shown += 1
+
         return "\n".join(lines)
 
     def _other_details(self, msg: Message) -> str:
-        """Details for 'other' type messages (sticker, voice, contact, etc.)."""
+        """Details for 'other' type messages (sticker, voice, audio, contact, etc.).
+
+        v3.1.7: Added regular audio file handling (DocumentAttributeAudio with
+        voice=False — mp3, flac, ogg, etc.). Audio files are classified as
+        'other' (not 'file') because is_file() returns False when is_audio()
+        is True. Previously there was no detail display for non-voice audio
+        files in this section. Now shows type label, artist, title, duration.
+        """
         media = msg.media
         lines = ["**📦 جزئیات سایر:**"]
 
@@ -511,6 +619,22 @@ class InfoHandler(Module):
                 elif isinstance(attr, DocumentAttributeAudio) and attr.voice:
                     lines.append("• نوع: **Voice Message**")
                     if attr.duration:
+                        lines.append(f"• Duration: `{attr.duration}s`")
+                    break
+                elif isinstance(attr, DocumentAttributeAudio):
+                    # F3 companion (v3.1.7): Regular audio file (.mp3, .flac,
+                    # .ogg, etc.) — DocumentAttributeAudio with voice=False.
+                    # These are classified as 'other' (not 'file') because
+                    # is_file() explicitly excludes is_audio() documents.
+                    # The matching detail display was removed from _file_details
+                    # (where it was dead code) and placed here where audio
+                    # documents actually arrive.
+                    lines.append("• نوع: **Audio File**")
+                    if getattr(attr, "performer", None):
+                        lines.append(f"• Artist: `{attr.performer}`")
+                    if getattr(attr, "title", None):
+                        lines.append(f"• Title: `{attr.title}`")
+                    if getattr(attr, "duration", None):
                         lines.append(f"• Duration: `{attr.duration}s`")
                     break
 
@@ -722,11 +846,14 @@ help_extra = (
     "• چت | نوع چت، عنوان، لینک عمومی، تعداد اعضا\n"
     "• Reply | اطلاعات پیام reply شده\n\n"
     "جزئیات اختصاصی هر نوع:\n"
-    "• فایل | File ID, حجم، فرمت، MIME type, Artist/Title\n"
-    "• ویدیو | Video ID, مدت، ابعاد، Streaming support\n"
+    "• فایل | File ID, حجم، فرمت، MIME type\n"
+    "• ویدیو | Video ID, مدت، ابعاد، Streaming support, نوع (دایره‌ای/معمولی)\n"
     "• عکس | Photo ID, ابعاد بزرگ‌ترین سایز، حجم تقریبی\n"
-    "• لینک | WebPage Preview شامل URL, Site, Title, Description\n"
-    "• سایر | Contact, Location, Poll, Sticker, Voice\n\n"
+    "  ↳ عکس ارسال‌شده به صورت فایل سند هم پشتیبانی می‌شود (File ID, حجم، ابعاد)\n"
+    "• لینک | WebPage Preview (URL, Site, Title, Description)\n"
+    "  ↳ URL entities در متن\n"
+    "  ↳ دکمه‌های شیشه‌ای (inline keyboard URL buttons)\n"
+    "• سایر | Contact, Location, Poll, Sticker, Voice, Audio File\n\n"
     "ویژگی‌های پیام:\n"
     "• ویرایش‌شده، فوروارد شده، سنجاق شده\n"
     "• بی‌صدا، منشن شده، خروجی\n"
@@ -734,10 +861,13 @@ help_extra = (
     "مثال‌ها:\n"
     "• reply روی یک عکس + `info` | Photo ID، ابعاد، حجم\n"
     "• reply روی یک ویدیو + `info` | مدت، ابعاد، MIME\n"
-    "• reply روی پیام متنی با لینک + `info` | WebPage preview\n\n"
+    "• reply روی پیام متنی با لینک + `info` | WebPage preview\n"
+    "• reply روی پیام با دکمه شیشه‌ای + `info` | دکمه‌ها و URLهای آن‌ها\n"
+    "• reply روی فایل صوتی + `info` | Artist, Title, Duration\n\n"
     "نکات مهم:\n"
     "• این دستور در هر چتی قابل استفاده است\n"
     "• حتماً باید به یک پیام reply شود\n"
+    "• فایل‌های صوتی (.mp3, .flac) به عنوان 'سایر' طبقه‌بندی می‌شوند\n"
     "• اطلاعات کامل WebPage برای لینک‌های deep link ربات‌ها هم نمایش داده می‌شود\n"
 )
 

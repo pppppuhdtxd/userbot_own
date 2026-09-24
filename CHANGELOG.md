@@ -5,6 +5,174 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.1.8] — 2026-09-14
+
+**Source:** AI (multi-round investigation across two independent bug reports;
+root cause confirmed via Telethon exception-hierarchy research for the first,
+exhaustive dual-path code trace — including a corrected re-investigation after
+an initial hypothesis was ruled out by the project owner — for the second;
+scope approved by project owner before delivery.)
+
+### Fixed — Critical
+
+- **G1 — `InviteHashExpiredError` not caught in `_validate_invite_links`
+  (`join_left.py`), causing expired invite links to slip through pre-join
+  validation** — `InviteHashExpiredError` is a distinct Telethon exception
+  from `InviteHashInvalidError`: both are direct subclasses of
+  `BadRequestError`, siblings to each other, not related by inheritance.
+  Telegram raises `InviteHashExpiredError` specifically for links that have
+  run past their time/usage expiry (the most common real-world "bad link"
+  case), while `InviteHashInvalidError` covers malformed/revoked hashes.
+  `_validate_invite_links` only caught the latter, so an expired link fell
+  through to the generic `except Exception` handler, which explicitly does
+  **not** cancel the batch — the expired link was silently treated as valid
+  and passed to the main join loop alongside good links. Symptom: sending a
+  `join` command with several links, one of them genuinely expired, joined
+  the valid ones first, then failed on the expired one with an unclear
+  message — instead of the intended behavior of cancelling the **entire**
+  operation before joining anything if any link is bad. Fixed by catching
+  `(errors.InviteHashInvalidError, errors.InviteHashExpiredError)` together.
+  No other validation criteria were added — pre-join validation still checks
+  exclusively for expired/invalid invite links via `CheckChatInviteRequest`.
+
+### Added — Important
+
+- **G2 (revised) — `chat_kind` now classified exactly once per reaction,
+  threaded through instead of independently recomputed
+  (`reaction_commands.py`)** — Originally investigated as a suspected bug
+  causing reaction-triggered `clear` commands to intermittently restrict
+  deletion to the user's own messages in bot chats. After an exhaustive
+  trace of both reaction-detection routes (`UpdateMessageReactions` and
+  `UpdateEditMessage`), Gate 2's environment filter, `_classify_peer`'s
+  caching behavior, and `telethon_utils.resolve_id()`, no confirmed
+  divergence between the two independent classification computations was
+  found — both consistently produced the same, correct result for bot
+  chats. However, the investigation surfaced that `_execute_command_directly`
+  was recomputing the exact same classification a second time (via
+  `resolve_id()` + another `_classify_peer()` call) purely to rebuild a fact
+  Gate 2 had already established a few lines earlier in the same call chain.
+  This was the only structural point in the reaction pipeline where two
+  independent computations of one fact existed — a future change to either
+  could in principle make them disagree. Refactored so `_on_reaction_
+  update_impl` and `_on_edit_update_impl` each classify the peer exactly
+  once, then thread the resulting `chat_kind` string through
+  `_process_reaction_update()` into `_execute_command_directly()` for
+  building `MockEvent`'s `is_private`/`is_group`/`is_channel` flags.
+  `_check_environment_filter()` no longer performs its own classification
+  or async I/O — it now takes the pre-classified `chat_kind` directly and
+  only checks set membership. Net effect: one fewer function call per
+  reaction (and, on a cache miss, one fewer potential `get_entity()` call),
+  and the two classification points can no longer diverge by construction.
+  The most likely actual explanation for the originally reported symptom
+  remains a mundane, non-bug one: different emojis in `reactions.json`
+  mapped to different `clear` scopes (e.g. one to `clear all`, another to
+  `clear self`) — the new G7 instrumentation below will confirm this
+  immediately if the symptom recurs.
+
+### Fixed — Important
+
+- **G3 — `InviteHashExpiredError` in the main join loop's fallback
+  classification (`join_left.py`)** — Defense-in-depth for the rare race
+  where a link expires in the brief window between Phase 0 validation and
+  its turn in the main join loop. The `isinstance` check in the generic
+  exception handler near the end of `_handle_join` now includes
+  `InviteHashExpiredError` alongside `InviteHashInvalidError`, producing
+  the clear "❌ لینک منقضی یا نامعتبر" message instead of a garbled
+  generic error truncated from the raw exception string.
+
+- **G5 — `INVITE_HASH_EXPIRED` string check added to the generic exception
+  fallback (`join_left.py`)** — Secondary safety net alongside G3's
+  `isinstance` check, mirroring the existing `"INVITE_HASH_INVALID" in err`
+  string-fallback pattern already in place, in case a future Telethon
+  version or an unusual API response surfaces the error as raw text rather
+  than the typed exception.
+
+### Added — Nice-to-Have (Observability)
+
+- **G6 — Report transparency when a scan stops exactly at `history_limit`
+  (`clearer.py`)** — `iter_messages(limit=history_limit)` silently stops
+  yielding once `history_limit` messages have been returned, which is
+  indistinguishable from "reached the true end of chat history" unless
+  explicitly checked. Both the "no matches found" report and the final
+  success/partial-success report now add an explicit note
+  ("⚠️ اسکن به دلیل محدودیت تعداد متوقف شد — ممکن است پیام‌های قدیمی‌تری
+  باقی مانده باشند") whenever `scanned >= history_limit`. **`history_limit`
+  itself is completely unchanged** — still 2000 by default
+  (`config/models.py`, untouched), still applied identically to every chat
+  type. This is purely a transparency addition so a scan that hit the cap
+  is never silently mistaken for a fully-complete scan.
+
+- **G7 — Observability instrumentation for diagnosing filtering behavior
+  (`clearer.py`, `reaction_commands.py`)** — Added with no change to any
+  filtering logic, purely to make the exact values that decide deletion
+  scope visible without guesswork if a similar report ever recurs:
+  - `clearer.py`: the scan-start status message (visible in chat) and a
+    new debug log line now show `is_private`, `use_from_user`, and `scope`
+    for every `clear` run, regardless of whether it was typed directly or
+    triggered via a reaction.
+  - `reaction_commands.py`: the existing "✅ Reaction detected" debug log
+    line now also includes `chat_kind` — the exact chat-type classification
+    used to build that reaction's `MockEvent`.
+  - **Note for users:** if different emojis in your `reactions.json` are
+    mapped to different `clear` scopes (for example, one emoji to
+    `clear all` and another to `clear self`), each will correctly delete
+    a different set of messages — this is intentional, user-configured
+    behavior, not a bug. The new instrumentation will show exactly which
+    scope was used for any given reaction if this is ever unclear.
+
+### Changed
+
+- `join_left.py` `_validate_invite_links`: `except errors.InviteHashInvalidError:`
+  → `except (errors.InviteHashInvalidError, errors.InviteHashExpiredError):`. (G1)
+- `join_left.py` main join loop fallback classification: added
+  `errors.InviteHashExpiredError` to the `isinstance` check and
+  `"INVITE_HASH_EXPIRED"` to the string fallback; error message updated to
+  "❌ لینک منقضی یا نامعتبر". (G3, G5)
+- `join_left.py` `help_extra`: updated v3.1.6 changelog entry to remove the
+  stale I2 (type-aware exclusion) description — reverted in an earlier,
+  unversioned hotfix after it was found to suppress exclusion for the
+  common case of explicit-peer folders with no type flags set; added
+  v3.1.8 changelog entry.
+- `reaction_commands.py` `_check_environment_filter`: signature changed
+  from `async def _check_environment_filter(self, peer_id, client)` to
+  `def _check_environment_filter(self, chat_kind: str)` — no longer async,
+  no longer performs classification or I/O. (G2)
+- `reaction_commands.py` `_on_reaction_update_impl` / `_on_edit_update_impl`:
+  each now classifies the peer once via `_classify_peer()` and passes the
+  result to both `_check_environment_filter()` and
+  `_process_reaction_update(..., chat_kind=...)`. (G2)
+- `reaction_commands.py` `_process_reaction_update`: added `chat_kind: str = ""`
+  parameter, threaded through to `_execute_command_directly()`; "✅ Reaction
+  detected" log line extended with `chat_kind`. (G2, G7)
+- `reaction_commands.py` `_execute_command_directly`: added
+  `chat_kind: str = ""` parameter; uses it directly when supplied, falling
+  back to the original `resolve_id()` + `_classify_peer()` computation only
+  if not supplied (defensive backward-compatibility path). (G2)
+- `clearer.py` `_run_clear`: added debug log line and scan-start status
+  message line showing `is_private` / `use_from_user`; added
+  `history_limit`-hit transparency note to both the no-matches and final
+  reports. (G6, G7)
+- `clearer.py`, `join_left.py`, `reaction_commands.py` `help_extra`: notes
+  added documenting the `history_limit` transparency note and the
+  emoji-to-scope mapping clarification.
+- Module docstrings in `join_left.py`, `clearer.py`, and
+  `reaction_commands.py` updated with full v3.1.8 change descriptions.
+
+### Not Changed (explicitly, per investigation scope)
+
+- `helpers/utils.py` — no changes.
+- `config/models.py` — no changes. `history_limit` remains `2000` and is
+  applied identically to all chat types, as confirmed correct and
+  intentionally preserved per project owner's explicit instruction.
+- `auto_clearer.py` — no changes. Confirmed during investigation that this
+  module does not use the `MockEvent`/reaction-triggered code path at all
+  (G4 from the investigation report was ruled out on this basis).
+- `bridge.py` — no changes. `MockEvent` already correctly uses whatever
+  `is_private`/`is_group`/`is_channel` flags it's constructed with; the fix
+  was entirely in what values are computed and passed to it.
+
+---
+
 ## [3.1.7] — 2026-09-12
 
 **Source:** AI (systematic cross-module investigation; classification consistency

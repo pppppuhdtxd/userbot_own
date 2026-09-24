@@ -31,6 +31,36 @@ Features:
   `.reaction_scope` (private chats / bot chats / groups+supergroups /
   broadcast channels)
 
+v3.1.8 changes:
+- G2 (revised) — `chat_kind` is now classified exactly once per reaction,
+  at the point where Gate 2's environment filter is checked, and threaded
+  through `_process_reaction_update()` into `_execute_command_directly()`
+  for building `MockEvent`'s `is_private`/`is_group`/`is_channel` flags.
+  Previously, `_execute_command_directly` independently recomputed the
+  same classification via `telethon_utils.resolve_id()` +
+  `_classify_peer()` a second time. No confirmed divergence between the
+  two computations was ever found during investigation, but having two
+  separate computations of the same fact was the only structural point
+  in the whole reaction pipeline where a future change to either could
+  make them disagree. `_check_environment_filter()` is no longer async
+  and no longer does its own classification — it now takes the
+  pre-classified `chat_kind` string directly and just checks set
+  membership. Net effect: one fewer function call per reaction, and the
+  classification used to gate the reaction through Gate 2 is now
+  provably the exact same classification used to build MockEvent,
+  by construction rather than by careful-but-separate implementation.
+- G7 — Observability instrumentation: the "✅ Reaction detected" debug
+  log line now also includes `chat_kind`, so a reaction-triggered
+  command's exact chat-type classification is visible in the logs
+  alongside the emoji and resolved command text. Combined with
+  `clearer.py`'s own v3.1.8 instrumentation (`is_private`/
+  `use_from_user`/`scope` shown in the scan-start message and logs),
+  any future report of unexpectedly limited deletion via a
+  reaction-triggered `clear` is now immediately diagnosable: the logs
+  will show whether `chat_kind` was wrong, or whether the triggering
+  emoji is simply mapped to a more restrictive scope (e.g. `clear self`)
+  than a different emoji mapped to `clear all` — see reactions.json.
+
 v3.0.8 fixes:
 - `MockEvent` (modules/bridge.py) had no `is_private`/`is_group`/
   `is_channel` attributes at all, unlike a real Telethon NewMessage
@@ -396,26 +426,34 @@ class ReactionCommands(Module):
 
     # ── Environment Filter (Gate 2) ───────────────────────────────────────
 
-    async def _check_environment_filter(self, peer_id, client: TelegramClient) -> bool:
+    def _check_environment_filter(self, chat_kind: str) -> bool:
         """
         Gate 2: Check if the environment (chat type) is enabled.
 
         Returns True if the environment is ENABLED (should process).
         Returns False if the environment is DISABLED (should drop).
 
-        v3.0.8: delegates classification to _classify_peer() (shared with
-        _execute_command_directly's MockEvent chat-type flags — see its
-        own docstring) and checks membership in the dynamically
-        configurable _active_scopes set instead of the old hardcoded
-        ENABLE_FOR_* booleans. Same caching characteristics as before:
-        the first reaction event from/about a given user or channel pays
-        for one client.get_entity() call, every subsequent one is a plain
-        dict lookup with no possibility of a network call at all.
+        v3.1.8 (G2, revised): this used to take a raw `peer_id` and call
+        `_classify_peer()` internally. Callers now classify the peer
+        themselves ONCE and pass the resulting `chat_kind` string in —
+        see _on_reaction_update_impl / _on_edit_update_impl below. That
+        single classification is then threaded all the way through
+        _process_reaction_update() to _execute_command_directly(), which
+        previously repeated the exact same classification a second time
+        (via telethon_utils.resolve_id() + another _classify_peer() call)
+        purely to build MockEvent's is_private/is_group/is_channel flags.
+        Both computations always produced the same cached result under
+        the current code — no confirmed bug was ever found here — but
+        having two independent computations of the same fact was the only
+        structural point in the whole reaction pipeline where a future
+        change to either one could make them diverge. Threading a single
+        classification through removes that possibility by construction
+        and costs one fewer function call per reaction. No longer async —
+        this method now does no I/O at all, just a set-membership check.
         """
-        kind = await self._classify_peer(peer_id, client)
-        if not kind:
+        if not chat_kind:
             return False  # Unknown peer type — drop
-        return kind in self._active_scopes
+        return chat_kind in self._active_scopes
 
     # ── Settings I/O ──────────────────────────────────────────────────────
 
@@ -789,8 +827,15 @@ class ReactionCommands(Module):
         if peer is None:
             return
 
+        # v3.1.8 (G2, revised): classify the peer exactly once here, then
+        # thread the result through both Gate 2's check and the downstream
+        # _process_reaction_update() → _execute_command_directly() call,
+        # instead of letting each of those independently reclassify the
+        # same peer later. See _check_environment_filter's docstring.
+        chat_kind = await self._classify_peer(peer, client)
+
         # Gate 2: Environment Filter
-        if not await self._check_environment_filter(peer, client):
+        if not self._check_environment_filter(chat_kind):
             return
 
         msg_id = getattr(event, 'msg_id', None)
@@ -800,7 +845,7 @@ class ReactionCommands(Module):
         reactions = getattr(event, 'reactions', None)
         chat_id = telethon_utils.get_peer_id(peer)
 
-        await self._process_reaction_update(chat_id, msg_id, reactions)
+        await self._process_reaction_update(chat_id, msg_id, reactions, chat_kind=chat_kind)
 
     # ── Method 2: UpdateEditMessage (Secondary Push Route) ────────────────
 
@@ -871,8 +916,14 @@ class ReactionCommands(Module):
         if peer_id is None:
             return
 
+        # v3.1.8 (G2, revised): classify the peer exactly once here, then
+        # thread the result through both Gate 2's check and the downstream
+        # call — same pattern as Method 1 above. See
+        # _check_environment_filter's docstring for the full rationale.
+        chat_kind = await self._classify_peer(peer_id, client)
+
         # Gate 2: Environment Filter
-        if not await self._check_environment_filter(peer_id, client):
+        if not self._check_environment_filter(chat_kind):
             return
 
         # Method 2 already has the full Message, so pass it through as
@@ -880,7 +931,8 @@ class ReactionCommands(Module):
         # (join/left/info/whois) then skip the lazy re-fetch in
         # _execute_command_directly() entirely, same as before.
         await self._process_reaction_update(
-            message.chat_id, message.id, message.reactions, target_msg=message
+            message.chat_id, message.id, message.reactions,
+            target_msg=message, chat_kind=chat_kind,
         )
 
     # ── Core Reaction Processing (Gates 3-5) ──────────────────────────────
@@ -891,9 +943,16 @@ class ReactionCommands(Module):
         msg_id: int,
         reactions,
         target_msg: Message | None = None,
+        chat_kind: str = "",
     ) -> None:
         """
         Process a reaction-state snapshot for one message.
+
+        v3.1.8 (G2, revised): `chat_kind` is the classification already
+        computed once by the caller (Method 1 or Method 2), passed through
+        unchanged to _execute_command_directly() below — see
+        _check_environment_filter's docstring for why this replaced a
+        second, independent classification that used to happen there.
 
         Takes the reactions data directly (chat_id/msg_id/reactions) rather
         than a full Message object, since Method 1 no longer fetches one
@@ -999,14 +1058,29 @@ class ReactionCommands(Module):
 
             command_text = self._reactions[emoji_str]
 
+            # v3.1.8 (G7): observability instrumentation. Previously this
+            # log line showed emoji/chat/msg/action but not chat_kind, so
+            # diagnosing a reaction-triggered command that behaved
+            # differently than expected required guesswork about how the
+            # chat was classified. Now the exact classification used to
+            # build MockEvent's is_private/is_group/is_channel flags is
+            # visible right alongside the emoji and the resolved command
+            # text — if a report of "limited deletion via reaction" comes
+            # in again, this single log line (plus clearer.py's own G7
+            # instrumentation) shows immediately whether it was a
+            # classification issue (chat_kind wrong) or simply that this
+            # particular emoji is mapped to a more restrictive command
+            # (e.g. `clear self` vs `clear all`) than the user expected.
             self._log_debug(
-                "✅ Reaction detected: emoji=%s, chat=%d, msg=%d, action=%s",
-                emoji_str, chat_id, msg_id, command_text
+                "✅ Reaction detected: emoji=%s, chat=%d, msg=%d, action=%s, chat_kind=%s",
+                emoji_str, chat_id, msg_id, command_text, chat_kind
             )
 
             # Execute command DIRECTLY
             try:
-                await self._execute_command_directly(chat_id, msg_id, command_text, target_msg)
+                await self._execute_command_directly(
+                    chat_id, msg_id, command_text, target_msg, chat_kind=chat_kind
+                )
             except Exception as exc:
                 self._log_error("Failed to execute command: %s", exc)
 
@@ -1054,6 +1128,7 @@ class ReactionCommands(Module):
         target_msg_id: int,
         command_text: str,
         target_msg: Message | None = None,
+        chat_kind: str = "",
     ) -> None:
         """
         Execute a command by directly invoking the target module's handler.
@@ -1061,6 +1136,26 @@ class ReactionCommands(Module):
         clearer.py, join_left.py, info_handler.py, and whois_handler.py.
 
         Falls back to send_message if direct invocation is unavailable.
+
+        v3.1.8 (G2, revised): `chat_kind` is now a parameter, expected to be
+        the classification already computed once by the caller
+        (_on_reaction_update_impl / _on_edit_update_impl, via
+        _process_reaction_update) at the same point where Gate 2's
+        environment filter was checked. This replaced a second, independent
+        computation that used to happen right here — telethon_utils
+        .resolve_id(chat_id) followed by another _classify_peer() call —
+        purely to rebuild the exact same fact that had already been
+        established a few lines earlier in the call chain. No divergence
+        between the two was ever confirmed, but having two separate
+        computations of one fact was the only structural point in the
+        whole reaction pipeline where a future change to either could make
+        them disagree; threading a single value through removes that
+        possibility by construction and is also one fewer function call
+        (and, on a cache miss, one fewer potential client.get_entity()
+        call) per reaction. If `chat_kind` is not supplied (empty string —
+        e.g. a future caller that doesn't yet have it), this method falls
+        back to the original resolve_id()+_classify_peer() computation so
+        behavior is unchanged for any such caller.
         """
         try:
             loader = self.context.loader_registry.get(self.cfg.index)
@@ -1084,18 +1179,14 @@ class ReactionCommands(Module):
         command_name = command_parts[0].lower()
         self._log_debug("Executing directly: %s", command_text)
 
-        # v3.0.8: resolve is_private/is_group/is_channel for MockEvent.
-        # telethon_utils.resolve_id() is a pure local computation on the
-        # marked chat_id integer (no API call) that reconstructs the peer
-        # type; _classify_peer() then resolves bot-vs-user /
-        # supergroup-vs-channel, hitting the same caches Gate 2 already
-        # warmed for this chat a moment earlier in the common case — see
-        # both methods' docstrings. This normally costs zero extra API
-        # calls; a cache miss (first time this chat is ever seen) costs
-        # at most one client.get_entity() call, same as Gate 2 would have
-        # already paid.
-        real_id, peer_cls = telethon_utils.resolve_id(chat_id)
-        chat_kind = await self._classify_peer(peer_cls(real_id), client)
+        # v3.1.8 (G2, revised): use the already-computed chat_kind passed
+        # in by the caller. Only recompute (defensive fallback) if it was
+        # not supplied at all — this preserves the pre-v3.1.8 behavior for
+        # any hypothetical caller that doesn't yet thread chat_kind through.
+        if not chat_kind:
+            real_id, peer_cls = telethon_utils.resolve_id(chat_id)
+            chat_kind = await self._classify_peer(peer_cls(real_id), client)
+
         mock_is_private = chat_kind in ("private", "bot")
         mock_is_group = chat_kind == "group"
         mock_is_channel = chat_kind == "channel"
@@ -1253,6 +1344,11 @@ help_extra = (
     "• تنظیمات mapping در `reactions.json` و scope در `reaction_scope.json` ذخیره می‌شوند\n"
     "• Loop prevention از اجرای تکراری جلوگیری می‌کند — حتی پس از قطعی و اتصال مجدد شبکه\n"
     "• اگر اجرای مستقیم ممکن نباشد، به `send_message` fallback می‌شود\n"
+    "• ⚠️ اگر ری‌اکشن‌های مختلف را به scope متفاوتی مپ کرده‌اید (مثلاً 👌 به\n"
+    "  `clear all` و 👍 به `clear self`)، رفتار متفاوت هر ری‌اکشن عمدی است\n"
+    "  نه باگ — `reactions.json` خودتان را بررسی کنید\n"
+    "• لاگ دیباگ هر ری‌اکشن شامل chat_kind هم می‌شود تا در صورت بروز مشکل،\n"
+    "  علت (طبقه‌بندی چت یا تنظیم scope) بلافاصله مشخص باشد\n"
 )
 
 ReactionCommands.help_text = help_text

@@ -69,6 +69,46 @@ Anti-FloodWait Layers:
     After BATCHES_BEFORE_LONG batches: long cooldown (120s ± jitter).
     ±20% random jitter on all delays to avoid predictable timing.
 
+v3.1.8 Changes:
+  Fix G1 — Catch InviteHashExpiredError in _validate_invite_links (CRITICAL):
+    InviteHashExpiredError is a distinct Telethon exception from
+    InviteHashInvalidError — both are direct subclasses of BadRequestError,
+    siblings to each other, not related by inheritance. Telegram raises
+    InviteHashExpiredError specifically for links that have run past their
+    time/usage expiry (the most common real-world "bad link" scenario),
+    while InviteHashInvalidError covers malformed/revoked hashes. Only
+    catching InviteHashInvalidError meant expired links fell through to
+    the generic `except Exception` handler in _validate_invite_links,
+    which explicitly does NOT cancel the batch — the expired link was
+    silently treated as valid, joined other valid links first, then
+    failed with an unclear message when its turn came, exactly matching
+    the reported "some chats got joined before the operation should have
+    been cancelled" behavior. Now both exception types are caught
+    identically and correctly trigger full-batch cancellation.
+
+  Fix G3 — Catch InviteHashExpiredError in the main join loop's fallback
+  classification:
+    Defense-in-depth for the rare race where a link expires in the brief
+    window between Phase 0 validation and its turn in the main join loop.
+    Mirrors the G1 fix — the isinstance check in the generic exception
+    handler now includes InviteHashExpiredError alongside
+    InviteHashInvalidError, producing the clear "❌ لینک منقضی یا نامعتبر"
+    message instead of a garbled generic error.
+
+  Fix G5 — INVITE_HASH_EXPIRED string check in the generic fallback:
+    Secondary safety net alongside G3's isinstance check, mirroring the
+    existing "INVITE_HASH_INVALID" in err string-fallback pattern, in case
+    a future Telethon version or an unusual API response surfaces the
+    error as a raw string rather than the typed exception.
+
+  Note: no additional validation criteria were added beyond expired/
+  invalid link detection. _validate_invite_links still validates ONLY
+  invite_link entities via CheckChatInviteRequest, checking exclusively
+  for InviteHashInvalidError / InviteHashExpiredError. No chat-fullness
+  check, no channel-vs-group check, no separate username verification —
+  the scope of pre-join validation is unchanged from v3.1.7 except for
+  recognizing this one additional, previously-missed exception type.
+
 v3.1.6 Changes:
   Fix C1 — _unwrap_join_result() helper (CRITICAL BUG FIX):
     In Telethon 1.44.0 with recent Telegram API layers, BOTH
@@ -1489,9 +1529,23 @@ class JoinLeft(Module):
                     continue
 
             # Call CheckChatInviteRequest to validate
+            #
+            # v3.1.8 fix (G1): InviteHashExpiredError is a distinct Telethon
+            # exception from InviteHashInvalidError — both are direct
+            # subclasses of BadRequestError, siblings to each other, not
+            # related by inheritance. Telegram raises InviteHashExpiredError
+            # specifically when a link has run past its time/usage expiry
+            # (the most common real-world "bad link" case), while
+            # InviteHashInvalidError covers malformed/revoked hashes. Only
+            # catching the latter meant expired links fell through to the
+            # generic `except Exception` handler below, which explicitly
+            # does NOT cancel the batch — the expired link was silently
+            # treated as valid and the whole point of pre-validation (never
+            # joining ANY chat if ANY link is bad) never triggered for this
+            # exception type. Now both are caught identically.
             try:
                 result = await client(CheckChatInviteRequest(invite_hash))
-            except errors.InviteHashInvalidError:
+            except (errors.InviteHashInvalidError, errors.InviteHashExpiredError):
                 invalid.append((identifier, "لینک منقضی یا نامعتبر است"))
                 async with self._invite_cache_lock:
                     self._invite_cache[invite_hash] = {"username": None, "ts": time.time()}
@@ -2506,8 +2560,20 @@ class JoinLeft(Module):
                     fail_count += 1
                     if "INVITE_REQUEST_SENT" in err:
                         status = "⏳ درخواست ارسال شد"
-                    elif isinstance(exc, errors.InviteHashInvalidError) or "INVITE_HASH_INVALID" in err:
-                        status = "❌ لینک نامعتبر"
+                    elif (
+                        # v3.1.8 fix (G3+G5): defense-in-depth for the rare
+                        # race where a link expires between Phase 0
+                        # validation and its turn in this loop. Mirrors the
+                        # G1 fix in _validate_invite_links — both the typed
+                        # exception (isinstance check, G3) and the raw error
+                        # string (G5, in case a future Telethon version or
+                        # unusual API response surfaces it as text instead
+                        # of the typed exception) are checked.
+                        isinstance(exc, (errors.InviteHashInvalidError, errors.InviteHashExpiredError))
+                        or "INVITE_HASH_INVALID" in err
+                        or "INVITE_HASH_EXPIRED" in err
+                    ):
+                        status = "❌ لینک منقضی یا نامعتبر"
                     elif isinstance(exc, errors.UsernameNotOccupiedError):
                         status = "❌ یوزرنیم وجود ندارد"
                     elif isinstance(exc, errors.ChannelPrivateError):
@@ -2815,13 +2881,17 @@ help_extra = (
     "• لینک‌های خصوصی قدیمی | `t.me/joinchat/AbCdEfGh`\n"
     "• شناسه عددی | `1234567890`\n"
     "• لینک‌های خصوصی کانال | `t.me/c/1234567890/123`\n\n"
+    "تغییرات v3.1.8:\n"
+    "• رفع باگ حیاتی: لینک‌های منقضی گاهی عملیات جوین را لغو نمی‌کردند (G1)\n"
+    "  → InviteHashExpiredError نوع متفاوتی از خطا نسبت به InviteHashInvalidError است\n"
+    "  → اکنون هر دو نوع خطا به‌درستی شناسایی و کل عملیات لغو می‌شود\n"
+    "• پیام خطای واضح‌تر برای لینک‌های منقضی در حلقه اصلی جوین (G3, G5)\n\n"
     "تغییرات v3.1.6:\n"
     "• رفع باگ حیاتی: خطای 'ChatInviteJoinResultOk' روی کانال‌های عمومی (C1)\n"
     "  → JoinChannelRequest در Telethon 1.44 ممکن است ChatInviteJoinResultOk برگرداند\n"
     "  → تمام ۵ مسیر جوین اکنون با _unwrap_join_result() ایمن شدند\n"
     "• پشتیبانی چند فولدر: وقتی joined پر شد، joined2، joined3 ایجاد می‌شود (I1)\n"
-    "• حذف هوشمند: فقط از فولدرهایی که می‌توانند آن نوع چت را نشان دهند حذف می‌شود (I2)\n"
-    "• اعتبارسنجی قبل از جوین: لینک‌های منقضی قبل از شروع بررسی می‌شوند (I3)\n"
+    "• اعتبارسنجی قبل از جوین: لینک‌های منقضی/نامعتبر قبل از شروع بررسی می‌شوند (I3)\n"
     "• ترتیب ثابت: لینک‌ها به ترتیب ظاهرشان در پیام پردازش می‌شوند (I4)\n"
     "• رفع باگ ترک از طریق لینک دعوت (I5)\n"
     "• صفحه‌بندی خروجی list برای لیست‌های طولانی (I6)\n\n"

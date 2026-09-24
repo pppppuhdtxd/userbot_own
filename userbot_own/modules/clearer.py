@@ -58,6 +58,21 @@ The `link` type covers:
 - Raw URL patterns in text (fallback)
 
 This ensures predictable and non-overlapping filter behavior.
+
+v3.1.8 Changes (G6, G7 — observability only, no filtering logic changed):
+- G6: When a scan stops exactly at `history_limit` messages, the report
+  (both the "no matches" and the final success/partial report) now adds
+  an explicit note that older messages may remain beyond the scanned
+  window. `history_limit` itself is completely unchanged — still 2000 by
+  default, still applied identically to every chat type — this is purely
+  a transparency addition so "scanned == history_limit" is never silently
+  read as "reached the true end of chat history".
+- G7: The scan-start status message and a debug log line now show
+  `is_private`, `use_from_user`, and `scope` for every `clear` run. This
+  makes the exact filtering decision visible for both directly-typed
+  commands and reaction-triggered commands (the latter route through
+  `reaction_commands.py`'s `MockEvent` bridge — see that module's own
+  v3.1.8 changes for the corresponding instrumentation on that side).
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -247,6 +262,25 @@ class Clearer(Module):
         # Yes for non-private chats when we only want our own messages.
         use_from_user = (not is_private) and (scope in ("all", "self"))
 
+        # v3.1.8 (G7): Observability instrumentation. Logs the exact
+        # classification values that decide filtering behavior at the
+        # start of every scan, and surfaces them in the scan-start status
+        # message itself. This is purely diagnostic — it does not change
+        # any filtering logic. If deletion is ever unexpectedly limited
+        # again (e.g. a reaction-triggered `clear` in a bot chat), these
+        # values — visible directly in the chat and in the logs — make
+        # the cause immediately apparent instead of requiring guesswork:
+        # is_private=False when it should be True would point straight at
+        # a chat-type misclassification; use_from_user=True in a chat that
+        # should allow full deletion would point straight at the scope
+        # logic; both being correct would point elsewhere entirely (e.g.
+        # an emoji mapped to a more restrictive scope than expected).
+        self._log_debug(
+            "[Account%d] _run_clear start: chat_id=%s, is_private=%s, "
+            "use_from_user=%s, scope=%s, history_limit=%d",
+            self.cfg.index, chat_id, is_private, use_from_user, scope, history_limit,
+        )
+
         # Show progress
         type_label = self._format_type_label(target_types)
         scope_label = {"all": "همه", "self": "خودم", "bot": "ربات‌ها"}[scope]
@@ -256,7 +290,8 @@ class Clearer(Module):
                 f"🔍 **در حال اسکن...**\n"
                 f"• نوع: {type_label}\n"
                 f"• محدوده: {scope_label}\n"
-                f"• حداکثر: `{history_limit}` پیام"
+                f"• حداکثر: `{history_limit}` پیام\n"
+                f"• _(debug: private={is_private}, from_user_filter={use_from_user})_"
             )
         except Exception as exc:
             self._log_error("Failed to create status message: %s", exc)
@@ -328,12 +363,26 @@ class Clearer(Module):
                 "\n• ⚠️ اسکن به‌دلیل خطا ناقص ماند — نتیجه ممکن است کامل نباشد"
                 if scan_interrupted else ""
             )
+            # v3.1.8 (G6): Report transparency when the scan stopped exactly
+            # at history_limit. iter_messages(limit=history_limit) silently
+            # stops yielding once `limit` messages have been returned —
+            # this is indistinguishable from "reached the true end of chat
+            # history" unless we explicitly check scanned == history_limit.
+            # Without this note, a user could believe a scan that hit the
+            # cap was complete when older messages may still remain beyond
+            # the scanned window. history_limit itself is unchanged — this
+            # is observability only, applying equally to all chat types.
+            limit_note = (
+                "\n• ⚠️ اسکن به دلیل محدودیت تعداد متوقف شد — "
+                "ممکن است پیام‌های قدیمی‌تری باقی مانده باشند"
+                if scanned >= history_limit else ""
+            )
             await self._safe_edit(
                 status_msg,
                 f"ℹ️ **پیامی یافت نشد**\n"
                 f"• اسکن شده: `{scanned}` پیام\n"
                 f"• نوع: {type_label}\n"
-                f"• زمان: `{elapsed:.2f}s`{note}"
+                f"• زمان: `{elapsed:.2f}s`{note}{limit_note}"
             )
             self._track_delete_task(status_msg, 6.0)
             return
@@ -379,6 +428,16 @@ class Clearer(Module):
             report_lines.append(f"• ناموفق: `{failed_count}`")
         if scan_interrupted:
             report_lines.append("• ⚠️ اسکن به‌دلیل خطا زودتر متوقف شد — ممکن است پیام‌های بیشتری باقی مانده باشند")
+        # v3.1.8 (G6): same history_limit-hit transparency note as the
+        # no-matches path above. history_limit stays unchanged for every
+        # chat type — this only reports whether the scan happened to hit
+        # that existing cap, so old messages beyond the scanned window
+        # aren't silently assumed to be fully cleared.
+        if scanned >= history_limit:
+            report_lines.append(
+                "• ⚠️ اسکن به دلیل محدودیت تعداد متوقف شد — "
+                "ممکن است پیام‌های قدیمی‌تری باقی مانده باشند"
+            )
         report_lines.append(f"• زمان: `{elapsed:.2f}s`")
         report_lines.append("")
         report_lines.append("🏷 **بر اساس نوع:**")
@@ -549,6 +608,11 @@ help_extra = (
     "   برای پاک کردن آن‌ها از `clear all` استفاده کنید.\n"
     "• آرگومان‌های نامعتبر باعث نادیده گرفته شدن کامل دستور می‌شوند\n"
     "• حداکثر ۲۰۰۰ پیام اسکن می‌شود\n"
+    "• اگر اسکن دقیقاً به همین محدودیت برسد، در گزارش یادآوری نمایش داده می‌شود\n"
+    "• پیام شروع اسکن اکنون وضعیت private/from_user_filter را هم نشان می‌دهد (دیباگ)\n"
+    "• اگر برای reaction های مختلف، scope متفاوتی تنظیم کرده‌اید (مثلاً یکی\n"
+    "  `clear all` و دیگری `clear self`)، این رفتار عمدی است نه باگ —\n"
+    "  فایل `reactions.json` خودتان را بررسی کنید\n"
 )
 
 Clearer.help_text = help_text

@@ -313,18 +313,29 @@ class Module:
         self._track_delete_task(event, delay)
 
     # ── Structured logging helpers ───────────────────────────────────────────
+    #
+    # v3.1.9: these no longer manually re-embed "[%s]" % self.cfg.index into
+    # every message. That was always redundant with this instance's own
+    # self._log, whose bound name already contains "_modules_a{index}." (see
+    # __init__ below), and it's now doubly redundant with
+    # logger.contextualize(account=...), entered once per account in
+    # composition_root.start_account() and AccountReconnector.run() — every
+    # record emitted anywhere in that account's task tree, including from
+    # here, already carries the exact account index in extra["account"].
+    # These four now simply forward to self._log so call sites (unchanged
+    # across the whole codebase) keep working exactly as before.
 
     def _log_info(self, msg: str, *args: Any) -> None:
-        self._log.info("[%s] %s", self.cfg.index, msg % args if args else msg)
+        self._log.info(msg, *args)
 
     def _log_warning(self, msg: str, *args: Any) -> None:
-        self._log.warning("[%s] %s", self.cfg.index, msg % args if args else msg)
+        self._log.warning(msg, *args)
 
     def _log_error(self, msg: str, *args: Any) -> None:
-        self._log.error("[%s] %s", self.cfg.index, msg % args if args else msg)
+        self._log.error(msg, *args)
 
     def _log_debug(self, msg: str, *args: Any) -> None:
-        self._log.debug("[%s] %s", self.cfg.index, msg % args if args else msg)
+        self._log.debug(msg, *args)
 
     # ── Repr ─────────────────────────────────────────────────────────────────
 

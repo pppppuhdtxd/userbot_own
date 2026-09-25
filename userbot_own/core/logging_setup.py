@@ -26,6 +26,60 @@ to substitute for "the log sink configuration". The `_configured` /
 application state, so it stays as module-level state rather than being
 forced through DI for the sake of consistency. This is a deliberate
 exception, not an oversight.
+
+────────────────────────────────────────────────────────────────
+v3.1.9 — Terminal/file level split, exact per-account filtering,
+non-blocking file sinks
+────────────────────────────────────────────────────────────────
+Three independent fixes, none requiring a new dependency:
+
+1. `setup()` previously used a single `log_level` for both the console
+   and the file sinks, and `Settings.log_level` defaults to "DEBUG" —
+   so out of the box, every DEBUG-level call anywhere in the codebase
+   was terminal-visible. `setup()` now takes an independent
+   `terminal_level` (default "INFO") for the console sink; `log_level`
+   continues to control the file sinks only, so full DEBUG detail is
+   still captured on disk for post-incident review.
+
+2. `add_account_handler()`'s per-account filter used to accept a
+   record if `str(account_index) in record["extra"]["name"]` — a
+   substring test. For accounts whose indices share a digit (e.g. `1`
+   and `21`), this let one account's log lines leak into another
+   account's file, undermining this project's per-account isolation
+   invariant. The filter now requires BOTH `"name" in record["extra"]`
+   (i.e. the record came from `get_logger()` — this project's own
+   code) AND `record["extra"].get("account") == account_index`
+   exactly. `account` is set via `logger.contextualize(account=...)`,
+   entered once per account in `composition_root.start_account()`
+   (and, for extra safety, again around `AccountReconnector.run()`)
+   — see those files for where the context is actually bound; nothing
+   in this module sets it.
+
+   Hotfix note: the first cut of this filter checked `account` alone,
+   dropping the `"name"` precondition entirely. That broke under real
+   multi-account load: `InterceptHandler.emit()` below forwards
+   third-party stdlib logging — including Telethon's own very verbose
+   internal protocol chatter, one line per RPC call — to the bare
+   loguru `logger` without ever binding `name`. Because that forwarding
+   happens *inside* `logger.contextualize(account=idx)`, those records
+   still picked up `account=idx` from the ambient context despite never
+   going through `get_logger()`, matched the account-only filter, and
+   then crashed loguru's own formatter with `KeyError: 'name'` (the
+   format string below requires `{extra[name]}`) — visible as a wall of
+   "Logging error in Loguru Handler #N" tracebacks on stderr rather
+   than a clean crash. Requiring `"name"` again restores the
+   third-party-exclusion guarantee this project always relied on, while
+   keeping the exact-equality fix for the original leak.
+
+3. `enqueue=True` is now set on both file sinks. Without it, each
+   `logger.add(...)` file sink writes synchronously on the calling
+   coroutine's thread; `enqueue=True` moves that write onto a
+   background thread via an internal queue, so file I/O on
+   storage-constrained/slower Android storage can never stall the
+   event loop that the reconnector's 3-second probes also run on.
+   Console sinks are unaffected — they were never the bottleneck and
+   ordering relative to the terminal is more useful preserved exactly
+   as emitted.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -180,7 +234,11 @@ _account_handlers: dict[int, int] = {}
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-def setup(log_level: str = "INFO", log_file: str | None = None) -> None:
+def setup(
+    log_level: str = "DEBUG",
+    log_file: str | None = None,
+    terminal_level: str = "INFO",
+) -> None:
     """
     Initialize the root logger with console + optional file output.
 
@@ -190,6 +248,22 @@ def setup(log_level: str = "INFO", log_file: str | None = None) -> None:
     3. Silences noisy loggers (telethon.network, telethon.crypto)
     4. Adds colored console output
     5. Optionally adds rotating file output
+
+    Args:
+        log_level: Level for the FILE sinks (main.log and every
+            per-account file). Defaults to "DEBUG" so full detail is
+            always captured on disk regardless of what the terminal
+            shows. Normally sourced from ``Settings.log_level``.
+        log_file: Path to the main rotating log file, or ``None`` to
+            skip file logging entirely (console only).
+        terminal_level: Level for the app-log console sink only
+            (v3.1.9). Defaults to "INFO" — this is what actually
+            determines what scrolls past in a live terminal; kept
+            independent of ``log_level`` so raising file verbosity for
+            diagnostics never floods the terminal, and vice versa.
+            The third-party/intercepted-log console sink below is
+            unaffected by this parameter — it stays hardcoded to
+            WARNING+ as before.
     """
     global _configured
 
@@ -221,7 +295,7 @@ def setup(log_level: str = "INFO", log_file: str | None = None) -> None:
             "<cyan>{extra[name]}</cyan> | "
             "<level>{message}</level>"
         ),
-        level=log_level.upper(),
+        level=terminal_level.upper(),
         colorize=True,
         backtrace=False,
         diagnose=False,
@@ -260,6 +334,9 @@ def setup(log_level: str = "INFO", log_file: str | None = None) -> None:
             backtrace=False,
             diagnose=False,
             filter=lambda record: "name" in record["extra"],
+            # v3.1.9: offload file I/O to a background thread so it
+            # can never block the event loop (see module docstring).
+            enqueue=True,
         )
 
     _configured = True
@@ -283,17 +360,49 @@ def add_account_handler(
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use a default-argument capture to avoid the late-binding closure pitfall:
-    # if this function were ever called in a loop, all lambdas would share the
-    # same `account_index` cell and end up with the last iteration's value.
-    # The default-argument form binds the value at definition time.
+    # v3.1.9, revised: exact-equality on `account`, replacing the original
+    # substring test (`str(_idx) in record["extra"]["name"]`) which could
+    # match an unrelated account whose index happened to contain this
+    # one's digit(s) as a substring (e.g. account 1 matching account 21's
+    # records) — a real cross-account log leak.
+    #
+    # IMPORTANT (v3.1.9 hotfix): the first cut of this filter dropped the
+    # `"name" in record["extra"]` precondition entirely, checking only
+    # `account`. That broke in practice: `InterceptHandler.emit()` (this
+    # module, above) forwards third-party stdlib logging — including
+    # Telethon's own very verbose internal protocol chatter ("Assigned
+    # msg_id=…", "Getting difference for account updates", one line per
+    # RPC call) — straight to the bare loguru `logger`, without ever
+    # binding a `name` key. Because that forwarding happens *inside*
+    # `logger.contextualize(account=idx)` (entered in
+    # composition_root.start_account() / AccountReconnector.run()),
+    # loguru's context machinery still merges `account=idx` into those
+    # records' `extra` even though nothing explicitly bound it. Those
+    # records then matched this filter on `account` alone, reached this
+    # sink, and crashed loguru's own formatter with `KeyError: 'name'`
+    # (the format string below requires `{extra[name]}`) — loguru catches
+    # that internally and prints a wall of "Logging error in Loguru
+    # Handler #N" tracebacks to stderr instead of crashing the process,
+    # which is what a "Logging error in Loguru Handler" spam under real
+    # multi-account load turned out to look like.
+    #
+    # Fixed by requiring BOTH: `name` present (so only records that went
+    # through `get_logger()` — i.e. this project's own code — are ever
+    # candidates) AND an exact `account` match (closing the original
+    # substring-leak bug without reopening this one). Third-party/
+    # intercepted records are excluded from every per-account file exactly
+    # as they always were before v3.1.9 — this restores that guarantee
+    # rather than changing it.
+    #
+    # Use a default-argument capture to avoid the late-binding closure
+    # pitfall: if this function is ever called in a loop, all lambdas
+    # would share the same `account_index` cell and end up with the
+    # last iteration's value. The default-argument form binds the
+    # value at definition time.
     def _account_filter(record: dict, _idx: int = account_index) -> bool:
         return (
             "name" in record["extra"]
-            and (
-                record["extra"].get("account") == _idx
-                or str(_idx) in record["extra"].get("name", "")
-            )
+            and record["extra"].get("account") == _idx
         )
 
     handler_id = logger.add(
@@ -305,6 +414,9 @@ def add_account_handler(
         compression="zip",
         encoding="utf-8",
         filter=_account_filter,
+        # v3.1.9: see the main file sink above — same non-blocking
+        # rationale applies per-account.
+        enqueue=True,
     )
 
     _account_handlers[account_index] = handler_id

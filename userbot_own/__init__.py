@@ -24,7 +24,12 @@ _version_file = Path(__file__).parent.parent / "VERSION"
 # or empty). Kept in sync with the actual VERSION file content so a
 # missing/corrupted VERSION file doesn't silently report a stale,
 # multiple-versions-old number.
-_FALLBACK_VERSION = "3.1.4"
+#
+# v3.1.9: this had drifted to "3.1.4" — three releases stale relative to
+# the actual VERSION file (3.1.8) at the time of this fix, despite the
+# comment above explicitly saying it's kept in sync. Corrected as part of
+# this version bump; nothing else about the fallback mechanism changed.
+_FALLBACK_VERSION = "3.1.9"
 
 try:
     __version__ = _version_file.read_text(encoding="utf-8").strip() or _FALLBACK_VERSION

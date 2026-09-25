@@ -30,7 +30,27 @@ import sys
 from pathlib import Path
 
 from userbot_own.app.composition_root import CompositionRoot
+from userbot_own.core.logging_setup import get_logger
 from userbot_own.core.watcher import setup_watchers
+
+# v3.1.9: module-level logger for the two call sites below
+# (_request_shutdown() and main()) that run outside any account's
+# context — SIGTERM/Ctrl+C handling and top-level startup-error
+# reporting are process-wide events, not per-account ones. Previously
+# both used raw `logging.getLogger(__name__)` (stdlib), which the
+# v3.0.12 comments below describe as an intentional move away from
+# print() to "the configured logger" — but a stdlib logger created this
+# way never gets the `name` key bound into its `extra`, which
+# `core/logging_setup.py`'s file sinks require to accept a record at
+# all. So those v3.0.12 log calls were, in practice, never written to
+# `main.log`, and the INFO-level ones weren't even visible on the
+# console (the console's WARNING+ "everything else" sink is the only
+# thing that would have caught them). Using this project's own
+# get_logger() factory fixes both: the messages now reach main.log,
+# and — since they're process-wide, not tied to any single account —
+# they correctly have no `account` context and therefore never appear
+# in any per-account file, only in main.log and the console.
+_log = get_logger(__name__)
 
 
 class Application:
@@ -113,20 +133,14 @@ def _request_shutdown(loop: asyncio.AbstractEventLoop) -> None:
     Schedule cancellation of all running tasks on the given loop.
     Called by the SIGTERM signal handler.
     """
-    import logging
-    logging.getLogger(__name__).info(
-        "SIGTERM received — initiating graceful shutdown."
-    )
+    _log.info("SIGTERM received — initiating graceful shutdown.")
     for task in asyncio.all_tasks(loop):
         task.cancel()
 
 
 def main() -> None:
     """Entry point — run the async main loop, exit cleanly on Ctrl+C or SIGTERM."""
-    import logging
-
     userbot_dir = Path(__file__).resolve().parent.parent
-    log = logging.getLogger(__name__)
 
     try:
         asyncio.run(Application(userbot_dir).run())
@@ -134,13 +148,18 @@ def main() -> None:
         # v3.0.12: log through the configured logger (not print()) so a
         # Ctrl+C shutdown shows up in log files the same way a SIGTERM
         # shutdown already does, instead of only appearing on stdout.
-        log.info("Ctrl+C received — exiting gracefully.")
+        # v3.1.9: this now actually reaches main.log — see the module-level
+        # `_log` comment above for why it previously didn't.
+        _log.info("Ctrl+C received — exiting gracefully.")
     except Exception:
         # v3.0.12: a startup/runtime error before this point previously
         # produced a raw traceback with no consistent framing. Log it
         # cleanly through the configured logger, then re-raise so the
         # process still exits non-zero and the full traceback is preserved.
-        log.exception("Unexpected error — exiting.")
+        # v3.1.9: same file-persistence fix as above — a fatal startup
+        # error is now actually recoverable from main.log after the fact,
+        # not just visible if someone was watching the terminal live.
+        _log.exception("Unexpected error — exiting.")
         raise
 
 

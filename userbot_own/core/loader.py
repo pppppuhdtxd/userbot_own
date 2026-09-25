@@ -112,7 +112,16 @@ class AccountLoader:
         self.cfg                        = context.cfg
         self.modules_dir: Path          = modules_dir
         self.extra_modules_dir: Path | None = extra_modules_dir
-        self.label:       str           = f"Account{context.cfg.index}"
+        # v3.1.9: the old `self.label` (f"Account{N}") text prefix that used
+        # to be manually re-embedded into every log message below has been
+        # removed. Account attribution now comes from two other places that
+        # didn't exist when that pattern was introduced: this instance's own
+        # `self._log` is already bound to a name containing the account
+        # index (see below), and `logger.contextualize(account=...)`,
+        # entered once per account in composition_root.start_account(),
+        # attaches the exact account index to every record emitted while
+        # that account's task tree is running — including this loader's.
+        # See CHANGELOG v3.1.9 for the full rationale.
         self._client:     TelegramClient | None = None
 
         # stem → (Module instance, Python module object). Populated from
@@ -175,7 +184,7 @@ class AccountLoader:
 
             if not isinstance(instance, Module):
                 self._log.warning(
-                    "[%s] %s has no valid Module — skipped.", self.label, path.name
+                    "%s has no valid Module — skipped.", path.name
                 )
                 sys.modules.pop(qual, None)
                 return None
@@ -185,7 +194,7 @@ class AccountLoader:
         except ModuleImportError:
             raise
         except Exception as exc:
-            self._log.exception("[%s] Import failed for %s: %s", self.label, path.name, exc)
+            self._log.exception("Import failed for %s: %s", path.name, exc)
             sys.modules.pop(qual, None)
             return None
 
@@ -206,14 +215,14 @@ class AccountLoader:
             instance.setup(self._client)
         except Exception as exc:
             self._log.exception(
-                "[%s] setup() failed for %s: %s", self.label, stem, exc
+                "setup() failed for %s: %s", stem, exc
             )
             sys.modules.pop(f"_modules_a{self.cfg.index}.{stem}", None)
             return False
 
         self._loaded[stem] = (instance, py_mod)
 
-        self._log.info("[%s] Loaded: %s", self.label, stem)
+        self._log.info("Loaded: %s", stem)
         return True
 
     def _do_unload(self, stem: str) -> None:
@@ -226,7 +235,7 @@ class AccountLoader:
             instance.teardown(self._client)
         except Exception as exc:
             self._log.warning(
-                "[%s] teardown() error for %s: %s", self.label, stem, exc
+                "teardown() error for %s: %s", stem, exc
             )
 
     # ── Extra-module enablement state (v3.1.0) ──────────────────────────────
@@ -245,8 +254,8 @@ class AccountLoader:
         data, err = read_json_file(self._enabled_file)
         if err is not None:
             self._log.error(
-                "[%s] enabled_modules.json unreadable — treating as no "
-                "extra modules enabled: %s", self.label, err,
+                "enabled_modules.json unreadable — treating as no "
+                "extra modules enabled: %s", err,
             )
             self._enabled_extra = set()
             return
@@ -264,7 +273,7 @@ class AccountLoader:
         err = write_json_file_atomic(self._enabled_file, data, indent=2)
         if err is not None:
             self._log.error(
-                "[%s] Failed to save enabled_modules.json: %s", self.label, err
+                "Failed to save enabled_modules.json: %s", err
             )
 
     def _resolve_path(self, stem: str) -> tuple[Path, bool] | None:
@@ -307,8 +316,8 @@ class AccountLoader:
         data, err = read_json_file(self._enabled_file)
         if err is not None:
             self._log.error(
-                "[%s] enabled_modules.json unreadable after external edit "
-                "— ignoring this change: %s", self.label, err,
+                "enabled_modules.json unreadable after external edit "
+                "— ignoring this change: %s", err,
             )
             return
 
@@ -324,16 +333,16 @@ class AccountLoader:
             candidate = self.extra_modules_dir / f"{stem}.py"
             if not candidate.exists():
                 self._log.warning(
-                    "[%s] enabled_modules.json now lists '%s', but no such "
+                    "enabled_modules.json now lists '%s', but no such "
                     "file exists in modules_extra/ — skipped.",
-                    self.label, stem,
+                    stem,
                 )
                 continue
             if stem in self._loaded:
                 self._log.warning(
-                    "[%s] enabled_modules.json now lists '%s', but that "
+                    "enabled_modules.json now lists '%s', but that "
                     "name is already loaded (core-module collision?) — "
-                    "skipped.", self.label, stem,
+                    "skipped.", stem,
                 )
                 continue
             if self._do_load(stem, candidate):
@@ -345,8 +354,8 @@ class AccountLoader:
 
         if to_enable or to_disable:
             self._log.info(
-                "[%s] enabled_modules.json changed externally: +%d enabled, "
-                "-%d disabled.", self.label, len(to_enable), len(to_disable),
+                "enabled_modules.json changed externally: +%d enabled, "
+                "-%d disabled.", len(to_enable), len(to_disable),
             )
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -489,7 +498,7 @@ class AccountLoader:
         """
         for stem in list(self._loaded.keys()):
             self._do_unload(stem)
-        self._log.info("[%s] All plugins unloaded.", self.label)
+        self._log.info("All plugins unloaded.")
 
     def load_all(self, client: TelegramClient) -> None:
         """
@@ -537,16 +546,16 @@ class AccountLoader:
                     # Same stem already loaded from modules_dir — core wins,
                     # an extra module can never shadow a core one.
                     self._log.error(
-                        "[%s] modules_extra/%s.py has the same name as a "
-                        "core module — skipped.", self.label, path.stem,
+                        "modules_extra/%s.py has the same name as a "
+                        "core module — skipped.", path.stem,
                     )
                     continue
                 if self._do_load(path.stem, path):
                     count += 1
 
         self._log.info(
-            "[%s] %d plugin(s) loaded (%d extra enabled).",
-            self.label, count, len(self._enabled_extra),
+            "%d plugin(s) loaded (%d extra enabled).",
+            count, len(self._enabled_extra),
         )
 
     def reload_module(self, stem: str) -> bool:
@@ -569,13 +578,13 @@ class AccountLoader:
         """
         resolved = self._resolve_path(stem)
         if resolved is None:
-            self._log.error("[%s] Module file not found: %s.py", self.label, stem)
+            self._log.error("Module file not found: %s.py", stem)
             return False
         path, is_extra = resolved
         if is_extra and stem not in self._enabled_extra:
             self._log.warning(
-                "[%s] '%s' is a disabled extra module — not reloading "
-                "(use enable_extra_module() to enable it).", self.label, stem,
+                "'%s' is a disabled extra module — not reloading "
+                "(use enable_extra_module() to enable it).", stem,
             )
             return False
         self._do_unload(stem)
@@ -638,8 +647,8 @@ class AccountLoader:
                     instance.teardown(old_client)
                 except Exception as exc:
                     self._log.debug(
-                        "[%s] teardown error for %s during reattach: %s",
-                        self.label, stem, exc,
+                        "teardown error for %s during reattach: %s",
+                        stem, exc,
                     )
 
             # Re-register on new client
@@ -656,23 +665,23 @@ class AccountLoader:
                 # returns None (diagnosable) rather than an instance that
                 # looks alive but will never receive another event.
                 self._log.error(
-                    "[%s] setup() failed for %s during reattach — module "
+                    "setup() failed for %s during reattach — module "
                     "unloaded (was silently left half-registered before "
                     "v3.0.12): %s",
-                    self.label, stem, exc,
+                    stem, exc,
                 )
                 self._loaded.pop(stem, None)
                 failed_stems.append(stem)
 
         if failed_stems:
             self._log.warning(
-                "[%s] Reattached handlers: %d OK, %d FAILED and unloaded: %s.",
-                self.label, reattached, len(failed_stems), ", ".join(failed_stems),
+                "Reattached handlers: %d OK, %d FAILED and unloaded: %s.",
+                reattached, len(failed_stems), ", ".join(failed_stems),
             )
         else:
             self._log.info(
-                "[%s] Reattached handlers: %d OK, 0 failed.",
-                self.label, reattached,
+                "Reattached handlers: %d OK, 0 failed.",
+                reattached,
             )
 
     # ── Introspection ─────────────────────────────────────────────────────
@@ -731,7 +740,7 @@ class AccountLoader:
             from watchdog.observers import Observer  # type: ignore[import-untyped]
         except ImportError:
             self._log.warning(
-                "[%s] watchdog not installed — hot-reload disabled.", self.label
+                "watchdog not installed — hot-reload disabled."
             )
             return
 
@@ -829,10 +838,9 @@ class AccountLoader:
                 # directory — degrade to "no extra-module hot-reload" rather
                 # than taking the whole watcher down with it.
                 self._log.warning(
-                    "[%s] modules_extra/ does not exist on disk — extra "
+                    "modules_extra/ does not exist on disk — extra "
                     "modules will still load if enabled, but hot-reload for "
-                    "them is unavailable until the directory exists.",
-                    self.label,
+                    "them is unavailable until the directory exists."
                 )
         for watch_path, _ in self._extra_watches:
             abs_path = watch_path.resolve()
@@ -849,8 +857,7 @@ class AccountLoader:
 
         observer.start()
         self._log.info(
-            "[%s] File watcher active — modules_dir=%s, modules_extra=%s, extra_dirs=%d.",
-            self.label,
+            "File watcher active — modules_dir=%s, modules_extra=%s, extra_dirs=%d.",
             self.modules_dir.name,
             self.extra_modules_dir.name if self.extra_modules_dir else "(none)",
             len(watch_dirs - base_dirs),
@@ -872,8 +879,8 @@ async def _hot_reload(loader: AccountLoader, stem: str) -> None:
     """Reload a single plugin and log the outcome."""
     ok = loader.reload_module(stem)
     loader._log.info(
-        "[%s] Hot-reload %s: %s.",
-        loader.label, stem, "OK" if ok else "FAILED",
+        "Hot-reload %s: %s.",
+        stem, "OK" if ok else "FAILED",
     )
 
 

@@ -53,13 +53,14 @@ itself performs no classification and makes no network calls.
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 from telethon import TelegramClient
 from telethon.tl.types import Message
 
-_log = logging.getLogger(__name__)
+from userbot_own.core.logging_setup import get_logger
+
+_log = get_logger(__name__)
 
 
 @dataclass(slots=True)

@@ -116,6 +116,34 @@ actual concurrent-invocation path even before this version. The guard
 protects against that changing in the future (e.g. if the disconnect
 watcher is ever wired to trigger recovery directly instead of merely
 signalling the loop) without changing any currently-observable behavior.
+
+────────────────────────────────────────────────────────────────
+v3.1.9 — Logging fix (per-account attribution + file persistence)
+────────────────────────────────────────────────────────────────
+Prior to this version, `self._log` here was a raw `loguru.logger.bind(...)`
+call with no `name` key in its bound `extra`. `core/logging_setup.py`'s
+file sinks (both `main.log` and every per-account file) require
+`"name" in record["extra"]` to accept a record at all — so almost every
+log call in this file (all of `run()`, `_recover_connection()`, the
+NO_INTERNET / TELEGRAM_DOWN / ONLINE handlers, `_attempt_connect()`'s
+success path, etc.) was silently dropped from every log file, and only
+ever reached the console at WARNING+, indistinguishable there from
+genuine third-party library noise. Reconnection is the single most
+important thing to have a durable, on-disk record of for a Termux
+deployment nobody is watching live — this was a significant,
+unintentional loss of observability.
+
+Fixed by switching `self._log` to `logging_setup.get_logger()` (this
+project's own factory, used everywhere else) and wrapping `run()` in
+`logger.contextualize(account=self._cfg.index)` for its entire lifetime.
+The manual `"[Account{}] "` text this file used to prepend to every
+message is removed — the bound logger name and the `contextualize()`
+context now carry that information structurally instead of as a string
+the reader has to parse out, and `add_account_handler()`'s per-account
+file filter checks `record["extra"]["account"] == idx` exactly rather
+than a fragile substring test. See CHANGELOG v3.1.9 for the fuller
+before/after picture, including the multi-account log-file-leak bug
+this also fixes.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -127,7 +155,7 @@ import sqlite3
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
-from loguru import logger
+from loguru import logger as _loguru_core
 from telethon import errors
 from telethon.tl.functions.updates import GetStateRequest
 from tenacity import (
@@ -138,6 +166,8 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
+
+from userbot_own.core.logging_setup import get_logger
 
 if TYPE_CHECKING:
     from telethon import TelegramClient
@@ -274,6 +304,15 @@ async def _cheap_probe_online(timeout: float = 3.0) -> bool:
         return False
 
 
+# v3.1.9: module-level logger used only by the @retry decorator's
+# `before_sleep_log` below. That decorator is evaluated at class-
+# definition time, before any AccountReconnector instance (and
+# therefore any self._log) exists, so it needs its own logger created
+# through this project's factory rather than the raw loguru `logger`
+# singleton this file used to import for that purpose.
+_tenacity_retry_log = get_logger(__name__)
+
+
 # ── AccountReconnector ───────────────────────────────────────────────────────
 
 class AccountReconnector:
@@ -330,18 +369,19 @@ class AccountReconnector:
         self._disconnect_event: asyncio.Event = asyncio.Event()
         self._disconnect_watch_task: asyncio.Task | None = None
 
-        # Create a context-bound logger for this account
-        self._log = logger.bind(
-            event_type="reconnect",
-            account=self._cfg.index,
-        )
+        # v3.1.9: use the project's logger factory instead of a raw
+        # loguru `logger.bind()` call — see the module docstring's
+        # "v3.1.9" section for why the old form silently never reached
+        # any log file. Account attribution for the per-account file
+        # filter comes from `logger.contextualize(account=...)`,
+        # entered around run() below (and, more broadly, around
+        # composition_root.start_account()) — not from this name — so
+        # it stays correct regardless of what this string contains.
+        self._log = get_logger(f"reconnector.account{self._cfg.index}")
 
     def _notify(self, connected: bool) -> None:
         """Log a connection-state transition for this account."""
-        self._log.info(
-            "[Account{}] Connection state changed: connected={}",
-            self._cfg.index, connected,
-        )
+        self._log.info("Connection state changed: connected=%s", connected)
 
     async def run(self) -> None:
         """
@@ -349,32 +389,39 @@ class AccountReconnector:
 
         This is typically started as an async task by the composition root:
             asyncio.create_task(reconnector.run())
+
+        v3.1.9: the entire body runs inside
+        `logger.contextualize(account=self._cfg.index)` so every log
+        record emitted anywhere in this call tree — including from
+        `_attempt_connect()`'s tenacity retry callback and anything a
+        reattached module logs during recovery — carries the exact
+        account index, and `add_account_handler()`'s per-account file
+        filter can match on it precisely instead of guessing from a
+        name string.
         """
         self._running = True
-        self._log.info("[Account{}] Reconnector started.", self._cfg.index)
+        with _loguru_core.contextualize(account=self._cfg.index):
+            self._log.info("Reconnector started.")
 
-        # v3.1.1: if a client already exists (composition_root connects the
-        # initial client before starting the reconnector), start watching
-        # it for an instant disconnect signal right away rather than only
-        # after the first rebuild.
-        if self._ac.client is not None:
-            self._start_disconnect_watcher(self._ac.client)
+            # v3.1.1: if a client already exists (composition_root connects
+            # the initial client before starting the reconnector), start
+            # watching it for an instant disconnect signal right away
+            # rather than only after the first rebuild.
+            if self._ac.client is not None:
+                self._start_disconnect_watcher(self._ac.client)
 
-        while self._running:
-            try:
-                await self._reconnect_cycle()
-            except asyncio.CancelledError:
-                self._log.info("[Account{}] Reconnector cancelled.", self._cfg.index)
-                break
-            except Exception as exc:
-                self._log.exception(
-                    "[Account{}] Reconnector cycle error: {}",
-                    self._cfg.index, exc,
-                )
-                await asyncio.sleep(5)
+            while self._running:
+                try:
+                    await self._reconnect_cycle()
+                except asyncio.CancelledError:
+                    self._log.info("Reconnector cancelled.")
+                    break
+                except Exception as exc:
+                    self._log.exception("Reconnector cycle error: %s", exc)
+                    await asyncio.sleep(5)
 
-        self._cancel_disconnect_watcher()
-        self._log.info("[Account{}] Reconnector stopped.", self._cfg.index)
+            self._cancel_disconnect_watcher()
+            self._log.info("Reconnector stopped.")
 
     def stop(self) -> None:
         """Signal the reconnect loop to stop."""
@@ -471,9 +518,8 @@ class AccountReconnector:
 
         if event_task in done:
             self._log.info(
-                "[Account{}] Instant disconnect signal received — "
-                "skipping remainder of healthy-interval wait.",
-                self._cfg.index,
+                "Instant disconnect signal received — "
+                "skipping remainder of healthy-interval wait."
             )
 
     async def _interruptible_backoff(self, backoff_seconds: float) -> None:
@@ -508,9 +554,9 @@ class AccountReconnector:
                 return
             if await _cheap_probe_online():
                 self._log.info(
-                    "[Account{}] Connectivity probe succeeded during "
-                    "backoff — waking early ({:.1f}s of {:.1f}s skipped).",
-                    self._cfg.index, backoff_seconds - elapsed, backoff_seconds,
+                    "Connectivity probe succeeded during backoff — waking "
+                    "early (%.1fs of %.1fs skipped).",
+                    backoff_seconds - elapsed, backoff_seconds,
                 )
                 return
 
@@ -528,10 +574,7 @@ class AccountReconnector:
 
         # Step 1: Check basic connection
         if client is None or not client.is_connected():
-            self._log.warning(
-                "[Account{}] Client disconnected — triggering recovery.",
-                self._cfg.index,
-            )
+            self._log.warning("Client disconnected — triggering recovery.")
             await self._recover_connection()
             return
 
@@ -546,17 +589,11 @@ class AccountReconnector:
             return
 
         except TimeoutError:
-            self._log.warning(
-                "[Account{}] Connection verification timeout.",
-                self._cfg.index,
-            )
+            self._log.warning("Connection verification timeout.")
             self._consecutive_failures += 1
 
         except errors.AuthKeyError:
-            self._log.error(
-                "[Account{}] Auth key error — session may be invalid.",
-                self._cfg.index,
-            )
+            self._log.error("Auth key error — session may be invalid.")
             # Don't try to reconnect, let user fix session
             self._notify(connected=False)
             await asyncio.sleep(300)
@@ -570,40 +607,31 @@ class AccountReconnector:
             # dropped connection — treat it identically to OSError/ConnectionError.
             partial_bytes = len(exc.partial) if exc.partial else 0
             self._log.warning(
-                "[Account{}] Incomplete MTProto frame read ({} of {} bytes) — "
+                "Incomplete MTProto frame read (%d of %d bytes) — "
                 "connection dropped mid-frame.",
-                self._cfg.index, partial_bytes, exc.expected,
+                partial_bytes, exc.expected,
             )
             self._consecutive_failures += 1
 
         except (errors.FloodWaitError, OSError, ConnectionError) as exc:
-            self._log.warning(
-                "[Account{}] Connection verification failed: {}",
-                self._cfg.index, exc,
-            )
+            self._log.warning("Connection verification failed: %s", exc)
             self._consecutive_failures += 1
 
             # Special handling for FloodWait
             if isinstance(exc, errors.FloodWaitError):
-                self._log.warning(
-                    "[Account{}] FloodWait {}s — waiting.",
-                    self._cfg.index, exc.seconds,
-                )
+                self._log.warning("FloodWait %ss — waiting.", exc.seconds)
                 await asyncio.sleep(exc.seconds + 5)
                 return
 
         except Exception as exc:
-            self._log.error(
-                "[Account{}] Unexpected verification error: {}",
-                self._cfg.index, exc,
-            )
+            self._log.error("Unexpected verification error: %s", exc)
             self._consecutive_failures += 1
 
         # Step 3: Decide recovery action based on failure count
         if self._consecutive_failures >= 2:
             self._log.warning(
-                "[Account{}] {} consecutive failures — triggering recovery.",
-                self._cfg.index, self._consecutive_failures,
+                "%d consecutive failures — triggering recovery.",
+                self._consecutive_failures,
             )
             await self._recover_connection()
         else:
@@ -619,10 +647,7 @@ class AccountReconnector:
                 _MIN_DEGRADED_INTERVAL,
                 _HEALTHY_INTERVAL / (self._consecutive_failures + 1),
             )
-            self._log.debug(
-                "[Account{}] Minor issue — re-checking in {:.1f}s.",
-                self._cfg.index, interval,
-            )
+            self._log.debug("Minor issue — re-checking in %.1fs.", interval)
             await asyncio.sleep(interval)
 
     async def _recover_connection(self) -> None:
@@ -651,27 +676,19 @@ class AccountReconnector:
         """
         if self._recovering:
             self._log.debug(
-                "[Account{}] Recovery already in progress — skipping "
-                "duplicate trigger.",
-                self._cfg.index,
+                "Recovery already in progress — skipping duplicate trigger."
             )
             return
 
         self._recovering = True
         try:
-            self._log.info(
-                "[Account{}] Starting connection recovery...",
-                self._cfg.index,
-            )
+            self._log.info("Starting connection recovery...")
 
             # Detect network state
             state = await detect_network_state()
             self._last_state = state
 
-            self._log.info(
-                "[Account{}] Network state detected: {}",
-                self._cfg.index, state.name,
-            )
+            self._log.info("Network state detected: %s", state.name)
 
             if state == NetworkState.NO_INTERNET:
                 await self._handle_no_internet()
@@ -680,10 +697,7 @@ class AccountReconnector:
             elif state == NetworkState.ONLINE:
                 await self._handle_online()
             else:  # UNKNOWN
-                self._log.warning(
-                    "[Account{}] Unknown network state — attempting reconnect.",
-                    self._cfg.index,
-                )
+                self._log.warning("Unknown network state — attempting reconnect.")
                 await self._handle_online()
         finally:
             self._recovering = False
@@ -696,9 +710,8 @@ class AccountReconnector:
         backoff = min(2 ** min(self._consecutive_failures, 8), 300)
 
         self._log.warning(
-            "[Account{}] No internet connection detected. "
-            "Waiting {}s before retry...",
-            self._cfg.index, backoff,
+            "No internet connection detected. Waiting %ss before retry...",
+            backoff,
         )
         self._notify(connected=False)
         self._consecutive_failures += 1
@@ -711,9 +724,9 @@ class AccountReconnector:
         backoff = min(60 + self._consecutive_failures * 30, 300)
 
         self._log.warning(
-            "[Account{}] Internet works but Telegram is unreachable. "
-            "Waiting {}s before retry...",
-            self._cfg.index, backoff,
+            "Internet works but Telegram is unreachable. "
+            "Waiting %ss before retry...",
+            backoff,
         )
         self._notify(connected=False)
         self._consecutive_failures += 1
@@ -722,19 +735,13 @@ class AccountReconnector:
 
     async def _handle_online(self) -> None:
         """Handle ONLINE state — rebuild client with tenacity retry."""
-        self._log.info(
-            "[Account{}] Internet available. Rebuilding client...",
-            self._cfg.index,
-        )
+        self._log.info("Internet available. Rebuilding client...")
 
         try:
             await self._rebuild_client_with_retry()
             # _attempt_connect() resets _consecutive_failures to 0 on success.
         except RetryError as exc:
-            self._log.error(
-                "[Account{}] All reconnect attempts failed: {}",
-                self._cfg.index, exc,
-            )
+            self._log.error("All reconnect attempts failed: %s", exc)
             self._consecutive_failures += 1
             # Wait before next cycle
             # v3.1.1: interruptible — see _handle_no_internet() above.
@@ -763,14 +770,10 @@ class AccountReconnector:
         if old_client is not None:
             try:
                 await asyncio.wait_for(old_client.disconnect(), timeout=5.0)
-                self._log.debug(
-                    "[Account{}] Old client disconnected.",
-                    self._cfg.index,
-                )
+                self._log.debug("Old client disconnected.")
             except Exception as exc:
                 self._log.warning(
-                    "[Account{}] Error disconnecting old client: {} — forcing closure.",
-                    self._cfg.index, exc,
+                    "Error disconnecting old client: %s — forcing closure.", exc
                 )
                 # Nullify so the GC can close the underlying DB connection.
                 self._ac.client = None
@@ -794,7 +797,15 @@ class AccountReconnector:
             sqlite3.OperationalError,
             asyncio.IncompleteReadError,  # EOFError subclass; not caught by OSError
         )),
-        before_sleep=before_sleep_log(logger, "WARNING"),
+        # v3.1.9: `_tenacity_retry_log` (module-level, created via this
+        # project's own get_logger() factory) replaces the raw loguru
+        # `logger` singleton previously passed here — same reasoning as
+        # the rest of this file's v3.1.9 change (see module docstring).
+        # This decorator runs at class-definition time, before any
+        # AccountReconnector instance (and therefore any self._log)
+        # exists, so it needs its own module-level logger rather than
+        # an instance attribute.
+        before_sleep=before_sleep_log(_tenacity_retry_log, "WARNING"),
         reraise=True,
     )
     async def _attempt_connect(self) -> None:
@@ -830,10 +841,7 @@ class AccountReconnector:
                     "— session file may be invalid. Run add_account.py to re-login."
                 )
 
-            self._log.success(
-                "[Account{}] Reconnected and authorized.",
-                self._cfg.index,
-            )
+            self._log.success("Reconnected and authorized.")
 
             # Re-register all module handlers on the new client
             self._loader.reattach(new_client)

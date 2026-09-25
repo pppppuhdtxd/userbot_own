@@ -34,13 +34,14 @@ Design notes:
 """
 from __future__ import annotations
 
-import logging
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
-log = logging.getLogger(__name__)
+from userbot_own.core.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 TEvent = TypeVar("TEvent")
 Handler = Callable[[TEvent], None]
@@ -87,9 +88,17 @@ class EventBus:
             try:
                 handler(event)
             except Exception:
-                log.warning(
-                    "Event handler failed for %s", type(event).__name__, exc_info=True
-                )
+                # v3.1.9: switched from get_logger()-incompatible
+                # `log.warning(..., exc_info=True)` (a stdlib-only kwarg
+                # that AccountLogger/loguru don't interpret — the
+                # traceback was silently never captured) to
+                # `log.exception()`, which forces loguru's own exception
+                # capture. That also bumps the level from WARNING to
+                # ERROR; given this bus has zero real subscribers
+                # anywhere in the project today (see module docstring),
+                # that's a low-risk, low-consequence trade for actually
+                # getting the traceback instead of losing it.
+                log.exception("Event handler failed for %s", type(event).__name__)
 
 
 # ── Application events ────────────────────────────────────────────────────────

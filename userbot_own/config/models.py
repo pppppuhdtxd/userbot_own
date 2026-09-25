@@ -116,6 +116,14 @@ class Settings:
     backoff_start: int = 1
     backoff_max:   int = 300
     history_limit: int = 2000
+    # v3.1.9: this now controls FILE sink verbosity only (main.log and
+    # every per-account file). The terminal's own default level is
+    # independently "INFO" (see core/logging_setup.py's setup()
+    # `terminal_level` parameter) — previously this single field also
+    # governed the console, so the "DEBUG" default here meant every
+    # DEBUG-level call in the codebase scrolled past in a live terminal
+    # by default. Raising or lowering this value now only affects what's
+    # captured on disk, not what's shown live.
     log_level:     str = "DEBUG"
 
     # v3.1.1 — documented here for discoverability; NOT wired through this

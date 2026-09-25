@@ -33,16 +33,15 @@ APP_VERSION now import the single canonical `userbot.__version__`.
 """
 from __future__ import annotations
 
-import logging
-
 from telethon import TelegramClient
 from telethon.network.connection import ConnectionTcpFull
 from telethon.sessions import StringSession
 
 from userbot_own import __version__ as _BOT_VERSION
 from userbot_own.config.models import AccountConfig
+from userbot_own.core.logging_setup import get_logger
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 # ── Client tuning constants ──────────────────────────────────────────────────

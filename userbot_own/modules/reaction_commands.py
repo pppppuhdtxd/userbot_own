@@ -31,6 +31,20 @@ Features:
   `.reaction_scope` (private chats / bot chats / groups+supergroups /
   broadcast channels)
 
+v3.1.9 changes:
+- Heartbeat (_heartbeat_loop, see below) demoted from INFO to DEBUG — it
+  was a terminal-visible line every 5 minutes regardless of activity,
+  which was pure noise for anyone watching the console live. It still
+  fires on the same schedule and still reaches this account's log file
+  unchanged (file sinks stay at DEBUG), so the v3.0.12 silent-failure
+  diagnostic this heartbeat exists for is unaffected.
+- The `reactions` / `.reactions` command (_cmd_list) now additionally
+  shows an on-demand liveness line — ready state and time since the
+  last reaction update actually reached the processing funnel — via the
+  new _format_liveness_line() helper, so the same fact the heartbeat
+  reports periodically to the file can also be checked synchronously
+  from inside the chat at any time.
+
 v3.1.8 changes:
 - G2 (revised) — `chat_kind` is now classified exactly once per reaction,
   at the point where Gate 2's environment filter is checked, and threaded
@@ -197,6 +211,16 @@ _MAX_TRACKED_COOLDOWNS = 1000
 #: emitted, so a module that has gone silently deaf (e.g. via a failed
 #: reattach, or a swallowed exception) is discoverable within one interval
 #: instead of only by manually testing it.
+#:
+#: v3.1.9: this heartbeat is now written at DEBUG level (file-only — see
+#: _heartbeat_loop() below) instead of INFO (terminal-visible), which was
+#: spamming the console every 5 minutes. It still fires on exactly this
+#: schedule and still reaches the per-account log file unchanged, so the
+#: v3.0.12 diagnostic value for a post-incident file review is fully
+#: preserved. For an immediate, on-demand answer to "is this module still
+#: alive?" without waiting for the interval or opening a log file, see the
+#: `reactions` / `.reactions` command output (_format_liveness_line()),
+#: which reports the same ready/last-processed facts synchronously.
 _HEARTBEAT_INTERVAL_SECONDS = 300.0
 
 
@@ -266,6 +290,16 @@ class ReactionCommands(Module):
 
         # Post-Startup Flag: only process reactions after module is fully ready
         self._is_ready: bool = False
+
+        # v3.1.9: monotonic timestamp of the last time a reaction update
+        # actually reached _process_reaction_update() (regardless of
+        # whether it matched a configured mapping). Powers
+        # _format_liveness_line() — the on-demand liveness readout shown
+        # by the `reactions` / `.reactions` command — so "is this module
+        # still receiving traffic?" can be answered synchronously instead
+        # of only via the DEBUG-level heartbeat log (see
+        # _HEARTBEAT_INTERVAL_SECONDS above).
+        self._last_event_at: float | None = None
 
         # Track background tasks created in setup() so teardown() can
         # cancel them on hot-reload, preventing a stale task from
@@ -395,16 +429,48 @@ class ReactionCommands(Module):
         problem is upstream (handlers not receiving updates) rather than
         this module having gone entirely dark, which narrows debugging
         immediately.
+
+        v3.1.9: demoted from INFO to DEBUG. At INFO this was a
+        terminal-visible line every 5 minutes regardless of any actual
+        activity — pure noise for anyone watching the console live. At
+        DEBUG it still fires on the exact same schedule and still reaches
+        this account's log file (file sinks stay at DEBUG; only the
+        terminal's default level changed — see logging_setup.setup()), so
+        nothing about the v3.0.12 file-based diagnostic story changes. For
+        a synchronous, on-demand version of the same fact that doesn't
+        require waiting for the interval or opening a log file, see the
+        `reactions` / `.reactions` command (_format_liveness_line()).
         """
         try:
             while True:
                 await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
-                self._log_info(
+                self._log_debug(
                     "alive — %d reactions configured, ready=%s",
                     len(self._reactions), self._is_ready,
                 )
         except asyncio.CancelledError:
             return
+
+    # ── Liveness readout (v3.1.9) ────────────────────────────────────────
+
+    def _format_liveness_line(self) -> str:
+        """
+        On-demand liveness readout for the `reactions` / `.reactions`
+        command, shown regardless of whether any reactions are configured.
+
+        This is the synchronous counterpart to the DEBUG-level heartbeat
+        in _heartbeat_loop() above: instead of waiting up to
+        _HEARTBEAT_INTERVAL_SECONDS or opening the log file, a user can
+        run the command and immediately see whether this module is ready
+        and when it last actually processed a reaction update.
+        """
+        state = "✅ آماده" if self._is_ready else "⏳ در حال آماده‌سازی"
+        if self._last_event_at is None:
+            recency = "هنوز هیچ ری‌اکشنی پردازش نشده"
+        else:
+            elapsed = time.monotonic() - self._last_event_at
+            recency = f"{elapsed:.0f} ثانیه پیش"
+        return f"🫀 **وضعیت ماژول:** {state} | **آخرین ری‌اکشن پردازش‌شده:** {recency}"
 
     # ── Self ID cache ─────────────────────────────────────────────────────
 
@@ -561,13 +627,18 @@ class ReactionCommands(Module):
             await self._cmd_scope(event, arg)
 
     async def _cmd_list(self, event) -> None:
+        # v3.1.9: liveness footer shown regardless of which branch runs
+        # below — see _format_liveness_line() for what it reports and why.
+        liveness = self._format_liveness_line()
+
         if not self._reactions:
             await self._safe_edit(
                 event,
                 "ℹ️ هیچ reaction ای تنظیم نشده است.\n\n"
                 "**نحوه استفاده:**\n"
                 "`reaction add 👌 clear txt`\n"
-                "`reaction add 👍 join`"
+                "`reaction add 👍 join`\n\n"
+                f"{liveness}"
             )
             return
 
@@ -577,6 +648,7 @@ class ReactionCommands(Module):
 
         lines.append(f"\n📊 **تعداد:** {len(self._reactions)} reaction")
         lines.append("\n💡 **نحوه استفاده:** روی یک پیام react کنید، دستور اجرا می‌شود.")
+        lines.append(f"\n{liveness}")
 
         await self._safe_edit(event, "\n".join(lines))
 
@@ -970,6 +1042,12 @@ class ReactionCommands(Module):
         """
         if reactions is None or not isinstance(reactions, MessageReactions):
             return
+
+        # v3.1.9: liveness pulse for _format_liveness_line() — marks that a
+        # genuine reaction-state snapshot reached this deep into the
+        # funnel, regardless of whether Gates 3-5 below end up triggering
+        # a command. See _last_event_at's definition in __init__.
+        self._last_event_at = time.monotonic()
 
         recent_reactions = getattr(reactions, 'recent_reactions', None) or []
 

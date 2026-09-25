@@ -5,6 +5,237 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.1.9] — 2026-09-25
+
+**Source:** AI (system-wide logging review requested by project owner —
+8-phase research report covering the full logging inventory, lifecycle-state
+log map, and a library/context-propagation comparison; scope approved by
+project owner before delivery, including two additional root-cause fixes
+the research surfaced beyond the original heartbeat-noise request.)
+
+**Post-delivery hotfix (same version, before wider rollout):** the first
+build of this release shipped with two bugs of its own, caught from a
+real two-account run's terminal output within minutes of delivery and
+corrected before this package was finalized — both are called out inline
+below, in the sections they belong to ("Fixed — Critical" and "Changed —
+Important"), rather than hidden. No version bump was needed since the
+faulty code had not been used in production; `VERSION` stays `3.1.9`.
+
+### Fixed — Critical
+
+- **Heartbeat log spam (`reaction_commands.py`)** — the v3.0.12
+  "still alive" heartbeat fired every 5 minutes at INFO level, which is
+  terminal-visible under the default configuration, making it a
+  permanent, recurring line in an otherwise clean console regardless of
+  any actual activity. Demoted to DEBUG (`_heartbeat_loop`). It still
+  fires on exactly the same 5-minute schedule and still reaches this
+  account's log file unchanged (file sinks remain at DEBUG — see the
+  terminal/file split below), so the v3.0.12 silent-failure diagnostic
+  this heartbeat exists for is fully preserved; only the terminal-spam
+  side effect is removed.
+
+- **`core/reconnector.py` logging almost entirely invisible in every log
+  file** — `self._log` here was a raw `loguru.logger.bind(event_type=...,
+  account=...)` call with no `"name"` key in its bound `extra`.
+  `core/logging_setup.py`'s file sinks (both `main.log` and every
+  per-account file) require `"name" in record["extra"]` to accept a
+  record at all, so nearly every log call in this file — the entire
+  reconnect cycle, network-state detection, recovery start/success,
+  FloodWait handling — was silently dropped from every log file, and
+  only ever reached the console at WARNING+, indistinguishable there
+  from genuine third-party library noise. Given this file is the primary
+  source of truth for diagnosing connectivity problems, this was a
+  significant, unintentional loss of observability — arguably a bigger
+  problem than the heartbeat noise itself. Fixed by switching to
+  `logging_setup.get_logger()` and wrapping the entire `run()` loop in
+  `logger.contextualize(account=self._cfg.index)` for its lifetime (see
+  "Context propagation" below). The `@retry`-decorated `_attempt_connect`
+  now uses a dedicated module-level `_tenacity_retry_log` (also via
+  `get_logger()`) for its `before_sleep_log` callback, since that
+  decorator is evaluated at class-definition time, before any instance
+  (and therefore any `self._log`) exists.
+
+- **Cross-account log-file leakage via substring matching
+  (`logging_setup.add_account_handler`)** — the per-account file filter
+  accepted a record if `str(account_index) in record["extra"]["name"]`,
+  a substring test rather than an equality test. For any two accounts
+  whose indices share a digit (e.g. `1` and `21`, or `2` and `12`), this
+  let one account's log lines leak into another account's file —
+  a direct, if narrow, violation of this project's per-account isolation
+  invariant. Replaced with an exact `record["extra"].get("account") ==
+  account_index` check, powered by `logger.contextualize(account=...)`
+  entered once per account (see below) rather than by parsing the bound
+  logger name.
+
+  **Hotfix:** the exact-match filter above was first shipped checking
+  `account` alone, dropping the pre-existing `"name" in record["extra"]`
+  precondition entirely. That combination broke immediately under a real
+  two-account run: `InterceptHandler` forwards third-party stdlib
+  logging (Telethon's own very verbose internal protocol chatter — one
+  DEBUG line per RPC call, e.g. `"Assigned msg_id=… to
+  InvokeWithLayerRequest"`) to the bare loguru `logger` without ever
+  binding `name`; because that forwarding happens *inside*
+  `logger.contextualize(account=idx)`, those records still picked up
+  `account=idx` from the ambient context, passed the account-only
+  filter, reached the per-account file sink, and crashed loguru's own
+  formatter with `KeyError: 'name'` (the sink's format string requires
+  `{extra[name]}`) — visible as a continuous wall of "Logging error in
+  Loguru Handler #N" tracebacks on stderr, far worse than the original
+  heartbeat noise this whole release exists to remove. Fixed by
+  requiring **both** `"name" in record["extra"]` (i.e. the record came
+  from `get_logger()`) **and** the exact `account` match — third-party/
+  intercepted records are excluded from every per-account file exactly
+  as they always were before this release; only the substring-vs-exact
+  behavior for genuine app records actually changed.
+
+### Fixed — Important
+
+- **Six files silently bypassing the project's logger factory** —
+  `core/telegram_client.py`, `core/events.py`, `app/application.py`
+  (`_request_shutdown()` and `main()`), `modules/bridge.py`, and
+  `modules/auto_clearer.py` all created their logger via raw stdlib
+  `logging.getLogger(__name__)` instead of `logging_setup.get_logger()`.
+  Because `logging.basicConfig`'s `InterceptHandler` routes these into
+  loguru without a bound `"name"` key, they suffered exactly the same
+  fate as the reconnector bug above: dropped from every log file,
+  console-visible only at WARNING+. Most notably, this meant
+  `application.py`'s SIGTERM/Ctrl+C shutdown messages and its top-level
+  "Unexpected error — exiting." fatal-crash log — both explicitly added
+  in v3.0.12 specifically to "log through the configured logger (not
+  print())" — were never actually reaching `main.log`; a headless Termux
+  crash left no on-disk trace of why the process exited. All six files
+  now create their logger via `get_logger()`. (`core/events.py`'s one
+  `log.warning(..., exc_info=True)` call was switched to `log.exception()`
+  since `AccountLogger`/loguru don't interpret the stdlib-only `exc_info`
+  keyword — the previous form silently never captured the traceback at
+  all. This module has zero real subscribers project-wide per its own
+  docstring, so the accompanying WARNING→ERROR level nudge is low-risk.)
+
+  `modules/join_left.py`'s module-level free-function logger (documented
+  in the research report as a seventh instance of the same pattern) was
+  intentionally **not** touched in this release — it sits in a large,
+  FloodWait-sensitive file, and fixing it wasn't necessary to close the
+  observability gaps above. Left as a known follow-up for a future,
+  more targeted pass.
+
+### Changed — Important
+
+- **Terminal output now defaults to INFO; file sinks stay at DEBUG
+  (`core/logging_setup.py`, `config/models.py`)** — `setup()` previously
+  used a single `log_level` for both the console and file sinks, and
+  `Settings.log_level` defaults to `"DEBUG"` — so out of the box, every
+  DEBUG-level call anywhere in the codebase (not just the heartbeat) was
+  terminal-visible. `setup()` now takes an independent `terminal_level`
+  parameter (default `"INFO"`) for the console sink only; `log_level`
+  (still defaulting to `"DEBUG"`) continues to control file verbosity,
+  so full detail is still captured on disk for post-incident review.
+  `Settings.log_level`'s docstring/comment updated to reflect that it
+  now governs file output only.
+
+- **Account context now propagated via `logger.contextualize()` instead
+  of manual text prefixes** — `composition_root.start_account()` and
+  `AccountReconnector.run()` now each wrap their body in
+  `logger.contextualize(account=<index>)` for the account's entire
+  lifetime. Because this is a `contextvars`-backed context (loguru's own
+  implementation), it survives `await` points and propagates into every
+  `asyncio.Task` created underneath — including through hot-reload via
+  `AccountLoader.reattach()` — without any of the wrapped code needing
+  to know it's happening. This is what makes the exact-equality
+  per-account file filter above possible, and it made the following
+  manual `"[Account{N}]"` / `"[%s]"` text prefixes — previously
+  hand-embedded into nearly every log message in these four files,
+  redundant with (and in reconnector's case, the *only* substitute for)
+  proper structured context — removable entirely:
+  - `modules/base.py` — `_log_info`/`_log_warning`/`_log_error`/
+    `_log_debug` no longer re-inject `"[%s]" % self.cfg.index`; they
+    forward straight to `self._log`, whose bound name already encodes
+    the account, with `contextualize()` now also carrying it structurally.
+  - `core/loader.py` — all 23 call sites had their manual `self.label`
+    (`f"Account{N}"`) prefix removed; the now-unused `self.label`
+    attribute was removed.
+  - `core/reconnector.py` — all ~25 call sites cleaned up (see above);
+    also converted from loguru's `{}`-style formatting to this project's
+    standard `%`-style, matching every other file, now that it goes
+    through `AccountLogger` like everything else.
+  - `app/composition_root.py` — `start_account()`'s local `label`
+    variable and its manual `"[%s]"` prefixing removed. **Hotfix:** the
+    first cut of this removal kept using the single module-level `log`
+    (shared, bound to the one fixed name `"userbot_own.app.
+    composition_root"`) for the rest of the method — so with the text
+    prefix gone and nothing replacing it, two different accounts'
+    "Connected to Telegram." / "Shutdown requested." / "Disconnected."
+    lines became genuinely indistinguishable in the console/file output
+    (confirmed in a real two-account run's terminal capture — the exact
+    same line appeared twice with no way to tell which account either
+    one belonged to). Fixed by giving `start_account()` its own
+    per-account logger, `get_logger(f"composition_root.account{N}")`
+    — matching the `loader.account{N}` / `reconnector.account{N}`
+    convention already used elsewhere — which shadows the shared `log`
+    for that method only. `_log_startup_banner()`, which genuinely runs
+    before any account exists, keeps using the shared module-level `log`
+    unchanged.
+
+  Net effect for a human reading the logs: account attribution comes
+  from one consistent, structural source everywhere, instead of three
+  different hand-rolled string conventions that existed side by side
+  (and, in reconnector's and composition_root's cases, weren't even
+  reliably reaching the right per-account file to begin with).
+
+- **File sinks made non-blocking (`core/logging_setup.py`)** — both the
+  main file sink and the per-account file sink now pass `enqueue=True`
+  to `logger.add()`, moving the actual disk write onto a background
+  thread via loguru's internal queue. Without this, a slow write on
+  storage-constrained Android/Termux storage could in principle stall
+  the event loop that the reconnector's 3-second connectivity probes
+  also run on. Console sinks are unaffected — never the bottleneck, and
+  their ordering relative to the live terminal is more useful preserved
+  exactly as emitted.
+
+### Added — Nice-to-have
+
+- **On-demand liveness readout in the `reactions` / `.reactions` command
+  (`reaction_commands.py`)** — a new `_format_liveness_line()` helper
+  reports whether the module is ready and how long ago (in seconds) the
+  last reaction update actually reached the processing funnel, tracked
+  via a new `_last_event_at` timestamp updated in
+  `_process_reaction_update()`. Shown in both branches of `_cmd_list()`
+  (whether or not any reactions are currently configured). This gives an
+  immediate, synchronous answer to "is this module still alive?" without
+  waiting up to 5 minutes for the next heartbeat or opening a log file —
+  directly addressing the liveness-observability requirement that
+  motivated demoting the heartbeat above.
+
+### Fixed — Minor
+
+- **`userbot_own/__init__.py`'s `_FALLBACK_VERSION` constant had drifted
+  to `"3.1.4"`** — three releases stale relative to the actual `VERSION`
+  file (`3.1.8`) at the time of this fix, despite its own comment stating
+  it's "kept in sync." Corrected to `"3.1.9"` as part of this version
+  bump; the fallback mechanism itself (used only if `VERSION` is
+  missing/unreadable) is unchanged.
+
+### Compatibility
+
+- No new dependencies — `requirements.txt` and `install.sh` are
+  unchanged, so One-Click Installation on Termux is unaffected.
+- DI / Composition Root architecture unchanged — no new singletons
+  constructed outside `composition_root.py`; `logger.contextualize()` is
+  entered *by* the Composition Root's own `start_account()`, not a new
+  object requiring injection.
+- Hot-reload idempotency unaffected — `logging_setup.setup()`'s
+  `_configured` guard is untouched, and no new `logger.add()` call sites
+  were introduced outside `setup()`/`add_account_handler()`.
+- FloodWait re-raise pattern untouched — no exception-handling logic was
+  modified in `reconnector.py` or `join_left.py`, only log calls
+  immediately alongside it.
+- Multi-account isolation **improved**, not merely preserved — this
+  release fixes a real, pre-existing cross-account log leak (see
+  "Fixed — Critical" above) rather than avoiding introducing a new one.
+- `history_limit` (2000) and `from_user="me"` in group filters:
+  unchanged; no file touched in this release contains either.
+
+---
+
 ## [3.1.8] — 2026-09-14
 
 **Source:** AI (multi-round investigation across two independent bug reports;

@@ -48,7 +48,6 @@ DocumentAttributeAudio. Use `autoclear other on 1` to auto-clear them.
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 
 from telethon import TelegramClient, events
@@ -56,6 +55,7 @@ from telethon.tl.types import User
 from telethon.utils import get_display_name
 
 from userbot_own.core.context import ModuleContext
+from userbot_own.core.logging_setup import get_logger
 from userbot_own.helpers.utils import (
     batch_delete,
     classify_message,
@@ -65,7 +65,7 @@ from userbot_own.helpers.utils import (
 )
 from userbot_own.modules.base import Module
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 # ── Type / scope constants ────────────────────────────────────────────────────

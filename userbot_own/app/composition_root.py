@@ -39,6 +39,8 @@ import logging
 import sys
 from pathlib import Path
 
+from loguru import logger as _loguru_core
+
 from userbot_own import __version__
 from userbot_own.config.loader import discover_accounts, load_settings
 from userbot_own.config.models import AccountConfig, Paths, Settings
@@ -145,77 +147,109 @@ class CompositionRoot:
         2. Load modules (register handlers on client object, not connection)
         3. Connect to Telegram with retry logic
         4. Start reconnector (which monitors and recovers if connection drops)
-        """
-        label = f"Account{acc_cfg.index}"
 
+        v3.1.9: the whole method body (after registering the per-account
+        file handler) runs inside `logger.contextualize(account=...)`.
+        This is the *entry point* for that context — every log record
+        emitted anywhere in this account's task tree from here on,
+        including inside AccountLoader, AccountReconnector, and every
+        module's `_log_info`/`_log_warning`/etc., automatically carries
+        `extra["account"] == acc_cfg.index`, which is what
+        `logging_setup.add_account_handler()`'s per-account file filter
+        matches on exactly (previously a fragile substring test on the
+        logger's *name* — see CHANGELOG v3.1.9).
+
+        `log` below is a per-account logger obtained from
+        `get_logger(f"composition_root.account{N}")` — a local name
+        that shadows the module-level `log` (bound to the single shared
+        "userbot_own.app.composition_root" name used by
+        `_log_startup_banner()`, which genuinely runs before any account
+        exists) for the rest of this method only. This is a v3.1.9
+        hotfix: the first cut of this change removed the old manual
+        `"[%s]" % label` text prefix but kept using the *shared*
+        module-level `log`, whose bound name is identical for every
+        account — so two accounts' "Connected to Telegram." /
+        "Disconnected." lines became genuinely indistinguishable in the
+        console/file output (the account index only lived in the
+        invisible `contextualize()` context, not in anything rendered).
+        A per-account logger name here restores unambiguous console
+        attribution the same way `loader.account{N}` and
+        `reconnector.account{N}` already do, without reintroducing a
+        manual text prefix.
+        """
         logging_setup.add_account_handler(
             account_index=acc_cfg.index,
             log_file=acc_cfg.log_file,
             log_level=self.settings.log_level,
         )
 
-        # Step 1: Build client
-        ac = AccountClient(acc_cfg)
-        client = ac.build()
+        # v3.1.9 hotfix: per-account logger, not the shared module-level
+        # `log` — see the docstring above for why. This shadows `log` for
+        # the remainder of this method only; `_log_startup_banner()` and
+        # anything else using the shared logger elsewhere is unaffected.
+        log = logging_setup.get_logger(f"composition_root.account{acc_cfg.index}")
 
-        # Step 2: Load modules on the (not-yet-connected) client.
-        # Telethon registers handlers on the client object, not the connection,
-        # so this is safe before connect(). It also closes the race window where
-        # a message arrives between connect() and load_all().
-        context = self.build_module_context(acc_cfg)
-        # v3.1.0: second, optional root for per-account enable/disable
-        # plugins. Everything else about the extra-module system —
-        # enabled_modules.json's path, watching it for external edits,
-        # the enabled-set cache — is self-contained inside AccountLoader;
-        # this is the only line composition_root.py needed to change.
-        loader = AccountLoader(context, self.paths.modules, self.paths.modules_extra)
-        loader.load_all(client)
-        self.loader_registry.register(acc_cfg.index, loader)
+        with _loguru_core.contextualize(account=acc_cfg.index):
+            # Step 1: Build client
+            ac = AccountClient(acc_cfg)
+            client = ac.build()
 
-        # Step 3: Connect with retry (exponential backoff for mobile networks)
-        max_attempts = 5
-        for attempt in range(1, max_attempts + 1):
-            try:
-                await asyncio.wait_for(client.connect(), timeout=30.0)
-                log.info("[%s] Connected to Telegram.", label)
-                break
-            except (TimeoutError, Exception) as exc:
-                log.warning(
-                    "[%s] Connect attempt %d/%d failed: %s",
-                    label, attempt, max_attempts, exc,
-                )
-                if attempt == max_attempts:
-                    log.error(
-                        "[%s] Initial connect failed — reconnector will keep trying.",
-                        label,
-                    )
-                else:
-                    await asyncio.sleep(min(2 ** attempt, 10))
+            # Step 2: Load modules on the (not-yet-connected) client.
+            # Telethon registers handlers on the client object, not the
+            # connection, so this is safe before connect(). It also closes
+            # the race window where a message arrives between connect() and
+            # load_all().
+            context = self.build_module_context(acc_cfg)
+            # v3.1.0: second, optional root for per-account enable/disable
+            # plugins. Everything else about the extra-module system —
+            # enabled_modules.json's path, watching it for external edits,
+            # the enabled-set cache — is self-contained inside AccountLoader;
+            # this is the only line composition_root.py needed to change.
+            loader = AccountLoader(context, self.paths.modules, self.paths.modules_extra)
+            loader.load_all(client)
+            self.loader_registry.register(acc_cfg.index, loader)
 
-        # Step 4: Verify authorization (only if connected)
-        if client.is_connected():
-            try:
-                if not await asyncio.wait_for(client.is_user_authorized(), timeout=10.0):
-                    log.warning("[%s] Not authorized — session may be invalid.", label)
-            except Exception as exc:
-                log.warning("[%s] Authorization check failed: %s", label, exc)
-
-        # Step 5: Run reconnector + file watcher concurrently
-        reconnector = AccountReconnector(ac, loader)
-        try:
-            await asyncio.gather(
-                reconnector.run(),
-                loader.watch(),
-            )
-        except asyncio.CancelledError:
-            log.info("[%s] Shutdown requested.", label)
-        finally:
-            if client and client.is_connected():
+            # Step 3: Connect with retry (exponential backoff for mobile networks)
+            max_attempts = 5
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-            log.info("[%s] Disconnected.", label)
+                    await asyncio.wait_for(client.connect(), timeout=30.0)
+                    log.info("Connected to Telegram.")
+                    break
+                except (TimeoutError, Exception) as exc:
+                    log.warning(
+                        "Connect attempt %d/%d failed: %s",
+                        attempt, max_attempts, exc,
+                    )
+                    if attempt == max_attempts:
+                        log.error("Initial connect failed — reconnector will keep trying.")
+                    else:
+                        await asyncio.sleep(min(2 ** attempt, 10))
+
+            # Step 4: Verify authorization (only if connected)
+            if client.is_connected():
+                try:
+                    if not await asyncio.wait_for(client.is_user_authorized(), timeout=10.0):
+                        log.warning("Not authorized — session may be invalid.")
+                except Exception as exc:
+                    log.warning("Authorization check failed: %s", exc)
+
+            # Step 5: Run reconnector + file watcher concurrently
+            reconnector = AccountReconnector(ac, loader)
+            try:
+                await asyncio.gather(
+                    reconnector.run(),
+                    loader.watch(),
+                )
+            except asyncio.CancelledError:
+                log.info("Shutdown requested.")
+            finally:
+                if client and client.is_connected():
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                log.info("Disconnected.")
 
 
 __all__ = ["CompositionRoot"]

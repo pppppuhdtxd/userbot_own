@@ -6,7 +6,12 @@
 # ── Core ──────────────────────────────────────────────────────
 
 # Telegram client (async MTProto)
-telethon>=1.36.0
+# NOTE (v3.1.11): code is compatible with both Telethon generations —
+# helpers/utils.py detects inline-keyboard URL buttons via is_url_button(),
+# which handles KeyboardButtonUrl (<= 1.44) and KeyboardInlineButton +
+# InlineButtonTypeUrl (>= 1.45, TL layer 229). Floor stays at 1.44.0
+# (the version this release is built and tested against).
+telethon>=1.44.0
 
 # Environment variable loading (.env files)
 python-dotenv>=1.0.0

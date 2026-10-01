@@ -34,9 +34,10 @@ class ModuleContext:
         cfg:              This account's own immutable AccountConfig.
         settings:         Global runtime settings (backoff, history_limit,
                           log_level) — replaces reaching for `config.HISTORY_LIMIT`
-                          etc. as module-level globals. Only clearer.py reads
-                          one of these fields (history_limit) today, but the
-                          whole Settings object is provided for the same
+                          etc. as module-level globals. Only one of these
+                          fields (history_limit) is read by modules today —
+                          by clearer.py AND auto_clearer.py — but the whole
+                          Settings object is provided for the same
                           uniformity reason as the other fields here.
         loader_registry:  Application-scoped account-index -> AccountLoader map.
                           Deliberately cross-account, not per-account — see

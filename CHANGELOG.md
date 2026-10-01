@@ -5,6 +5,241 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.1.10] — 2026-09-30
+
+**Source:** AI — full-codebase audit requested by the project owner (three
+rounds; every Python file in the package read line by line, ~16,760 lines
+across 33 files), findings approved by the owner before implementation.
+
+**Two places where this release differs from the approved plan, stated up
+front rather than buried:**
+
+1. **Telethon is capped at `<1.45.0`, not raised to 1.45.0.** The audit
+   recommended bumping the floor to 1.45.0 as "safe — no breaking changes".
+   That recommendation was wrong: it rested on the upstream changelog, which
+   documents no breaking change, and not on testing this project's own imports.
+   See *Dependency Updates* below.
+2. **The I2 (type-aware folder exclusion) timeline in older text was wrong.**
+   The audit and the approval both said "unconditional since v3.1.6". The
+   CHANGELOG shows v3.1.6 *introduced* type-aware exclusion and it was
+   *reverted afterwards in an unversioned hotfix* (see [3.1.8]). Code comments
+   in this release state that history.
+
+### Bug Fixes
+
+- **`modules/join_left.py` — 29 log calls were silently dropped from every log
+  file.** The module-level logger was a raw stdlib `logging.getLogger(__name__)`.
+  A stdlib logger reaches loguru through `InterceptHandler` *without* the
+  `name` key that `core/logging_setup.py`'s file sinks require before they accept
+  a record, so its 28 `debug()` calls and 1 `warning()` never reached `main.log`
+  or any per-account log (only the warning reached the console, mixed in with
+  third-party noise). Same root cause v3.1.9 fixed in `app/application.py` and
+  `core/reconnector.py`; this file was missed. It now uses `get_logger()`.
+  A project-wide grep confirms no other own-code file uses a raw stdlib logger.
+
+- **`account_management/cli.py` — `_login()` asked for a 2FA password even though
+  the login code was never accepted.** Step 4 (code entry) had no
+  "did it succeed?" guard, unlike Step 3 (`code_request_ok`) and Step 5
+  (`password_ok`). Any sequence of attempts that used up all 5 retries without
+  reaching a `return False` branch — five non-digit entries, five sign-in
+  timeouts, or any mix (the invalid-code guard only fires when the *last* attempt
+  is the invalid one) — fell off the end of the loop into the 2FA step. Now
+  guarded with `code_accepted`, set only where the code really was accepted
+  (successful sign-in, or `SessionPasswordNeededError`). This was the only
+  unguarded retry loop in the file.
+
+- **`core/reconnector.py` — a revoked/logged-out session was retried about every
+  8-10 seconds, forever.** `_attempt_connect()` raises when the session is no
+  longer authorized (deliberately outside tenacity's retry types), but nothing
+  downstream treated that specially: it reached `run()`'s catch-all, which logged
+  a full traceback and slept a flat 5 s before the next full connect attempt.
+  It was easy to hit because the health check's own dead-session branch
+  (`except errors.AuthKeyError`) only covers `AUTH_KEY_DUPLICATED`; the usual
+  permanent failures (`SESSION_REVOKED`, `AUTH_KEY_UNREGISTERED`,
+  `USER_DEACTIVATED[_BAN]`) are `UnauthorizedError`, a different base class, and
+  reach this loop through the generic branch. Now: `_attempt_connect()` raises
+  `_AuthorizationLost` (a `RuntimeError` subclass), and `run()` logs one clear
+  ERROR line (no traceback) and waits 10 → 20 → 30 min between attempts, resetting
+  on the first successful reconnect. It is a backoff, not a permanent stop, on
+  purpose: Telethon's `is_user_authorized()` returns `False` for *any* RPC error
+  (a transient FloodWait included), so "not authorized" is not always permanent,
+  and a session re-created with `add_account.py` is picked up at the next check.
+  Measured with a fake client and a virtual clock over one simulated hour
+  (fixed waits only, zero network time): **450 connection attempts and 450 ERROR
+  records with tracebacks before; 3 attempts and 3 records, no tracebacks,
+  after.** Also fixed as a side effect: cancelling the reconnector while it waits
+  now exits through the normal path (the old catch-all sleep let
+  `CancelledError` escape `run()` and skipped the "stopped" log and watcher cleanup).
+
+- **`app/composition_root.py` — the startup banner told operators to kill the
+  bot.** It advertised `Ctrl+R=restart` (Windows) and
+  `SIGUSR1=restart (pkill -SIGUSR1 -f main.py)` (Unix/Termux). Both were
+  implemented by `app/restart.py`, which v3.0.4 deleted. With no handler
+  installed, `SIGUSR1`'s default action terminates the process: verified, a
+  process shaped like `application.py` exits with code 138 and its `finally`
+  block never runs. The banner now says only `Ctrl+C=exit`.
+
+- **`core/watcher.py` — the "add an account without restarting" feature was never
+  implemented, but the code and log said it was.** `AccountsDirHandler.on_created`
+  logged "Triggering startup for new account…" and never called
+  `start_account_cb`. It could not simply be wired through: the handler runs on
+  watchdog's thread as a plain function while `CompositionRoot.start_account` is a
+  coroutine, and the event fires when `add_account.py` *creates* the folder —
+  before `account.json` exists or the login has finished. Also, in the normal
+  flow the operator only saw a quiet "account.json not found yet" line and was
+  never told a restart was needed (the folder was recorded as known before that
+  check). Both log branches now say the bot does not start accounts at runtime
+  and must be restarted; docstrings (module, class, `setup_watchers`) now match.
+  `start_account_cb` is kept (and documented as reserved) so `app/application.py`'s
+  wiring is unchanged. The `account.json` half of the old claim was overstated
+  too: `AccountJsonHandler` only logs a phone change, it never applied one.
+
+- **`modules/join_left.py` — "already a member" was reported like a fresh join.**
+  Of the five join paths, three (invite-hash, pre-resolve, last-chance catch)
+  said `ℹ️ … قبلاً عضو بود (جوین موفق)`, but the four in-branch handlers
+  (channel_id, username, numeric_id, invite_with_username) fell into the shared
+  success block and printed a plain `✅`. All now use the same wording. Wording
+  only — counting, persistence, adaptive decay and post-join actions are
+  unchanged, and the flag is reset at the top of every attempt so it cannot leak
+  to the next item or across a FloodWait retry.
+
+- **`modules/join_left.py` — `_handle_left` called an unresolvable-membership
+  case "not found".** For an invite link that resolves but where the account is
+  not a member, it reported `❌ … یافت نشد`. That branch is only reachable in that
+  one situation; it now reports `ℹ️ … از قبل عضو نبود`, the same wording the
+  `UserNotParticipantError` handler already used for the same situation.
+
+### Dependency Updates
+
+- **`requirements.txt`: `telethon>=1.36.0` → `telethon>=1.44.0,<1.45.0`.**
+  On Telethon 1.45.0 (TL layer 229) `KeyboardButtonUrl` no longer exists (replaced
+  by `KeyboardInlineButton` + `InlineButtonTypeUrl`). This project imports it in
+  `helpers/utils.py`, `modules/info_handler.py` and `modules/join_left.py`, and uses
+  it to recognise inline URL buttons. On 1.45.0, `helpers.utils` fails to import
+  and takes 10 more modules down by cascade — 11 of 37 fail, including
+  `core/loader.py`, `app/composition_root.py` and `app/application.py`, i.e. the
+  whole startup path: the bot cannot start.
+  Because the old pin had no upper bound, **a fresh install of v3.1.9 since
+  Telethon 1.45.0 was published resolves to 1.45.0 and crashes.** Verified: with
+  the new pin, a fresh install resolves to 1.44.0, and `update.sh`'s plain
+  `pip install -r requirements.txt` downgrades an install already on 1.45.0.
+  The floor moved from 1.36.0 to 1.44.0 because that is the version this release
+  is built and tested against (1.44.0 and 1.45.0 are the only versions tested).
+  **Follow-up, not done here:** port the three call sites to the 1.45 button
+  model and test against real message traffic before raising the cap — a silent
+  degradation of URL-button detection would quietly break `clear link` and
+  auto-clear, so a hard pin is safer than an untested shim.
+- **`pyproject.toml`: `version` corrected from `3.1.0` to `3.1.10`** (metadata
+  drift; nothing reads it at runtime).
+
+### Documentation Fixes
+
+- **`README.md`:** version line (`3.0.8` → `3.1.10`); project tree — removed the
+  phantom `app/restart.py`, corrected `application.py`'s stale "restart-spawn
+  entry point" description, corrected `watcher.py`'s description, replaced the
+  nonexistent `.env.example` row; "Live config reload" row rewritten as
+  "Config-change detection" (detect + log only, restart required); documented the
+  new revoked-session behaviour in the connection-resilience section; the
+  Version rule now lists every hand-maintained copy of the version.
+- **`.env.example` never shipped.** The README's manual-install step
+  (`cp userbot_own/.env.example …`) failed on a fresh checkout. Likely cause: the
+  repo's own `.gitignore` has `.env.*`, which also matches `.env.example`. The
+  README no longer depends on it (create `userbot_own/.env` yourself). `.gitignore`
+  is intentionally untouched — add `!.env.example` if you want the file back.
+- **`README.md` Configuration table:** `BACKOFF_START` / `BACKOFF_MAX` are loaded
+  into `Settings` but nothing reads them (`core/reconnector.py`'s schedule is
+  fixed); marked "currently has no effect", with a pointer to the
+  `FAST_RECONNECT_*` variables that do work.
+- **`modules_extra/example_module.py` restored.** Introduced in v3.1.0 and
+  documented (README walkthrough, project tree, the in-app `.extra` help) as
+  shipping with the project, but absent from the v3.1.9 package; the CHANGELOG
+  records no removal. It responds to `پینگ اضافی` with `🏓 pong` in Saved Messages
+  only and ships disabled — a `modules_extra/` file is never imported until
+  `.extra enable example_module` — so it cannot affect anything by default.
+- **`modules/join_left.py`:** in-app help said the Layer-4 batch rest fires "after
+  every 5 joins"; `_BATCH_SIZE` is 4. Every other number in that help section was
+  checked against its constant and is correct. Four stale mentions of the reverted
+  type-aware (I2) exclusion corrected: the header narrative, the section banner,
+  `_post_join_actions`'s docstring, and the now-removed helper (see below).
+- **`modules/clearer.py`:** `_matches_scope`'s docstring said scope `self` is only
+  re-checked client-side in private chats; the code always re-checks it, which
+  means a wrong `is_private` flag cannot widen `clear self`.
+- **`core/context.py`:** `history_limit` is read by `clearer.py` *and*
+  `auto_clearer.py`, not only the former.
+- **`helpers/utils.py`:** `classify_message` documents a caveat, verified with
+  real Telethon objects: audio and voice messages classify as `other` only when
+  caption-less; with a caption they classify as `txt` (or `link`). Photos, videos
+  and files keep their media class.
+- **`modules/base.py`:** removed an orphaned docstring fragment.
+- **`userbot_own/__init__.py`:** `_FALLBACK_VERSION` bumped in the same change as
+  `VERSION`, with the reason for the rule recorded next to it.
+- **`core/telegram_client.py` / `account_management/cli.py`:** notes on the
+  `ConnectionTcpFull` (bot, checksummed) vs `ConnectionTcpAbridged` (short-lived
+  login client) difference. Not unified: no documented reason for the difference
+  exists, and changing how the login flow connects cannot be verified without a
+  live account.
+
+### Code Quality
+
+- **`modules/help_handler.py`** now dispatches through `CommandRouter` like
+  `system.py`, `module_manager.py` and `whois_handler.py`. Behaviour is identical:
+  17 inputs (mixed case, extra arguments, near-miss commands, whitespace, empty
+  and `None` text, outside Saved Messages) produce the same handler calls, queries
+  and Saved-Messages-check ordering before and after.
+- **`account_management/cli.py` `_write_cfg`** now delegates to
+  `write_json_file_atomic()` instead of a hand-rolled copy of the same pattern.
+  On-disk output is byte-identical (same sha256: `indent=2`, UTF-8,
+  `ensure_ascii=False`, same `account.json.tmp` temp name via `tmp_suffix`). The
+  import is deliberately lazy, so the CLI still starts without Telethon
+  installed. **One behaviour change:** with Telethon not importable (the
+  helper's module imports it at load time), config writes now fail with a clear
+  "a Python dependency failed to import" message instead of succeeding; the bot
+  cannot run in that state anyway.
+- **`modules/join_left.py`:** removed dead `_folder_would_show_entity` (never
+  called since I2 was reverted).
+- **`app/composition_root.py`:** `except (TimeoutError, Exception)` → `except
+  Exception` (identical: `TimeoutError` is an `Exception`, and
+  `asyncio.TimeoutError is TimeoutError` on 3.11+); removed the `sys` import the
+  banner fix left unused.
+
+### Compatibility
+
+Python 3.11+. Telethon 1.44.x. No new dependency. `install.sh` and `update.sh`
+are untouched. Hot-reload, multi-account isolation, the dynamic help system,
+`history_limit = 2000`, the `from_user="me"` group-only rule, the composition
+root / DI wiring, the FloodWait re-raise pattern and atomic writes are all
+unchanged. `ruff` (project config): the one pre-existing finding
+(`E741`, `join_left.py`) is unchanged; no new findings.
+
+### Not Changed (explicitly, and why)
+
+- **`core/events.py` is an orphan.** `core/reconnector.py`'s docstring calls it
+  "now removed" and `composition_root.py` says the `EventBus` was dropped in
+  v3.0.11, yet the file still ships and nothing imports it. Not deleted here
+  (not in the approved scope); a good candidate for the next release.
+- `config/models.py`'s `backoff_start` / `backoff_max` fields are left as they
+  are; the README now says they do nothing.
+- `reconnector.run()`'s generic catch-all still sleeps 5 s inside its `except`
+  body (only the new authorization-loss wait handles cancellation itself).
+- `.gitignore`'s `.env.*` pattern (see above).
+- The pre-3.1.9 history in this file was not audited entry by entry.
+
+### Verification
+
+Each fix was tested against the original tree and the patched tree using the
+real classes and fakes for Telegram: a virtual-clock harness for the reconnector
+(permanent loss, recovery with counter reset, an ordinary transient failure
+that must behave identically, cancellation while parked in the wait); the real
+`_handle_join` / `_handle_left` driven across every join branch including the
+string-match and FloodWait-then-member variants (result counters identical to
+before); the real `AccountLoader` loading all 10 core modules and walking the
+README's example-module walkthrough step by step; a mock-driven `_login()` over
+8 retry scenarios; the real watchdog `Observer` for the watcher; byte comparison
+of `_write_cfg` output; real Telethon `Message` objects for `classify_message`;
+and a SIGUSR1 probe process. All modules import on Telethon 1.44.0.
+
+---
+
 ## [3.1.9] — 2026-09-25
 
 **Source:** AI (system-wide logging review requested by project owner —

@@ -242,19 +242,37 @@ def _read_cfg(folder: Path) -> dict | None:
 
 
 def _write_cfg(folder: Path, cfg: dict) -> bool:
-    """Atomically write account.json via temp file + rename."""
-    cfg_file = folder / "account.json"
-    tmp_file = folder / "account.json.tmp"
+    """Atomically write account.json via helpers/utils.py::write_json_file_atomic."""
+    # v3.1.10: this used to be a hand-rolled copy of the same temp-file +
+    # rename pattern that write_json_file_atomic() already provides (and that
+    # every module's settings writer shares) — two implementations of a
+    # safety-critical routine is how they drift apart. The on-disk result is
+    # unchanged: indent=2, UTF-8, ensure_ascii=False, and the same
+    # `account.json.tmp` temp name (via tmp_suffix — the helper's default
+    # would have produced `account.tmp`).
+    #
+    # The import is deliberately lazy. helpers/utils.py imports Telethon at
+    # module level, while this CLI has always started — and shown _login()'s
+    # friendly "telethon is not installed" message — without it; a top-level
+    # import would turn a missing dependency into a raw traceback before any
+    # menu appears. `pip install -r requirements.txt` is the right hint for
+    # both causes: a missing package and an out-of-range Telethon version.
     try:
-        tmp_file.write_text(
-            json.dumps(cfg, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        from userbot_own.helpers.utils import write_json_file_atomic
+    except ImportError as exc:
+        _err(
+            "Cannot write account.json — a Python dependency failed to "
+            f"import ({exc}). Try: pip install -r requirements.txt"
         )
-        tmp_file.replace(cfg_file)
-        return True
-    except OSError as exc:
-        _err(f"Failed to write account.json: {exc}")
         return False
+
+    write_err = write_json_file_atomic(
+        folder / "account.json", cfg, indent=2, tmp_suffix=".json.tmp"
+    )
+    if write_err is not None:
+        _err(f"Failed to write account.json: {write_err}")
+        return False
+    return True
 
 
 def _backup_cfg(folder: Path) -> Path | None:
@@ -498,6 +516,12 @@ def _build_client(cfg: dict, account_dir: Path):
         session,
         cfg["api_id"],
         cfg["api_hash"],
+        # v3.1.10 note: the long-lived bot client (core/telegram_client.py)
+        # uses ConnectionTcpFull (checksummed); this short-lived login/verify
+        # client uses the lighter Abridged transport. Both are standard MTProto
+        # transports the server accepts. The audit found no documented reason
+        # for the difference and left it alone rather than unify: changing how
+        # the login flow connects cannot be verified without a live account.
         connection=ConnectionTcpAbridged,
     )
 
@@ -604,6 +628,18 @@ async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
 
         # ── Step 4: Enter code with retry ───────────────────────────
         code = ""
+        # v3.1.10: this loop had no "did it actually succeed?" guard, unlike
+        # Step 3 above (`code_request_ok`) and Step 5 below (`password_ok`).
+        # Any sequence of attempts that used up every retry without reaching
+        # a `return False` branch — five non-digit entries, five sign-in
+        # timeouts, or any mix of the two (the PhoneCodeInvalidError guard
+        # below only fires when the LAST attempt is itself the invalid one) —
+        # simply fell off the end of the loop and continued into Step 5, which
+        # then asked for a 2FA password for an account that never got past the
+        # code stage. `code_accepted` is set only where the code really was
+        # accepted: a successful sign-in, or SessionPasswordNeededError (the
+        # code was fine; the account additionally has 2FA, handled in Step 5).
+        code_accepted = False
         for attempt in range(1, _MAX_RETRIES + 1):
             code = _ask("Verification code (spaces allowed)").replace(" ", "")
             if not code or not code.isdigit():
@@ -615,8 +651,10 @@ async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
                     client.sign_in(cfg["phone"], code),
                     timeout=_SIGNIN_TIMEOUT,
                 )
+                code_accepted = True
                 break
             except tl_errors.SessionPasswordNeededError:
+                code_accepted = True
                 break
             except tl_errors.PhoneCodeInvalidError:
                 _err(f"Invalid code. (Attempt {attempt}/{_MAX_RETRIES})")
@@ -631,6 +669,10 @@ async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
             except Exception as exc:
                 _err(f"Sign-in failed: {exc}")
                 return False
+
+        if not code_accepted:
+            _err("Could not verify the login code after multiple attempts.")
+            return False
 
         # ── Step 5: 2FA password (if needed) with retry ─────────────
         try:

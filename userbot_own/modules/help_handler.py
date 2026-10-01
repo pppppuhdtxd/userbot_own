@@ -21,6 +21,7 @@ from telethon import TelegramClient, events
 from userbot_own.core.context import ModuleContext
 from userbot_own.core.exceptions import LoaderNotFoundError
 from userbot_own.modules.base import Module
+from userbot_own.modules.router import CommandRouter
 
 # Logging is provided by Module._log_* helpers; no module-level logger needed.
 
@@ -65,6 +66,15 @@ class HelpHandler(Module):
     category = "general"
     desc = "راهنما"
 
+    def __init__(self, context: ModuleContext) -> None:
+        super().__init__(context)
+        # v3.1.10: first-token dispatch now goes through CommandRouter like
+        # system.py, module_manager.py and whois_handler.py, instead of the
+        # hand-written `parts[0] != "help"` check. Behaviour is unchanged:
+        # exact case-insensitive match on the first token only.
+        self._router = CommandRouter()
+        self._router.register("help", handler=self._cmd_help)
+
     def setup(self, client: TelegramClient) -> None:
         self._add_handler(client, events.NewMessage(outgoing=True), self._on_command)
         self._log_info("HelpHandler ready.")
@@ -73,19 +83,24 @@ class HelpHandler(Module):
 
     async def _on_command(self, event) -> None:
         text = (event.raw_text or "").strip()
-        if not text:
-            return
-
-        parts = text.lower().split()
-
-        # Only handle `help` commands
-        if parts[0] != "help":
+        # Match the command FIRST, so ordinary chat messages never reach the
+        # Saved-Messages check below (same order as before the migration).
+        handler, _ = self._router.resolve(text)
+        if handler is None:
             return
 
         # Only in Saved Messages
-        client = event.client
         if not await self._is_saved_messages(event):
             return
+
+        await handler(event)
+
+    async def _cmd_help(self, event) -> None:
+        # The router only matched the first token; the argument is this
+        # command's own business. Lowercasing the whole text and using just
+        # the first argument is exactly what the pre-router code did.
+        parts = (event.raw_text or "").strip().lower().split()
+        client = event.client
 
         if len(parts) == 1:
             # `help` → compact list

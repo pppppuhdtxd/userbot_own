@@ -135,13 +135,17 @@ v3.1.6 Changes:
     autoleave and _sync_folder_to_tracking scan all joined* folders.
 
   Fix I2 — Smart type-aware exclusion + exclude_peers capacity guard:
-    Joined chats are now only excluded from folders whose type flags
-    match the entity type:
-      broadcast channels → only from folders with broadcasts=True
-      groups/supergroups → only from folders with groups=True
-      users/bots         → only from folders with contacts/non_contacts/bots=True
-    Purely explicit-peer folders (all type flags False) are skipped.
-    Also enforces a 100-entry cap on exclude_peers per folder (N4).
+    v3.1.10 correction: the type-aware half of this fix (introduced in v3.1.6)
+    no longer exists. It was reverted afterwards in an unversioned hotfix
+    (CHANGELOG [3.1.8] mentions it) because it suppressed exclusion for
+    explicit-peer folders with no type flags set — the common case. A joined
+    chat is now excluded from EVERY other editable folder unconditionally (see
+    _add_to_all_other_folders_exclusion). This paragraph used to describe the
+    reverted behaviour as current — "only excluded from folders whose type
+    flags match the entity type", "purely explicit-peer folders are skipped" —
+    and its helper, _folder_would_show_entity, was left behind as dead code
+    until v3.1.10.
+    Still in force: a 100-entry cap on exclude_peers per folder (N4).
 
   Fix I3 — Pre-join invite link validation:
     Before starting any join operations, all invite_link entities are
@@ -254,7 +258,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import logging
 import random
 import re
 import time
@@ -278,18 +281,31 @@ from telethon.tl.types import (
     InputNotifyPeer,
     InputPeerNotifySettings,
     InputPeerSelf,
-    KeyboardButtonUrl,
     ReplyInlineMarkup,
     TextWithEntities,
 )
 from telethon.tl.types import messages as tl_messages
 
 from userbot_own.core.context import ModuleContext
-from userbot_own.helpers.utils import leave_dialog, read_json_file, safe_delete, write_json_file_atomic
+from userbot_own.core.logging_setup import get_logger
+from userbot_own.helpers.utils import get_inline_button_url, leave_dialog, read_json_file, safe_delete, write_json_file_atomic
 from userbot_own.modules.base import Module
 
 # Module-level logger — used only by free functions outside the Module class
-log = logging.getLogger(__name__)
+# (the Module class itself logs through self._log_* / modules/base.py).
+#
+# v3.1.10: this used to be a raw stdlib `logging.getLogger(__name__)`. A stdlib
+# logger reaches loguru through InterceptHandler WITHOUT the `name` key that
+# core/logging_setup.py's file sinks require before they accept a record, so
+# every call below (28 debug + 1 warning) was silently dropped from main.log
+# and from every per-account log — and only the single warning ever reached
+# the console, indistinguishable from third-party noise. It is the same root
+# cause v3.1.9 already fixed in app/application.py and core/reconnector.py;
+# this file was missed. get_logger() binds `name`, and the `account` context
+# entered by CompositionRoot.start_account() routes each record to the right
+# per-account file. (The "[Account%d]" text prefixes on the messages are kept
+# as they were — auto_clearer.py uses the same module-level pattern.)
+log = get_logger(__name__)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -581,43 +597,6 @@ def _unwrap_join_result(raw) -> tuple[object | None, bool]:
     return (chats[0] if chats else None, False)
 
 
-# ── Smart exclusion helper (I2) ───────────────────────────────────────────────
-
-def _folder_would_show_entity(folder: DialogFilter, entity) -> bool:
-    """
-    I2: Type-aware exclusion check.
-
-    Returns True only if the folder's type flags could cause this entity type
-    to appear in it (i.e., excluding it from that folder would have any effect).
-
-    Logic:
-    - broadcast Channel  → only relevant if folder.broadcasts=True
-    - megagroup/group    → only relevant if folder.groups=True
-    - User/bot           → only relevant if folder.contacts/non_contacts/bots=True
-    - Purely explicit-peers folders (all type flags False) return False — a
-      newly joined chat won't be in include_peers yet, so it would never appear.
-
-    This prevents wasteful UpdateDialogFilterRequest calls for folders whose
-    type flags don't include the joined entity type, and respects the
-    _EXCLUDE_PEERS_CAPACITY limit enforced separately.
-    """
-    if entity is None:
-        return False
-
-    is_broadcast = isinstance(entity, Channel) and entity.broadcast
-    is_group     = (isinstance(entity, Channel) and not entity.broadcast) or isinstance(entity, Chat)
-    is_user      = not isinstance(entity, (Channel, Chat))
-
-    if is_broadcast:
-        return bool(folder.broadcasts)
-    if is_group:
-        return bool(folder.groups)
-    if is_user:
-        return bool(folder.contacts or folder.non_contacts or folder.bots)
-
-    return False  # unknown entity type — skip
-
-
 # ── Folder creation / management ──────────────────────────────────────────────
 
 async def _create_joined_folder(
@@ -873,7 +852,7 @@ async def _remove_peers_from_all_joined_folders(
     return total_removed
 
 
-# ── I2: Smart type-aware folder exclusion ────────────────────────────────────
+# ── Folder exclusion (I2's type-aware version was reverted; now unconditional) ───
 
 async def _add_to_all_other_folders_exclusion(
     client: TelegramClient,
@@ -1463,7 +1442,7 @@ class JoinLeft(Module):
         Req 3 + Req 4: Immediately after a successful join, in this exact order:
         1. Mute the chat
         2. Add to joined* folder (incremental, with exclude_archived=True patch)
-        3. Add to exclude_peers of all OTHER folders (type-aware, I2)
+        3. Add to exclude_peers of all OTHER folders (unconditional — I2's type-aware check was reverted)
         4. Archive the chat (LAST — prevents folder operations from un-archiving)
 
         Archive is deliberately last: UpdateDialogFilterRequest with
@@ -1649,12 +1628,15 @@ class JoinLeft(Module):
         for ent in extract_telegram_entities(command_msg.message):
             seen.setdefault(ent, None)  # don't overwrite if already present
 
-        # Inline keyboard buttons on the reply message
+        # Inline keyboard buttons on the reply message (both Telethon
+        # generations: KeyboardButtonUrl on <= 1.44, KeyboardInlineButton +
+        # InlineButtonTypeUrl on >= 1.45 — via get_inline_button_url()).
         if hasattr(reply_msg, "reply_markup") and isinstance(reply_msg.reply_markup, ReplyInlineMarkup):
             for row in reply_msg.reply_markup.rows:
                 for button in row.buttons:
-                    if isinstance(button, KeyboardButtonUrl):
-                        for ent in extract_telegram_entities(button.url):
+                    btn_url = get_inline_button_url(button)
+                    if btn_url:
+                        for ent in extract_telegram_entities(btn_url):
                             seen.setdefault(ent, None)
 
         return list(seen.keys())
@@ -2283,6 +2265,11 @@ class JoinLeft(Module):
             # ── RETRY loop for FloodWait (with Req 5 cap) ─────────────────────
             while True:
                 try:
+                    # v3.1.10: set by the "already a member" handlers below so the shared
+                    # success block can word the result accordingly. Reset on EVERY attempt
+                    # so neither the next item nor a FloodWait retry can inherit it.
+                    already_member = False
+
                     # ── Join by effective type ─────────────────────────────────
 
                     if entity_type == "channel_id":
@@ -2308,9 +2295,11 @@ class JoinLeft(Module):
                                 joined_entity = await client.get_entity(ip)
                         except errors.UserAlreadyParticipantError:
                             joined_entity = await client.get_entity(ip)
+                            already_member = True
                         except Exception as exc:
                             if self._is_already_member_error(exc):
                                 joined_entity = await client.get_entity(ip)
+                                already_member = True
                             else:
                                 raise
 
@@ -2334,11 +2323,13 @@ class JoinLeft(Module):
                                 joined_entity = await client.get_entity(f"@{identifier}")
                         except errors.UserAlreadyParticipantError:
                             joined_entity = await client.get_entity(f"@{identifier}")
+                            already_member = True
                         except (errors.UsernameNotOccupiedError, errors.ChannelPrivateError):
                             raise
                         except Exception as exc:
                             if self._is_already_member_error(exc):
                                 joined_entity = await client.get_entity(f"@{identifier}")
+                                already_member = True
                             else:
                                 raise
 
@@ -2363,10 +2354,11 @@ class JoinLeft(Module):
                                 if joined_entity_new is not None:
                                     joined_entity = joined_entity_new
                             except errors.UserAlreadyParticipantError:
-                                pass  # keep pre-resolved joined_entity
+                                already_member = True  # keep pre-resolved joined_entity
                             except Exception as exc:
                                 if not self._is_already_member_error(exc):
                                     raise
+                                already_member = True  # keep pre-resolved joined_entity
 
                     elif entity_type == "invite_link":
 
@@ -2391,9 +2383,11 @@ class JoinLeft(Module):
                                     joined_entity = await client.get_entity(f"@{resolved_username}")
                             except errors.UserAlreadyParticipantError:
                                 joined_entity = await client.get_entity(f"@{resolved_username}")
+                                already_member = True
                             except Exception as exc:
                                 if self._is_already_member_error(exc):
                                     joined_entity = await client.get_entity(f"@{resolved_username}")
+                                    already_member = True
                                 else:
                                     # Fall back to hash path
                                     self._log_debug(
@@ -2510,7 +2504,14 @@ class JoinLeft(Module):
                         }.get(effective_type, "✅")
 
                         joined_entities.append(joined_entity)
-                        results.append(f"{path_icon} [{title}] ✅")
+                        if already_member:
+                            # v3.1.10: same wording as the invite-hash, Layer-1 and last-chance
+                            # paths for the same situation (was a plain "✅", which read as a
+                            # fresh join). WORDING ONLY — counting, persistence, adaptive decay
+                            # and post-join actions below are deliberately unchanged.
+                            results.append(f"ℹ️ [{title}] — قبلاً عضو بود (جوین موفق)")
+                        else:
+                            results.append(f"{path_icon} [{title}] ✅")
                         success_count += 1
                         join_times.append(time.monotonic() - attempt_start)
 
@@ -2764,7 +2765,12 @@ class JoinLeft(Module):
                             break
 
                     if target_entity is None:
-                        results.append(f"❌ [{identifier}] — یافت نشد")
+                        # v3.1.10: the ONLY way to reach this check is an invite link that
+                        # resolved (CheckChatInviteRequest answered) but where this account is
+                        # NOT a member — there is nothing to leave. It used to report "not
+                        # found" (❌), which is wrong: the link was found. Same wording as the
+                        # UserNotParticipantError handler below, which is the same situation.
+                        results.append(f"ℹ️ [{identifier}] — از قبل عضو نبود")
                         break
 
                     name = (
@@ -2913,7 +2919,7 @@ help_extra = (
     "  → FloodWait سنگین (≥300s): ضریب ×5.0\n"
     "  → با هر جوین موفق، ضریب ۱۰٪ کاهش می‌یابد\n\n"
     "Layer 4 — Batch & Cooldown (human only):\n"
-    "  → بعد از هر ۵ جوین: استراحت ۳۰s\n"
+    "  → بعد از هر ۴ جوین: استراحت ۳۰s\n"
     "  → بعد از هر ۳ دسته: استراحت ۱۲۰s\n"
     "  → jitter ±۲۰٪ روی تمام تأخیرها\n\n"
     "مدیریت فولدر (v3.1.6):\n"

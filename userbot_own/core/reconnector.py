@@ -144,6 +144,39 @@ file filter checks `record["extra"]["account"] == idx` exactly rather
 than a fragile substring test. See CHANGELOG v3.1.9 for the fuller
 before/after picture, including the multi-account log-file-leak bug
 this also fixes.
+
+────────────────────────────────────────────────────────────────
+v3.1.10 — Permanent authorization loss is no longer retried every ~10 s
+────────────────────────────────────────────────────────────────
+When a reconnect finds the session no longer authorized (revoked from
+another device, logged out, account deactivated), `_attempt_connect()`
+raises — deliberately outside tenacity's retry types, because retrying
+cannot help. But nothing downstream treated that exception specially: it
+travelled up to `run()`'s catch-all, which logged a full traceback and
+slept a flat 5 s, and the next cycle rebuilt the client and failed the
+same way. Adding up one lap's fixed waits (2 s SQLite wait + 1 s cleanup
+wait + the 5 s sleep, plus the network probe and the connect/auth round
+trips) that is a full connection attempt about every 8-10 s, forever —
+hundreds an hour, each with a traceback — for an account nobody may be
+watching. On Termux that is needless battery, network and log-file churn,
+plus a steady stream of connections with a dead auth key toward Telegram.
+
+It was easy to hit because the health check's own dead-session branch
+(`except errors.AuthKeyError`, sleep 300 s) only covers AUTH_KEY_DUPLICATED
+(RPC code 406). The usual permanent failures — SESSION_REVOKED,
+AUTH_KEY_UNREGISTERED, USER_DEACTIVATED[_BAN] — are `UnauthorizedError`
+(401), a different base class, so they fall through to the generic branch,
+escalate to `_recover_connection()`, and end up in this loop.
+
+Fix: `_attempt_connect()` now raises `_AuthorizationLost` (a RuntimeError
+subclass, so anything that caught RuntimeError is unaffected) and `run()`
+answers it with one clear ERROR line and an escalating wait — 10 min,
+20 min, then every 30 min — reset as soon as a reconnect succeeds. It is a
+backoff rather than a permanent stop on purpose: Telethon's
+`is_user_authorized()` returns False for ANY RPC error (a transient
+FloodWait included), so "not authorized" is not always permanent, and an
+account that is re-logged-in externally is picked up on the next check
+without a restart.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -214,6 +247,30 @@ _MIN_DEGRADED_INTERVAL: float = 5.0
 #: NO_INTERNET / TELEGRAM_DOWN / post-RetryError backoff (seconds). A raw
 #: TCP connect, never a Telegram API call — see _cheap_probe_online().
 _PROBE_INTERVAL: float = _env_float("FAST_RECONNECT_PROBE_INTERVAL", 3.0)
+
+
+# ── Authorization loss (v3.1.10) ─────────────────────────────────────────────
+
+#: Wait after a reconnect finds the account no longer authorized, doubling per
+#: consecutive loss up to the cap (seconds): 10 min → 20 min → 30 min, then
+#: every 30 min. Long, and NOT env-configurable, on purpose — reconnecting
+#: harder cannot fix a revoked session, so the wait's only job is to stop
+#: hammering Telegram (and the battery / log file on Termux) until a human
+#: re-logs in.
+_AUTH_FAILURE_BACKOFF_START: float = 600.0
+_AUTH_FAILURE_BACKOFF_MAX: float = 1800.0
+
+
+class _AuthorizationLost(RuntimeError):
+    """
+    A reconnect connected fine, but the session is no longer authorized.
+
+    Raised by `_attempt_connect()` and handled by `run()`'s escalating wait.
+    A RuntimeError subclass so anything that already caught the bare
+    RuntimeError this replaced keeps working; not one of tenacity's retry
+    types, so `_attempt_connect()`'s @retry never retries it. See the
+    module docstring's "v3.1.10" section.
+    """
 
 
 # ── Network State Detection ──────────────────────────────────────────────────
@@ -356,6 +413,10 @@ class AccountReconnector:
         self._last_state = NetworkState.UNKNOWN
         self._consecutive_failures = 0
 
+        # v3.1.10: consecutive reconnects that found the account unauthorized;
+        # drives the escalating wait in run(). Reset on a successful reconnect.
+        self._auth_failures = 0
+
         # v3.1.1: guards against a concurrent second call to
         # _recover_connection() while one is already in flight. Not fixing
         # an observed bug today (see module docstring) — defense-in-depth
@@ -416,6 +477,26 @@ class AccountReconnector:
                 except asyncio.CancelledError:
                     self._log.info("Reconnector cancelled.")
                     break
+                except _AuthorizationLost as exc:
+                    # v3.1.10: a dead session is not a transient error — see
+                    # the module docstring. One clear line (no traceback: the
+                    # cause is known) and a long, escalating wait, instead of
+                    # falling into the catch-all's flat 5 s retry below.
+                    self._auth_failures += 1
+                    delay = min(
+                        _AUTH_FAILURE_BACKOFF_START * 2 ** (self._auth_failures - 1),
+                        _AUTH_FAILURE_BACKOFF_MAX,
+                    )
+                    self._log.error(
+                        "%s Re-checking in %d min (attempt %d) — or restart "
+                        "the bot after re-login to pick it up immediately.",
+                        exc, int(delay // 60), self._auth_failures,
+                    )
+                    try:
+                        await asyncio.sleep(delay)
+                    except asyncio.CancelledError:
+                        self._log.info("Reconnector cancelled.")
+                        break
                 except Exception as exc:
                     self._log.exception("Reconnector cycle error: %s", exc)
                     await asyncio.sleep(5)
@@ -834,9 +915,11 @@ class AccountReconnector:
                 new_client.is_user_authorized(), timeout=10.0
             )
             if not authorized:
-                # Auth failure is permanent — don't retry, surface immediately
+                # Not authorized: tenacity must not retry this (it is not one
+                # of the retry types below), and run() answers it with a long
+                # escalating wait rather than its usual 5 s catch-all retry.
                 self._notify(connected=False)
-                raise RuntimeError(
+                raise _AuthorizationLost(
                     f"[Account{self._cfg.index}] Not authorized after reconnect "
                     "— session file may be invalid. Run add_account.py to re-login."
                 )
@@ -850,8 +933,9 @@ class AccountReconnector:
             # client — it must always track whichever client is current.
             self._start_disconnect_watcher(new_client)
 
-            # Reset failure counter and notify subscribers
+            # Reset failure counters and notify subscribers
             self._consecutive_failures = 0
+            self._auth_failures = 0
             self._notify(connected=True)
 
         except Exception:

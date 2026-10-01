@@ -57,7 +57,6 @@ from telethon.tl.types import (
     DocumentAttributeImageSize,
     DocumentAttributeSticker,
     DocumentAttributeVideo,
-    KeyboardButtonUrl,
     Message,
     MessageEntityBlockquote,
     MessageEntityBold,
@@ -101,6 +100,7 @@ from userbot_own.helpers.utils import (
     format_user_flags,
     get_file_extension,
     get_file_size,
+    get_inline_button_url,
     truncate,
 )
 from userbot_own.modules.base import Module
@@ -516,26 +516,27 @@ class InfoHandler(Module):
 
         # F4: Inline keyboard URL buttons (glass/web buttons — دکمه‌های شیشه‌ای)
         # is_link() classifies a message as 'link' when ReplyInlineMarkup
-        # contains at least one KeyboardButtonUrl. Display those buttons here.
+        # contains at least one URL button (KeyboardButtonUrl on Telethon
+        # <= 1.44, KeyboardInlineButton + InlineButtonTypeUrl on >= 1.45).
+        # Display those buttons here via the version-agnostic helper.
         reply_markup = getattr(msg, "reply_markup", None)
         if isinstance(reply_markup, ReplyInlineMarkup):
             url_buttons: list = []
             for row in (getattr(reply_markup, "rows", None) or []):
                 for button in (getattr(row, "buttons", None) or []):
-                    if isinstance(button, KeyboardButtonUrl):
-                        url_buttons.append(button)
+                    url = get_inline_button_url(button)
+                    if url:
+                        url_buttons.append((getattr(button, "text", "") or "?", url))
 
             if url_buttons:
                 lines.append(f"• 🔘 دکمه‌های لینک (inline keyboard): `{len(url_buttons)}`")
                 shown = 0
-                for btn in url_buttons:
+                for label, url in url_buttons:
                     if shown >= 5:
                         remaining = len(url_buttons) - 5
                         if remaining > 0:
                             lines.append(f"  … و `{remaining}` دکمه دیگر")
                         break
-                    label = (getattr(btn, "text", "") or "?")
-                    url   = (getattr(btn, "url",  "") or "")
                     if len(url) > 100:
                         url = url[:100] + "…"
                     lines.append(f"  - `{label}` → `{url}`")

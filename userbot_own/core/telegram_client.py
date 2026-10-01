@@ -100,6 +100,11 @@ def _build_connection_kwargs(cfg: AccountConfig) -> dict:
         "session":               session,
         "api_id":                cfg.api_id,
         "api_hash":              cfg.api_hash,
+        # ConnectionTcpFull adds a sequence number and a CRC32 checksum to every
+        # packet (ConnectionTcpAbridged sends only a length prefix), so a
+        # corrupted packet on an unreliable link is detected rather than
+        # silently mis-parsed. account_management/cli.py's short-lived
+        # login/verify clients use Abridged — see the comment there.
         "connection":            ConnectionTcpFull,
         "flood_sleep_threshold": FLOOD_SLEEP_THRESHOLD,
         "request_retries":       REQUEST_RETRIES,

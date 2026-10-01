@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 from pathlib import Path
 
 from loguru import logger as _loguru_core
@@ -117,10 +116,16 @@ class CompositionRoot:
             )
         log.info("Log dir  : %s", self.paths.logs)
 
-        if sys.platform == "win32":
-            log.info("Shortcuts: Ctrl+C=exit | Ctrl+R=restart")
-        else:
-            log.info("Shortcuts: Ctrl+C=exit | SIGUSR1=restart (pkill -SIGUSR1 -f main.py)")
+        # v3.1.10: this used to advertise "Ctrl+R=restart" (Windows) and
+        # "SIGUSR1=restart (pkill -SIGUSR1 -f main.py)" (Unix/Termux). Both
+        # were implemented by app/restart.py, which v3.0.4 deleted (see
+        # CHANGELOG) — nothing handles either any more. The SIGUSR1 hint was
+        # worse than stale, it was a trap: with no handler installed, that
+        # signal's default action is to terminate the process, so following
+        # the banner killed the bot outright — no graceful shutdown, no
+        # restart. The signals that ARE handled are Ctrl+C / SIGINT and
+        # SIGTERM (app/application.py); a restart is "stop, then start again".
+        log.info("Shortcuts: Ctrl+C=exit")
 
         log.info("=" * 65)
 
@@ -216,7 +221,7 @@ class CompositionRoot:
                     await asyncio.wait_for(client.connect(), timeout=30.0)
                     log.info("Connected to Telegram.")
                     break
-                except (TimeoutError, Exception) as exc:
+                except Exception as exc:  # TimeoutError (from wait_for) is an Exception
                     log.warning(
                         "Connect attempt %d/%d failed: %s",
                         attempt, max_attempts, exc,

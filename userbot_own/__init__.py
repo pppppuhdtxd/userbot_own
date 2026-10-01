@@ -29,7 +29,13 @@ _version_file = Path(__file__).parent.parent / "VERSION"
 # the actual VERSION file (3.1.8) at the time of this fix, despite the
 # comment above explicitly saying it's kept in sync. Corrected as part of
 # this version bump; nothing else about the fallback mechanism changed.
-_FALLBACK_VERSION = "3.1.9"
+#
+# v3.1.10: bumped to "3.1.10" in the same change as VERSION. This constant,
+# README.md's "Current version" line, and pyproject.toml's `version` are the
+# three hand-maintained copies of VERSION — every one of them had drifted at
+# some point (pyproject.toml was still "3.1.0"). README's "Version rule"
+# section now lists all of them so a bump cannot silently skip one again.
+_FALLBACK_VERSION = "3.1.10"
 
 try:
     __version__ = _version_file.read_text(encoding="utf-8").strip() or _FALLBACK_VERSION

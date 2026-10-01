@@ -72,7 +72,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.0.8`
+**Current version:** `3.1.10`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -116,7 +116,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history.
 | **Message classification** | Unified priority system (`file > vid > pic > link > txt > other`) across all modules |
 | **Category-based help** | RTL-friendly help output with 7 logical categories, plus per-module detail via `help <module>` |
 | **Reaction commands** | Execute commands by reacting to messages with emojis — push-based (zero polling), works on bots, users, groups, and channels per-type toggle |
-| **Live config reload** | `account.json` edits and new `accounts/N/` folders are picked up by a file watcher without a restart |
+| **Config-change detection** | Edits to `account.json` and new `accounts/N/` folders are noticed by a file watcher and written to the log — they take effect after a restart |
 | **Semantic versioning** | Every change tracked in `VERSION` + `CHANGELOG.md` |
 | **Python 3.11+** | Native union types, `match` statements, `slots=True` dataclasses |
 | **Dependency injection** | Composition root wires config and registries into every module's constructor — no global state reached for by import |
@@ -140,15 +140,15 @@ cd userbot_own
 python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-# 3. Install dependencies
+# 3. Install dependencies (requirements.txt pins Telethon to 1.44.x — see the note in that file)
 pip install -r requirements.txt
 
 # 4. Add your first account
 python add_account.py
 
-# 5. (Optional) Configure environment variables
-cp userbot_own/.env.example userbot_own/.env
-# Edit userbot_own/.env with your settings
+# 5. (Optional) Configure environment variables — create userbot_own/.env yourself
+#    with any overrides from the Configuration table below, for example:
+#    LOG_LEVEL=INFO
 
 # 6. Run
 python main.py
@@ -174,12 +174,11 @@ userbot_own/
 │
 └── userbot_own/
     ├── __init__.py                ← exposes __version__ (reads VERSION)
-    ├── .env.example                ← copy to .env to override settings below
+    ├── .env                        ← optional, created by you (git-ignored) — see Configuration
     │
     ├── app/                        ← composition root & application lifecycle
     │   ├── composition_root.py     ← builds the object graph; owns per-account startup
-    │   ├── application.py          ← run-loop orchestration + restart-spawn entry point
-    │   └── restart.py              ← Ctrl+R / SIGUSR1 restart mechanics
+    │   └── application.py          ← run-loop orchestration; Ctrl+C / SIGTERM → graceful shutdown
     │
     ├── config/                     ← config models separated from config loading
     │   ├── models.py                ← AccountConfig, Paths, Settings (pure data)
@@ -194,7 +193,7 @@ userbot_own/
     │   ├── loader.py                 ← per-account plugin loader + hot-reload
     │   ├── logging_setup.py          ← centralized structured logging
     │   ├── reconnector.py            ← per-account reconnect loop
-    │   └── watcher.py                ← file-change callbacks (account.json, new accounts)
+    │   └── watcher.py                ← file watchers (account.json, new account folders): detect + log only
     │
     ├── helpers/
     │   └── utils.py                  ← shared utilities + classify_message()
@@ -295,12 +294,22 @@ AccountReconnector._reconnect_cycle()   (every ~30s when healthy — v3.1.1: int
            │  moment connectivity returns, instead of sleeping out the full backoff
            └─ ONLINE → rebuild client (tenacity-retried) → loader.reattach(new_client)
                   ├─ logs the connection-state transition
-                  └─ v3.1.1: restarts the disconnect watcher on the new client
+                  ├─ v3.1.1: restarts the disconnect watcher on the new client
+                  └─ v3.1.10: session no longer authorized (revoked / logged out /
+                     deactivated) → one ERROR line, then re-check only every
+                     10 → 20 → 30 min instead of retrying every few seconds
 ```
 
 v3.1.1's fast-reconnect behavior is on by default and configurable via
 environment variables — see the FAQ entry below for the full list and how
 to disable it.
+
+If a session is **revoked or logged out** (terminated from another device,
+account deactivated), reconnecting cannot fix it. Since 3.1.10 the bot logs one
+clear ERROR line for that account and re-checks only every 10 → 20 → 30
+minutes, instead of retrying every few seconds. Re-login with
+`python add_account.py`; restart the bot to bring the account back at once,
+otherwise it is picked up at the next check.
 
 There is no proxy layer — connections are always direct. If your network
 blocks Telegram, use a system-level VPN (WireGuard, OpenVPN, V2Ray); the bot
@@ -397,14 +406,20 @@ as before.
 ## Configuration
 
 All settings can be overridden via environment variables or a `.env` file
-in the `userbot_own/` directory (copy `userbot_own/.env.example` to `userbot_own/.env`).
+in the `userbot_own/` directory — a plain `KEY=value` file, e.g. `LOG_LEVEL=INFO`.
+Create it yourself: it is git-ignored, and no `.env.example` ships with the project.
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `LOG_LEVEL` | `DEBUG` | Root logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-| `BACKOFF_START` | `1` | Initial reconnect back-off in seconds |
-| `BACKOFF_MAX` | `300` | Maximum reconnect back-off in seconds |
+| `BACKOFF_START` | `1` | Initial reconnect back-off in seconds — **currently has no effect** (see note) |
+| `BACKOFF_MAX` | `300` | Maximum reconnect back-off in seconds — **currently has no effect** (see note) |
 | `HISTORY_LIMIT` | `2000` | Max messages scanned by clearer / auto_clearer modules |
+
+> **Note:** `BACKOFF_START` and `BACKOFF_MAX` are loaded into `Settings`, but nothing
+> reads them — the reconnect back-off schedule is fixed inside `core/reconnector.py`.
+> The reconnect settings that *do* work are the `FAST_RECONNECT_*` variables (see the
+> FAQ entry on fast reconnect below). Checked in v3.1.10.
 
 ---
 
@@ -627,8 +642,9 @@ opt into deliberately than have silently active after a `git pull`.
 ### Trying it out
 
 The repo ships with one example module, `modules_extra/example_module.py`,
-disabled by default, that does nothing but respond to `پینگ اضافی` with a
-pong — enough to verify the whole system end-to-end on a real account:
+disabled by default, that does nothing but respond to `پینگ اضافی` (typed in
+Saved Messages) with a pong — enough to verify the whole system end-to-end
+on a real account:
 
 ```
 .extra                          →  shows example_module as ❌ disabled
@@ -800,8 +816,12 @@ This project follows [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PA
 
 ### After every change
 
-1. Update `VERSION` (project root)
-2. `userbot_own/__init__.py` reads the version automatically from `VERSION`
+1. Update `VERSION` (project root) — the single source of truth
+2. Also bump the three hand-maintained copies of it, in the same commit (each has
+   drifted before — `pyproject.toml` was still `3.1.0` at v3.1.9):
+   - `_FALLBACK_VERSION` in `userbot_own/__init__.py` (used only if `VERSION` can't be read)
+   - `version` in `pyproject.toml`
+   - the **Current version** line at the top of this README
 3. Prepend a new entry to `CHANGELOG.md`
 
 ### Version rule for AI-assisted changes

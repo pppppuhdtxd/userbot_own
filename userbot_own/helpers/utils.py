@@ -21,7 +21,9 @@ Messages are classified into ONE of these types based on priority:
 The `link` type detection is comprehensive and covers:
     • MessageMediaWebPage (auto-generated preview for download links, etc.)
     • MessageEntityUrl / MessageEntityTextUrl (inline URL entities)
-    • KeyboardButtonUrl in ReplyInlineMarkup (inline keyboard with URL buttons)
+    • URL buttons in ReplyInlineMarkup (دکمه شیشه‌ای — KeyboardButtonUrl on
+      Telethon <= 1.44, KeyboardInlineButton + InlineButtonTypeUrl on >= 1.45,
+      detected via is_url_button())
     • Raw URL patterns in text (fallback when entities aren't parsed)
 
 This ensures each message has exactly one type, avoiding ambiguity
@@ -52,7 +54,6 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
     InputChannel,
     InputUser,
-    KeyboardButtonUrl,
     MessageEntityTextUrl,
     MessageEntityUrl,
     MessageMediaDocument,
@@ -64,6 +65,34 @@ from telethon.tl.types import (
     UserStatusRecently,
 )
 from telethon.tl.types import messages as tl_msg_types
+
+# ── Inline-keyboard URL-button compatibility (Telethon <1.45 vs >=1.45) ──
+#
+# Telethon 1.45.0 (TL layer 229) removed ``KeyboardButtonUrl`` entirely:
+#   old (<=1.44):  KeyboardButtonUrl(text=..., url=...)
+#   new (>=1.45):  KeyboardInlineButton(text=..., type=InlineButtonTypeUrl(url=...))
+#
+# Importing the old name unconditionally is what crashed startup with
+# ``ImportError: cannot import name 'KeyboardButtonUrl'`` on 1.45.x.
+# Both imports below are optional; the helpers underneath duck-type so the
+# code works on either Telethon version (and on mixed/dummy objects in tests).
+try:  # Telethon <= 1.44
+    from telethon.tl.types import KeyboardButtonUrl as _KeyboardButtonUrl
+except ImportError:  # Telethon >= 1.45 — removed
+    _KeyboardButtonUrl = None  # type: ignore[assignment]
+try:  # Telethon >= 1.45 (TL layer 229)
+    from telethon.tl.types import InlineButtonTypeUrl as _InlineButtonTypeUrl
+    from telethon.tl.types import KeyboardInlineButton as _KeyboardInlineButton
+except ImportError:  # Telethon <= 1.44 — does not exist yet
+    _InlineButtonTypeUrl = None  # type: ignore[assignment]
+    _KeyboardInlineButton = None  # type: ignore[assignment]
+
+#: Re-exported aliases kept so external code doing
+#: ``from userbot_own.helpers.utils import KeyboardButtonUrl`` keeps working.
+#: They are ``None`` on Telethon versions where the TL constructor is absent.
+KeyboardButtonUrl = _KeyboardButtonUrl
+KeyboardInlineButton = _KeyboardInlineButton
+InlineButtonTypeUrl = _InlineButtonTypeUrl
 
 from userbot_own.core.logging_setup import get_logger
 
@@ -87,6 +116,10 @@ __all__ = [
     "is_non_file_media",
     # Link detection
     "is_link",
+    "get_url_buttons",
+    "iter_inline_url_buttons",
+    "get_inline_button_url",
+    "is_url_button",
     # Message classification
     "classify_message",
     # File info
@@ -414,6 +447,79 @@ def is_non_file_media(media) -> bool:
 
 # ── Link detection ────────────────────────────────────────────────────────────
 
+def get_inline_button_url(button) -> str | None:
+    """Return the URL of an inline-keyboard button, or ``None``.
+
+    Works on both Telethon generations (duck-typed, no hard dependency on
+    either TL constructor existing):
+
+    - Telethon <= 1.44: ``KeyboardButtonUrl`` carries ``.url`` directly.
+    - Telethon >= 1.45: ``KeyboardInlineButton`` carries
+      ``.type == InlineButtonTypeUrl(url=...)``; the URL lives on the
+      nested ``type`` object (``button.type.url``).
+
+    Any other button kind (callback, switch_inline, …) returns ``None``.
+    """
+    if button is None:
+        return None
+    # Old model: url straight on the button.
+    url = getattr(button, "url", None)
+    if isinstance(url, str) and url:
+        return url
+    # New model: url nested under button.type.
+    btn_type = getattr(button, "type", None) or getattr(button, "button_type", None)
+    if btn_type is not None:
+        nested = getattr(btn_type, "url", None)
+        if isinstance(nested, str) and nested:
+            return nested
+        # Defensive: class-name check in case the TL class object differs
+        # (e.g. vendored copies) but the shape matches.
+        if type(btn_type).__name__ == "InlineButtonTypeUrl":
+            return nested if isinstance(nested, str) else None
+    # Defensive fallback for duck-typed test doubles exposing url elsewhere.
+    if _KeyboardButtonUrl is not None and isinstance(button, _KeyboardButtonUrl):
+        url = getattr(button, "url", None)
+        return url if isinstance(url, str) and url else None
+    if _KeyboardInlineButton is not None and isinstance(button, _KeyboardInlineButton):
+        return get_inline_button_url(btn_type) if btn_type is not None else None
+    # Last resort: class-name match (covers fake TL objects in unit tests
+    # and any future rename that keeps the text/type shape).
+    if type(button).__name__ in ("KeyboardButtonUrl", "KeyboardInlineButton"):
+        if isinstance(url, str) and url:
+            return url
+        if btn_type is not None:
+            nested = getattr(btn_type, "url", None)
+            if isinstance(nested, str) and nested:
+                return nested
+    return None
+
+
+def is_url_button(button) -> bool:
+    """Return ``True`` if *button* is an inline-keyboard URL button."""
+    return get_inline_button_url(button) is not None
+
+
+def iter_inline_url_buttons(reply_markup):
+    """Yield ``(text, url)`` for every URL button in *reply_markup*.
+
+    Accepts a ``ReplyInlineMarkup`` (either Telethon generation) or anything
+    with a ``.rows`` list of rows with ``.buttons``. Non-URL buttons are
+    skipped.
+    """
+    rows = getattr(reply_markup, "rows", None) or []
+    for row in rows:
+        buttons = getattr(row, "buttons", None) or []
+        for button in buttons:
+            url = get_inline_button_url(button)
+            if url:
+                yield (getattr(button, "text", "") or "", url)
+
+
+def get_url_buttons(reply_markup) -> list:
+    """Return a list of ``(text, url)`` tuples for URL buttons in *markup*."""
+    return list(iter_inline_url_buttons(reply_markup))
+
+
 def is_link(msg) -> bool:
     """
     Return ``True`` if *msg* contains a link in any form.
@@ -424,7 +530,9 @@ def is_link(msg) -> bool:
     2. It contains ``MessageEntityUrl`` or ``MessageEntityTextUrl`` in its
        entities (clickable URL hyperlinks in text)
     3. Its inline keyboard (``reply_markup``) contains at least one
-       ``KeyboardButtonUrl`` (URL button in a "glass button" / دکمه شیشه‌ای)
+       URL button (دکمه شیشه‌ای) — ``KeyboardButtonUrl`` on Telethon
+       <= 1.44, ``KeyboardInlineButton`` + ``InlineButtonTypeUrl`` on
+       Telethon >= 1.45 (detected via ``is_url_button()``).
     4. Its text matches a raw URL pattern (fallback for cases where Telegram
        didn't parse the URL as an entity)
 
@@ -460,14 +568,15 @@ def is_link(msg) -> bool:
             return True
 
     # 3. Check for URL buttons in inline keyboard (دکمه شیشه‌ای)
-    #    This covers bot messages with buttons like "🔗 Visit Website"
+    #    This covers bot messages with buttons like "🔗 Visit Website".
+    #    Compatible with both Telethon generations (see is_url_button()).
     reply_markup = getattr(msg, "reply_markup", None)
     if isinstance(reply_markup, ReplyInlineMarkup):
         rows = getattr(reply_markup, "rows", None) or []
         for row in rows:
             buttons = getattr(row, "buttons", None) or []
             for button in buttons:
-                if isinstance(button, KeyboardButtonUrl):
+                if is_url_button(button):
                     return True
 
     # 4. Fallback: check for raw URL pattern in text
@@ -494,6 +603,16 @@ def classify_message(msg) -> str:
                         or raw URL in text
         5. ``txt``    — Plain text message (no media, no links)
         6. ``other``  — Stickers, voice messages, contacts, locations, etc.
+
+    Caveat (v3.1.10, checked with real Telethon Message objects): ``link`` and
+    ``txt`` look at the message's text/caption, not at whether media is
+    attached. ``file``, ``vid`` and ``pic`` are decided first, so a file,
+    video or photo WITH a caption keeps its media class. Audio and voice
+    messages have no tier of their own, though, so one that carries a caption
+    lands in ``txt`` (or ``link``, if the caption contains a URL) instead of
+    ``other`` — only a caption-less one reaches ``other``. The modules' help
+    texts say "audio/voice → other"; that holds for the usual caption-less
+    case.
 
     This ensures each message has exactly one classification, avoiding
     ambiguity in filtering operations.

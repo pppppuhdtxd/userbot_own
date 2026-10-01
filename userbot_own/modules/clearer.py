@@ -466,11 +466,20 @@ class Clearer(Module):
     async def _matches_scope(self, client: TelegramClient, msg, scope: str) -> bool:
         """Check if a message matches the requested scope (all/self/bot).
 
-        For scope "all" and "self" in non-private chats, `from_user='me'`
-        is already applied at the iter_messages level (server-side), so this
-        method returns True unconditionally for those scopes — the filtering
-        was already done. For private chats with scope "self", we fall back to
-        a client-side sender_id check using base._get_me_id().
+        Scope "all": returns True unconditionally — no sender check is needed
+        here. In non-private chats `from_user='me'` was already applied at the
+        iter_messages level (server-side); in private chats the whole chat is
+        in scope.
+
+        Scope "self": the sender is ALWAYS re-checked client-side against
+        base._get_me_id() (a per-client cache — a dict lookup, not an API
+        call), whatever the chat type. In non-private chats that is redundant
+        with the server-side `from_user='me'` filter, and it is deliberately
+        left that way: a wrong `is_private` flag (for example on a MockEvent
+        built for a reaction command) therefore cannot widen "clear self" to
+        other people's messages. (v3.1.10: this docstring used to say the
+        check only happened for private chats; the code never worked that
+        way.)
 
         For scope "bot", sender.bot is checked via _is_bot_sender() which uses
         a local cache (self._bot_peer_cache) to avoid a get_entity() call per

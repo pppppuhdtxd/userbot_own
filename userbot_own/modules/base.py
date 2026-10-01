@@ -70,7 +70,6 @@ already omitted it, relying on what was previously a method-default
 argument — that stays true now, just resolved from a class attribute
 instead so the two modules can keep their own different timing without
 either one needing to touch its call sites).
-not the timing.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations

@@ -11,6 +11,8 @@ Commands:
   → Add each joined chat to 'joined' (or 'joined2', 'joined3', ...) folder
     IMMEDIATELY (incremental, auto-overflow at 100-chat cap)
   → Mute & archive each chat IMMEDIATELY after joining (crash-safe)
+  → v3.2.0: after the batch, make sure every non-joined folder has
+    exclude_archived (one API call per folder, only where missing)
 
 - `join delay <seconds>`
   → Set fixed delay between joins (0 = restore smart throttling)
@@ -23,7 +25,8 @@ Commands:
 - `left` (reply to a message with links/usernames/IDs)
   → Leave all found chats with safe pacing (FloodWait-aware)
   → Remove left chats from ALL 'joined*' folders automatically
-  → Remove left chats from excluded_chats of ALL other folders immediately
+  → v3.2.0: nothing to un-exclude — archived chats stay hidden through
+    exclude_archived (legacy exclude_peers entries of the chat are swept)
   → Delete command message on success
 
 - `folder` (Saved Messages only)
@@ -68,6 +71,72 @@ Anti-FloodWait Layers:
     After BATCH_SIZE joins: short cooldown (30s ± jitter).
     After BATCHES_BEFORE_LONG batches: long cooldown (120s ± jitter).
     ±20% random jitter on all delays to avoid predictable timing.
+
+v3.2.0 Changes:
+  Redesign — Telegram's server-side `exclude_archived` replaces per-chat exclusion:
+    Every joined chat is muted and archived (folder_id=1). Before 3.2.0 each chat
+    was ALSO written, one UpdateDialogFilterRequest per folder per join, into the
+    exclude_peers list of every other folder (100-entry cap, tracking, sync bugs).
+    Now ensure_exclude_archived() makes sure every other regular folder carries
+    the `exclude_archived` flag — once, only where it is missing. Verified in the
+    Telegram Desktop (ChatFilter::contains) and Android (DialogFilter.includesDialog)
+    clients: precedence is exclude_peers > include_peers > exclude_archived, so
+    chats in a folder's include_peers (every joined* folder) stay visible even
+    with the flag set. The flag only hides archived chats that match a folder by
+    TYPE flags (contacts / non-contacts / groups / channels / bots).
+    REMOVED: _add_to_all_other_folders_exclusion, _remove_from_all_folders_exclusion,
+    _EXCLUDE_PEERS_CAPACITY, and the dead _ensure_joined_folder_exists,
+    _find_joined_folder, _add_peers_to_joined_folder, _mute_and_archive.
+    KEPT (it is NOT exclusion code): _sync_folder_to_tracking — it feeds auto-leave.
+    VISIBLE SIDE EFFECT: because the flag is set on the user's own folders too,
+    chats the user archived BY HAND no longer appear in folders that match by type
+    flags (explicit-peer-only folders are unaffected). Documented in help_extra.
+
+  ensure_exclude_archived() — idempotent, FloodWait-global, never silent:
+    Reads the folder list fresh, skips DialogFilterDefault / DialogFilterChatlist /
+    joined*, sets the flag on a COPY of each remaining folder, paces writes, waits
+    a FloodWait once and resumes, re-raises when its wait budget is spent, counts
+    and logs every failure. Runs at the end of every join batch, at startup and
+    every 6 hours (so a folder created after a batch is protected too).
+
+  Fix N1 (CRITICAL) — false "folder add succeeded" after a FloodWait:
+    _add_single_peer_to_joined_folder appended the peer to the CACHED DialogFilter
+    before calling the API. A FloodWait on the write left the cache claiming a
+    state the server never had; the retry saw the peer "already present" and
+    returned True although nothing was persisted. All folder writes now build the
+    new state on a copy and update the cache only after Telegram accepted it
+    (_write_folder_with_retry). _remove_peers_from_all_joined_folders had the same flaw (N3).
+
+  Fix N2/N3 — mute / archive / folder results are first-class:
+    A second FloodWait used to be swallowed with no log, and _post_join_actions'
+    result was ignored at all call sites. Now: bounded, logged retries
+    (_call_with_flood_retry); _post_join_actions returns a PostJoinResult;
+    _record_join() (one shared path for all join outcomes) queues incomplete chats
+    for an end-of-batch retry sweep and the 6-hour cycle; the summary reports real
+    counts instead of len(joined_entities). Mute is load-bearing: an unmuted
+    archived chat is moved back to the main list by Telegram on its next message.
+
+  Fix N4 — Pattern 1.2 (sibling exceptions):
+    FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError and
+    SlowModeWaitError are siblings under errors.FloodError; only the first was
+    caught. All sites now catch errors.FloodError (see _flood_seconds). Folder
+    writes treat every errors.RPCError (the Filter* family and more) as a
+    per-folder failure.
+
+  Fix N5 — Pattern 1.3: unified post-leave cleanup:
+    `left`, auto-leave and the folder reset share _remove_left_from_folders().
+    "Not a participant" / private / not-found branches now clean the joined*
+    folders too (they used to leave stale entries that consumed the 100-chat cap).
+
+  Migration: NO bulk clearing of exclude_peers (user-authored exclusions cannot be
+    told apart). Legacy entries are inert; the scoped sweep removes only the
+    entries of a chat when that chat is left. The first startup reconcile flips
+    the flag on existing folders — that run IS the migration; no marker needed.
+
+  Also: K5 — the "already a member" wording now covers the hash-fallback branch of
+    invite_with_username; docstring/comment corrections (_check_auto_leave is
+    age-based; the unverified "folder update un-archives" claim removed); ruff
+    I001/E741 clean.
 
 v3.1.8 Changes:
   Fix G1 — Catch InviteHashExpiredError in _validate_invite_links (CRITICAL):
@@ -135,6 +204,8 @@ v3.1.6 Changes:
     autoleave and _sync_folder_to_tracking scan all joined* folders.
 
   Fix I2 — Smart type-aware exclusion + exclude_peers capacity guard:
+    v3.2.0: the whole exclusion system described here was REMOVED (superseded
+    by exclude_archived, see above); this entry is kept as history only.
     v3.1.10 correction: the type-aware half of this fix (introduced in v3.1.6)
     no longer exists. It was reverted afterwards in an unversioned hotfix
     (CHANGELOG [3.1.8] mentions it) because it suppressed exclusion for
@@ -152,7 +223,7 @@ v3.1.6 Changes:
     validated via CheckChatInviteRequest. If ANY link is expired/invalid,
     the entire operation is cancelled with a clear Persian error message.
     Already-joined links skip the join API call but still receive full
-    post-join actions (folder, mute, archive, exclusion). These are
+    post-join actions (folder, mute, archive; exclusion until v3.2.0). These are
     reported as "قبلاً عضو بود (فولدر بروزرسانی شد)".
 
   Fix I4 — _collect_entities ordering (Bug A):
@@ -185,6 +256,7 @@ v3.1.6 Changes:
 
   Fix N4 — exclude_peers per-folder capacity guard:
     Folders already at 100 exclude_peers entries are skipped silently.
+    (Removed in v3.2.0 together with the exclusion system.)
 
 v3.0.4 Changes (Task 2 — Telethon wrapper fix + FloodWait reduction):
   Fix A — Correct ImportChatInviteRequest result unwrapping:
@@ -222,7 +294,7 @@ v3.0.4 Changes (Task 2 — Telethon wrapper fix + FloodWait reduction):
     _SMART_DELAYS["invite_direct"] reduced 8.0s → 4.0s (API call count
     on the direct-hash path dropped from up to 3 to exactly 1)
 
-  Fix G — _post_join_actions exclusion now awaited:
+  Fix G — _post_join_actions exclusion now awaited (exclusion removed in v3.2.0):
     Changed fire-and-forget asyncio.create_task() for folder exclusion to
     a direct await, making all 4 post-join actions strictly sequential and
     crash-safe per chat.
@@ -244,7 +316,8 @@ v3.0.3 Changes (Task 2 — full overhaul):
   Req 3: Mute & archive immediately after each join (per-chat, not batched).
     If the process dies mid-run, all completed joins are muted+archived.
 
-  Req 4: Strict folder exclusion — joined chats added to excluded_chats
+  Req 4: [SUPERSEDED in v3.2.0 by exclude_archived — see above]
+    Strict folder exclusion — joined chats added to excluded_chats
     of ALL other editable folders. Left chats cleaned from exclusion lists
     immediately and synchronously on `left` / `folder` reset / auto-leave.
     Periodic verification in _check_auto_leave() covers manual leaves.
@@ -257,10 +330,12 @@ v3.0.3 Changes (Task 2 — full overhaul):
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime
 import random
 import re
 import time
+from dataclasses import dataclass, field
 
 from telethon import TelegramClient, errors, events
 from telethon.tl.functions.account import UpdateNotifySettingsRequest
@@ -277,6 +352,8 @@ from telethon.tl.types import (
     Chat,
     ChatInviteAlready,
     DialogFilter,
+    DialogFilterChatlist,
+    DialogFilterDefault,
     InputFolderPeer,
     InputNotifyPeer,
     InputPeerNotifySettings,
@@ -288,7 +365,13 @@ from telethon.tl.types import messages as tl_messages
 
 from userbot_own.core.context import ModuleContext
 from userbot_own.core.logging_setup import get_logger
-from userbot_own.helpers.utils import get_inline_button_url, leave_dialog, read_json_file, safe_delete, write_json_file_atomic
+from userbot_own.helpers.utils import (
+    get_inline_button_url,
+    leave_dialog,
+    read_json_file,
+    safe_delete,
+    write_json_file_atomic,
+)
 from userbot_own.modules.base import Module
 
 # Module-level logger — used only by free functions outside the Module class
@@ -312,7 +395,6 @@ log = get_logger(__name__)
 
 _JOINED_FOLDER_NAME    = "joined"
 _FOLDER_CAPACITY       = 100    # I1: Telegram's hard cap on include_peers per folder
-_EXCLUDE_PEERS_CAPACITY = 100   # N4: Telegram's hard cap on exclude_peers per folder
 _FOLDER_CACHE_TTL      = 30.0   # seconds
 _EDIT_THROTTLE         = 2.5    # seconds between message edits to avoid FloodWait
 _AUTO_DELETE_DELAY     = 5.0    # seconds before auto-deleting command output
@@ -351,6 +433,112 @@ _MAX_FLOODWAIT_RETRIES = 5
 # Pacing for left/folder-reset loops (mirrors Layer 2 safe defaults)
 _LEFT_INTER_DELAY    = 2.0   # seconds between successive leaves (safe mode)
 _LEFT_MAX_FW_RETRIES = 3     # retries before skipping on leave FloodWait
+
+# v3.2.0: post-join action (mute / archive / folder-add) retry policy.
+# A FloodWait is waited out inline only while it is short; a longer one is NOT
+# slept through in the middle of a join batch — the action is handed to the
+# end-of-batch retry sweep instead (and, if still unresolved, to the 6-hour
+# reconcile). Every give-up is logged at WARNING and surfaced in the summary.
+_ACTION_MAX_ATTEMPTS = 3       # attempts per mute / archive / folder write
+_ACTION_FLOOD_CAP    = 60.0    # seconds: longest FloodWait slept through inline
+_FLOOD_PAD           = 2       # seconds added on top of the FloodWait Telegram asks for
+_SWEEP_ROUNDS        = 2       # passes of the end-of-batch retry sweep
+_SWEEP_ROUND_DELAY   = 3.0     # seconds between sweep passes
+_SWEEP_TIME_BUDGET   = 180.0   # seconds: hard ceiling on one sweep
+_PENDING_MAX_SWEEPS  = 4       # sweeps before an unresolved chat is given up on
+_ARCHIVE_FOLDER_ID   = 1       # Telegram: folder_id 1 = Archive (no other id is allowed)
+
+# v3.2.0: ensure_exclude_archived() pacing
+_ENSURE_PACE            = 1.2    # seconds between consecutive folder writes (±20% jitter)
+_ENSURE_MAX_FLOOD_WAIT  = 180.0  # seconds: total FloodWait one ensure run may sleep through
+
+# Auto-leave / reconcile cadence
+_AUTO_LEAVE_INTERVAL = 6 * 3600
+
+
+# ── v3.2.0: FloodWait helper + result types ───────────────────────────────────
+
+def _flood_seconds(exc: BaseException) -> int:
+    """
+    Seconds Telegram asks us to wait, for ANY member of Telethon's flood family.
+
+    errors.FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError and
+    SlowModeWaitError are SIBLINGS under errors.FloodError — none is a subclass
+    of another — so `except errors.FloodWaitError` silently misses the other
+    three (Pattern 1.2). Callers now catch errors.FloodError and read the wait
+    through this helper; the bare FloodError base class carries no `.seconds`,
+    hence the defensive getattr. Always returns at least 1.
+    """
+    try:
+        seconds = int(getattr(exc, "seconds", 0) or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    return max(1, seconds)
+
+
+@dataclass(frozen=True, slots=True)
+class PostJoinResult:
+    """Outcome of the three per-chat post-join actions (v3.2.0: first-class result)."""
+    muted: bool
+    folder_added: bool
+    archived: bool
+
+    @property
+    def complete(self) -> bool:
+        return self.muted and self.folder_added and self.archived
+
+    def missing(self) -> set[str]:
+        """Names of the actions that did NOT succeed: subset of {mute, folder, archive}."""
+        out: set[str] = set()
+        if not self.muted:
+            out.add("mute")
+        if not self.folder_added:
+            out.add("folder")
+        if not self.archived:
+            out.add("archive")
+        return out
+
+
+@dataclass(slots=True)
+class _PendingActions:
+    """A joined chat whose post-join actions are not all done yet (per-account, in-memory)."""
+    entity: object
+    missing: set[str]
+    attempts: int = 0
+
+
+@dataclass(slots=True)
+class EnsureResult:
+    """
+    What one ensure_exclude_archived() run did. Mutable so the function can fill
+    it in as it goes — a caller that receives a FloodError out of the function
+    (budget exhausted) therefore still has an accurate partial result.
+    """
+    updated:     int = 0                    # folders flipped to exclude_archived=True
+    already_ok:  int = 0                    # folders that already had the flag
+    skipped:     int = 0                    # ineligible: default / shared / joined* / unknown
+    failed:      int = 0                    # folders whose write was rejected
+    deferred:    int = 0                    # folders not attempted (FloodWait budget spent)
+    fetch_error: str | None = None          # set when the folder list could not be read
+    failures:    list[str] = field(default_factory=list)
+
+    @property
+    def problems(self) -> int:
+        return self.failed + self.deferred + (1 if self.fetch_error else 0)
+
+    @property
+    def changed(self) -> bool:
+        """True when the run did anything worth telling the user / the log at INFO."""
+        return bool(self.updated or self.problems)
+
+    def summary(self) -> str:
+        parts = [
+            f"updated={self.updated}", f"already_ok={self.already_ok}",
+            f"skipped={self.skipped}", f"failed={self.failed}", f"deferred={self.deferred}",
+        ]
+        if self.fetch_error:
+            parts.append(f"fetch_error={self.fetch_error}")
+        return " ".join(parts)
 
 
 # ── Entity extraction ─────────────────────────────────────────────────────────
@@ -423,23 +611,63 @@ def _extract_invite_hash(identifier: str) -> str | None:
 
 
 # ── Folder cache helpers ─────────────────────────────────────────────────────
+#
+# v3.2.0 (N1): the objects held in this cache are SHARED — _get_folders() hands
+# the very same DialogFilter instances to every caller until the TTL lapses.
+# Callers therefore must NEVER mutate a cached folder in place. Doing so (the
+# pre-3.2.0 behaviour of _add_single_peer_to_joined_folder and
+# _remove_peers_from_all_joined_folders) updated the cache BEFORE the API call:
+# if the call then failed, the cache claimed a state the server never had, and
+# the next attempt reported success for something that was never written.
+# The rule now: build the new state on a copy (copy.copy + replacing list
+# attributes), send it, and only after Telegram accepted it write the copy
+# through with _update_folder_in_cache().
+
+async def _fetch_all_filters(client: TelegramClient) -> list:
+    """
+    Read EVERY dialog filter from Telegram, uncached, as a plain list.
+
+    Returns all constructor kinds — DialogFilter (regular folder),
+    DialogFilterChatlist (shared folder) and DialogFilterDefault (the
+    Premium-only "All chats" placeholder). Handles both result shapes: the
+    messages.DialogFilters wrapper (current layers; has .filters and
+    .tags_enabled) and a bare list (older Telethon).
+    """
+    result = await client(GetDialogFiltersRequest())
+    return list(getattr(result, "filters", result) or [])
+
 
 async def _get_folders(
     client: TelegramClient,
     cache: dict[int, tuple[float, list[DialogFilter]]],
 ) -> list[DialogFilter]:
-    """Fetch dialog filters with TTL-based caching."""
+    """
+    Fetch regular dialog filters (DialogFilter only) with TTL-based caching.
+
+    Shared folders (DialogFilterChatlist) and the "All chats" placeholder
+    (DialogFilterDefault) are deliberately not returned: they have no
+    exclude_archived / exclude_peers fields, so nothing here can edit them.
+    The returned objects are shared with the cache — see the note above.
+    """
     cid = id(client)
     now = time.monotonic()
     hit = cache.get(cid)
     if hit and (now - hit[0]) < _FOLDER_CACHE_TTL:
         return hit[1]
 
-    result  = await client(GetDialogFiltersRequest())
-    filters = getattr(result, "filters", result)
+    filters = await _fetch_all_filters(client)
     folders = [f for f in filters if isinstance(f, DialogFilter)]
     cache[cid] = (now, folders)
     return folders
+
+
+def _store_folders_in_cache(
+    client: TelegramClient,
+    cache: dict[int, tuple[float, list[DialogFilter]]],
+    folders: list[DialogFilter],
+) -> None:
+    """Replace the cached folder list with a freshly fetched one (TTL restarts)."""
+    cache[id(client)] = (time.monotonic(), list(folders))
 
 
 def _invalidate_folder_cache(
@@ -459,6 +687,9 @@ def _update_folder_in_cache(
     without resetting the TTL, so the next _get_folders call uses the
     updated in-memory state without re-fetching from Telegram.
     Reduces GetDialogFiltersRequest calls by ~70% during busy join batches.
+
+    N1 (v3.2.0): call this ONLY after the matching UpdateDialogFilterRequest
+    has succeeded, and pass a COPY — never the object the cache already holds.
     """
     cid = id(client)
     hit = cache.get(cid)
@@ -529,14 +760,6 @@ def _find_all_joined_folders(folders: list[DialogFilter]) -> list[DialogFilter]:
             result.append((n, f))
     result.sort(key=lambda x: x[0])
     return [f for _, f in result]
-
-
-def _find_joined_folder(folders: list[DialogFilter]) -> DialogFilter | None:
-    """Return the base 'joined' folder (number 1) if it exists."""
-    for f in folders:
-        if _get_joined_folder_number(_folder_title(f)) == 1:
-            return f
-    return None
 
 
 def _find_active_joined_folder(all_joined_sorted: list[DialogFilter]) -> DialogFilter | None:
@@ -625,6 +848,11 @@ async def _create_joined_folder(
     saved     = InputPeerSelf()
     inc_peers = [saved] + (extra_peers or [])
 
+    # exclude_archived=True: on a joined* folder this is INERT in the Telegram clients —
+    # include_peers wins over exclude_archived, and every type flag is False — so the
+    # chats stay visible. It is kept so every folder this module creates is
+    # consistent with what ensure_exclude_archived() sets on all the others.
+    # (The v3.0.5 CHANGELOG entry explained this flag backwards; see v3.2.0.)
     new_folder = DialogFilter(
         id               = new_id,
         title            = TextWithEntities(text=title_str, entities=[]),
@@ -650,18 +878,82 @@ async def _create_joined_folder(
     return new_folder
 
 
-async def _ensure_joined_folder_exists(
+async def _collect_peer_ids(client: TelegramClient, entities: list) -> set[int]:
+    """
+    Resolve entities / input peers / plain ids to the numeric ids that appear in
+    DialogFilter peer lists (v3.2.0: shared by the leave-cleanup functions).
+
+    Never raises: an entity that cannot be resolved falls back to its own .id,
+    and a plain int is taken as-is (the auto-leave not-found branches only have
+    the stored chat id).
+    """
+    ids: set[int] = set()
+    for entity in entities:
+        if isinstance(entity, int) and not isinstance(entity, bool):
+            if entity:
+                ids.add(entity)
+            continue
+        try:
+            ip  = await client.get_input_entity(entity)
+            pid = _peer_id(ip)
+        except Exception:
+            pid = getattr(entity, "id", None)
+        if pid:
+            ids.add(pid)
+    return ids
+
+
+async def _write_folder_with_retry(
     client: TelegramClient,
+    updated: DialogFilter,
     account_index: int,
     cache: dict[int, tuple[float, list[DialogFilter]]],
-) -> DialogFilter:
-    """Ensure the base 'joined' folder exists. Returns it (creates if missing)."""
-    folders = await _get_folders(client, cache)
-    folder  = _find_joined_folder(folders)
-    if folder:
-        return folder
-    log.debug("[Account%d] 'joined' folder not found — creating.", account_index)
-    return await _create_joined_folder(client, account_index, cache, number=1)
+    *,
+    what: str,
+) -> bool:
+    """
+    Send one folder update, then — and ONLY then — write it through to the cache.
+
+    `updated` must be a copy (see "Folder cache helpers"). A FloodWait is waited
+    out only when it is short (_ACTION_FLOOD_CAP); anything longer, or running out
+    of attempts, is a logged give-up (WARNING), never a silent one. Any
+    sibling of the flood family is covered (Pattern 1.2). On a non-flood
+    failure the cache is invalidated so the next operation re-reads the truth.
+    Returns True when Telegram accepted the update.
+    """
+    label = _folder_title(updated)
+    for attempt in range(1, _ACTION_MAX_ATTEMPTS + 1):
+        try:
+            await client(UpdateDialogFilterRequest(id=updated.id, filter=updated))
+        except errors.FloodError as exc:
+            wait = _flood_seconds(exc) + _FLOOD_PAD
+            if attempt >= _ACTION_MAX_ATTEMPTS or wait > _ACTION_FLOOD_CAP:
+                log.warning(
+                    "[Account%d] Could not %s '%s' folder: FloodWait %ds (%s), attempt %d/%d, "
+                    "inline cap %ds — giving up.",
+                    account_index, what, label, _flood_seconds(exc), type(exc).__name__,
+                    attempt, _ACTION_MAX_ATTEMPTS, int(_ACTION_FLOOD_CAP),
+                )
+                return False
+            log.debug(
+                "[Account%d] FloodWait %ds while trying to %s '%s' folder (attempt %d/%d) — waiting.",
+                account_index, _flood_seconds(exc), what, label, attempt, _ACTION_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(wait)
+            continue
+        except Exception as exc:
+            # RPC errors (the Filter* family: FilterIdInvalid, FilterIncludeEmpty,
+            # FilterNotSupported, FilterTitleEmpty, InputFilterInvalid, FILTERS_TOO_MUCH, …)
+            # are all subclasses of errors.RPCError → Exception; network errors too.
+            log.warning(
+                "[Account%d] Could not %s '%s' folder: %s: %s",
+                account_index, what, label, type(exc).__name__, exc,
+            )
+            _invalidate_folder_cache(client, cache)
+            return False
+        _update_folder_in_cache(client, cache, updated)
+        return True
+    return False
 
 
 async def _add_single_peer_to_joined_folder(
@@ -676,13 +968,27 @@ async def _add_single_peer_to_joined_folder(
 
     If the active folder is at _FOLDER_CAPACITY (100 chats), automatically
     creates the next numbered folder (joined2, joined3, …) seamlessly.
-    Returns True if added (or already present), False on error.
+    Returns True if the chat is now in a joined* folder (or already was),
+    False — after a WARNING — otherwise.
+
+    v3.2.0 (N1 — CRITICAL data-integrity fix): the new include_peers list is built
+    on a COPY of the cached folder and the cache is updated only after Telegram
+    accepted the write. Before, the cached object was mutated first; if the
+    update then hit a FloodWait, the retry found the peer "already present" in
+    the mutated cache and returned True although nothing had been written.
+    N9: folder-creation failures (e.g. FILTERS_TOO_MUCH when the account is at
+    its folder-count cap) are now logged at WARNING instead of DEBUG.
     """
-    for attempt in range(3):
+    ent_id = getattr(entity, "id", entity)
+    for attempt in range(1, _ACTION_MAX_ATTEMPTS + 1):
         try:
             ip  = await client.get_input_entity(entity)
             pid = _peer_id(ip)
             if pid is None:
+                log.warning(
+                    "[Account%d] Folder add skipped for entity %s: could not derive a peer id.",
+                    account_index, ent_id,
+                )
                 return False
 
             folders    = await _get_folders(client, cache)
@@ -693,7 +999,8 @@ async def _add_single_peer_to_joined_folder(
                 await _create_joined_folder(client, account_index, cache, number=1, extra_peers=[ip])
                 return True
 
-            # Check if peer is already in ANY joined* folder
+            # Check if peer is already in ANY joined* folder. Safe to trust since
+            # v3.2.0: the cache only ever holds state Telegram has accepted.
             for jf in all_joined:
                 existing_ids = {_peer_id(p) for p in (jf.include_peers or [])} - {None}
                 if pid in existing_ids:
@@ -714,85 +1021,51 @@ async def _add_single_peer_to_joined_folder(
                 )
                 return True
 
-            # Add peer to the active folder (incremental update)
-            active.include_peers = list(active.include_peers or []) + [ip]
-            # Ensure exclude_archived=True so the folder doesn't un-archive the chat
-            if not active.exclude_archived:
-                active.exclude_archived = True
+            # Add peer to the active folder (incremental update) — on a COPY (N1).
+            updated = copy.copy(active)
+            updated.include_peers = list(active.include_peers or []) + [ip]
+            if not updated.exclude_archived:
+                # Normally already True (the folder is created that way). Harmless on a
+                # joined* folder: include_peers wins over exclude_archived in the
+                # Telegram clients, so the chat stays visible here either way.
+                updated.exclude_archived = True
                 log.debug(
                     "[Account%d] Patched '%s' folder to exclude_archived=True.",
                     account_index, _folder_title(active),
                 )
-            await client(UpdateDialogFilterRequest(id=active.id, filter=active))
-            _update_folder_in_cache(client, cache, active)  # N2: write-through
+            if not await _write_folder_with_retry(
+                client, updated, account_index, cache, what=f"add chat id={ent_id} to"
+            ):
+                return False
             log.debug(
                 "[Account%d] Added peer id=%d to '%s' folder (incremental).",
-                account_index, pid, _folder_title(active),
+                account_index, pid, _folder_title(updated),
             )
             return True
 
-        except errors.FloodWaitError as exc:
-            if attempt < 2:
-                log.debug(
-                    "[Account%d] FloodWait %ds on folder add for entity %s (attempt %d/3), waiting...",
-                    account_index, exc.seconds, getattr(entity, "id", entity), attempt + 1,
-                )
-                await asyncio.sleep(exc.seconds + 2)
-            else:
+        except errors.FloodError as exc:
+            wait = _flood_seconds(exc) + _FLOOD_PAD
+            if attempt >= _ACTION_MAX_ATTEMPTS or wait > _ACTION_FLOOD_CAP:
                 log.warning(
-                    "[Account%d] FloodWait exceeded retries on folder add for entity %s — skipping.",
-                    account_index, getattr(entity, "id", entity),
+                    "[Account%d] Folder add for entity %s: FloodWait %ds (%s), attempt %d/%d — giving up.",
+                    account_index, ent_id, _flood_seconds(exc), type(exc).__name__,
+                    attempt, _ACTION_MAX_ATTEMPTS,
                 )
                 return False
-        except Exception as exc:
             log.debug(
-                "[Account%d] Could not add entity to folder: %s",
-                account_index, exc,
+                "[Account%d] FloodWait %ds on folder add for entity %s (attempt %d/%d), waiting...",
+                account_index, _flood_seconds(exc), ent_id, attempt, _ACTION_MAX_ATTEMPTS,
             )
+            await asyncio.sleep(wait)
+        except Exception as exc:
+            log.warning(
+                "[Account%d] Could not add entity %s to a joined* folder: %s: %s",
+                account_index, ent_id, type(exc).__name__, exc,
+            )
+            _invalidate_folder_cache(client, cache)
             return False
 
     return False
-
-
-async def _add_peers_to_joined_folder(
-    client: TelegramClient,
-    entities: list,
-    account_index: int,
-    cache: dict[int, tuple[float, list[DialogFilter]]],
-) -> int:
-    """
-    I1: Batch-add multiple entities across joined* folders, respecting
-    _FOLDER_CAPACITY per folder. Creates new folders as needed.
-    """
-    if not entities:
-        return 0
-
-    new_peers: list   = []
-    new_ids: set[int] = set()
-
-    for entity in entities:
-        try:
-            ip  = await client.get_input_entity(entity)
-            pid = _peer_id(ip)
-            if pid and pid not in new_ids:
-                new_peers.append(ip)
-                new_ids.add(pid)
-        except Exception as exc:
-            log.debug(
-                "[Account%d] Could not resolve peer for %s: %s",
-                account_index, getattr(entity, "id", entity), exc,
-            )
-
-    if not new_peers:
-        return 0
-
-    added = 0
-    for peer in new_peers:
-        if await _add_single_peer_to_joined_folder(client, peer, account_index, cache):
-            added += 1
-
-    log.debug("[Account%d] Batch-added %d peer(s) to joined* folder(s).", account_index, added)
-    return added
 
 
 async def _remove_peers_from_all_joined_folders(
@@ -800,32 +1073,28 @@ async def _remove_peers_from_all_joined_folders(
     entities: list,
     account_index: int,
     cache: dict[int, tuple[float, list[DialogFilter]]],
-) -> int:
+) -> tuple[int, int]:
     """
     I1: Remove peers from ALL joined* folders (joined, joined2, joined3, …).
-    Returns total number of peers removed across all folders.
+    Returns (peers_removed, folders_failed).
+
+    v3.2.0 (N3): copy-then-commit (no more in-place mutation of cached folders),
+    FloodWait handled with a bounded retry (any flood sibling), and every failure
+    logged at WARNING and reported through folders_failed. `entities` may hold
+    entities, input peers or plain ids. A folder-list fetch error propagates to the
+    caller (_remove_left_from_folders), which reports it.
     """
     if not entities:
-        return 0
+        return 0, 0
 
-    remove_ids: set[int] = set()
-    for entity in entities:
-        try:
-            ip  = await client.get_input_entity(entity)
-            pid = _peer_id(ip)
-            if pid:
-                remove_ids.add(pid)
-        except Exception:
-            pid = getattr(entity, "id", None)
-            if pid:
-                remove_ids.add(pid)
-
+    remove_ids = await _collect_peer_ids(client, entities)
     if not remove_ids:
-        return 0
+        return 0, 0
 
     folders    = await _get_folders(client, cache)
     all_joined = _find_all_joined_folders(folders)
     total_removed = 0
+    failed        = 0
 
     for folder in all_joined:
         original    = list(folder.include_peers or [])
@@ -834,241 +1103,414 @@ async def _remove_peers_from_all_joined_folders(
         if removed_cnt == 0:
             continue
 
-        folder.include_peers = kept
-        try:
-            await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
-            _update_folder_in_cache(client, cache, folder)  # N2: write-through
+        updated = copy.copy(folder)
+        updated.include_peers = kept
+        if await _write_folder_with_retry(
+            client, updated, account_index, cache, what=f"remove {removed_cnt} peer(s) from"
+        ):
             total_removed += removed_cnt
             log.debug(
                 "[Account%d] Removed %d peer(s) from '%s' folder.",
-                account_index, removed_cnt, _folder_title(folder),
+                account_index, removed_cnt, _folder_title(updated),
             )
-        except Exception as exc:
-            log.debug(
-                "[Account%d] Could not update '%s' folder when removing peers: %s",
-                account_index, _folder_title(folder), exc,
-            )
+        else:
+            failed += 1
 
-    return total_removed
+    return total_removed, failed
 
 
-# ── Folder exclusion (I2's type-aware version was reverted; now unconditional) ───
-
-async def _add_to_all_other_folders_exclusion(
-    client: TelegramClient,
-    entity,
-    account_index: int,
-    cache: dict[int, tuple[float, list[DialogFilter]]],
-) -> None:
-    """
-    Req 4: Add a chat to the exclude_peers of every OTHER editable folder
-    so it only appears in the joined* folder(s).
-
-    - Skips ALL joined* folders (not just the base 'joined')
-    - Excludes from ALL other editable folders unconditionally
-      (reverted from the v3.1.6 type-aware I2 approach which was too
-      conservative and caused newly joined chats to appear in other folders
-      when those folders had broadcasts/groups flags set to False)
-    - N4: respects the 100-entry exclude_peers capacity per folder
-    - N2: uses write-through cache after each successful update
-    """
-    try:
-        ip  = await client.get_input_entity(entity)
-        pid = _peer_id(ip)
-        if pid is None:
-            return
-    except Exception as exc:
-        log.debug("[Account%d] exclusion: could not resolve entity: %s", account_index, exc)
-        return
-
-    folders      = await _get_folders(client, cache)
-    all_joined   = _find_all_joined_folders(folders)
-    joined_ids   = {f.id for f in all_joined}
-
-    for folder in folders:
-        if folder.id in joined_ids:
-            continue  # skip all joined* folders
-
-        existing_excl = list(folder.exclude_peers or [])
-        excl_ids      = {_peer_id(p) for p in existing_excl} - {None}
-
-        if pid in excl_ids:
-            continue  # already excluded
-
-        # N4: capacity guard — don't overflow exclude_peers
-        if len(existing_excl) >= _EXCLUDE_PEERS_CAPACITY:
-            log.debug(
-                "[Account%d] Skipping exclusion for folder '%s': exclude_peers at capacity (%d).",
-                account_index, _folder_title(folder), _EXCLUDE_PEERS_CAPACITY,
-            )
-            continue
-
-        existing_excl.append(ip)
-        folder.exclude_peers = existing_excl
-
-        for attempt in range(3):
-            try:
-                await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
-                _update_folder_in_cache(client, cache, folder)  # N2: write-through
-                log.debug(
-                    "[Account%d] Added peer id=%d to exclude_peers of folder '%s'.",
-                    account_index, pid, _folder_title(folder),
-                )
-                break
-            except errors.FloodWaitError as exc:
-                if attempt < 2:
-                    await asyncio.sleep(exc.seconds + 2)
-                else:
-                    log.debug(
-                        "[Account%d] FloodWait on folder exclusion for '%s' — skipped.",
-                        account_index, _folder_title(folder),
-                    )
-            except Exception as exc:
-                log.debug(
-                    "[Account%d] Could not update exclusion for folder '%s': %s",
-                    account_index, _folder_title(folder), exc,
-                )
-                break
-
-
-async def _remove_from_all_folders_exclusion(
+async def _sweep_legacy_exclusions(
     client: TelegramClient,
     entities: list,
     account_index: int,
     cache: dict[int, tuple[float, list[DialogFilter]]],
-) -> None:
+) -> tuple[int, int]:
     """
-    Req 4: When a chat is left (by any means), remove it from exclude_peers
-    of ALL folders immediately and synchronously.
+    v3.2.0 migration — SCOPED legacy sweep. Returns (entries_removed, folders_failed).
 
-    This is called from _handle_left(), folder reset, and _check_auto_leave().
+    Versions before 3.2.0 wrote every joined chat into the exclude_peers list of
+    every other folder. Those entries are inert now but still occupy slots and
+    clutter the folder editor. When a chat is LEFT, this removes just that chat's id
+    from other folders' exclude_peers — nothing else. It deliberately does not
+    bulk-clear exclude_peers: user-authored exclusions are indistinguishable from
+    ours, and until a chat is left its legacy entry is a harmless extra safety net.
+
+    Costs no API call in the common case: it reuses the folder cache that the
+    joined*-folder cleanup has just warmed, and writes only if an entry matches.
     """
-    remove_ids: set[int] = set()
-    for entity in entities:
-        try:
-            ip  = await client.get_input_entity(entity)
-            pid = _peer_id(ip)
-            if pid:
-                remove_ids.add(pid)
-        except Exception:
-            pid = getattr(entity, "id", None)
-            if pid:
-                remove_ids.add(pid)
+    if not entities:
+        return 0, 0
 
-    if not remove_ids:
-        return
+    ids = await _collect_peer_ids(client, entities)
+    if not ids:
+        return 0, 0
 
-    folders = await _get_folders(client, cache)
+    folders    = await _get_folders(client, cache)
+    joined_ids = {f.id for f in _find_all_joined_folders(folders)}
+    swept  = 0
+    failed = 0
+
     for folder in folders:
-        excl     = list(folder.exclude_peers or [])
-        new_excl = [p for p in excl if _peer_id(p) not in remove_ids]
-        if len(new_excl) == len(excl):
-            continue  # nothing to remove
+        if folder.id in joined_ids:
+            continue
+        original = list(folder.exclude_peers or [])
+        kept     = [p for p in original if _peer_id(p) not in ids]
+        n        = len(original) - len(kept)
+        if n == 0:
+            continue
 
-        folder.exclude_peers = new_excl
-        for attempt in range(3):
+        updated = copy.copy(folder)
+        updated.exclude_peers = kept
+        if await _write_folder_with_retry(
+            client, updated, account_index, cache, what=f"remove {n} legacy exclusion(s) from"
+        ):
+            swept += n
+            log.debug(
+                "[Account%d] Swept %d legacy exclusion(s) from '%s' folder.",
+                account_index, n, _folder_title(updated),
+            )
+        else:
+            failed += 1
+
+    return swept, failed
+
+
+async def _remove_left_from_folders(
+    client: TelegramClient,
+    entities: list,
+    account_index: int,
+    cache: dict[int, tuple[float, list[DialogFilter]]],
+) -> tuple[int, int, int]:
+    """
+    The ONE post-leave folder cleanup used by `left`, auto-leave and the folder
+    reset (Pattern 1.3 — these used to be three parallel, diverging copies).
+    Returns (removed_from_joined, legacy_swept, folders_failed). Never raises
+    (except CancelledError); every failure is logged and counted.
+    """
+    if not entities:
+        return 0, 0, 0
+    removed = swept = failed = 0
+
+    try:
+        removed, f1 = await _remove_peers_from_all_joined_folders(client, entities, account_index, cache)
+        failed += f1
+    except errors.FloodError as exc:
+        failed += 1
+        log.warning(
+            "[Account%d] Folder cleanup after leave hit FloodWait %ds (%s) — joined* folders not updated.",
+            account_index, _flood_seconds(exc), type(exc).__name__,
+        )
+    except Exception as exc:
+        failed += 1
+        log.warning(
+            "[Account%d] Folder cleanup after leave failed: %s: %s",
+            account_index, type(exc).__name__, exc,
+        )
+
+    try:
+        swept, f2 = await _sweep_legacy_exclusions(client, entities, account_index, cache)
+        failed += f2
+    except errors.FloodError as exc:
+        failed += 1
+        log.warning(
+            "[Account%d] Legacy-exclusion sweep hit FloodWait %ds (%s) — skipped.",
+            account_index, _flood_seconds(exc), type(exc).__name__,
+        )
+    except Exception as exc:
+        failed += 1
+        log.warning(
+            "[Account%d] Legacy-exclusion sweep failed: %s: %s",
+            account_index, type(exc).__name__, exc,
+        )
+
+    return removed, swept, failed
+
+
+# ── v3.2.0: Folder protection — exclude_archived ─────────────────────────────
+
+async def ensure_exclude_archived(
+    client: TelegramClient,
+    account_index: int,
+    cache: dict[int, tuple[float, list[DialogFilter]]],
+    *,
+    result: EnsureResult | None = None,
+    context: str = "",
+    pace: float = _ENSURE_PACE,
+    max_flood_wait: float = _ENSURE_MAX_FLOOD_WAIT,
+) -> EnsureResult:
+    """
+    Make sure EVERY regular, non-joined* folder carries Telegram's own
+    `exclude_archived` flag, so archived joined chats never show up in it.
+    This replaces the old per-chat exclude_peers machinery.
+
+    Why it is safe (verified in the Telegram Desktop and Android clients): a folder
+    shows a chat if it is NOT in exclude_peers AND (it is in include_peers OR it
+    matches the type flags and passes the muted / read / archived conditions). So
+    exclude_archived only hides archived chats that match by TYPE flags;
+    explicitly included peers always stay visible — which is why every joined*
+    folder can (and does) keep the flag. Side effect, by design and documented:
+    a user's own manually archived chats also disappear from folders that match by
+    type flags.
+
+    Behaviour:
+      • Idempotent — a second run costs one read and zero writes.
+      • Reads the folder list FRESH (never from the cache) right before writing, so a
+        concurrent edit made in another Telegram client is not overwritten with
+        stale data; the fresh list then refreshes the cache.
+      • Skips DialogFilterDefault ("All chats" placeholder), DialogFilterChatlist
+        (shared folders: no such field, and they only hold explicit includes) and
+        every joined* folder.
+      • Read-modify-write on a COPY of the parsed filter, so every other field
+        (title entities, color, emoticon, title_noanimate, pinned/include/exclude
+        peers, type flags) survives byte-for-byte. The check is truthiness-based:
+        None and False are identical on the wire.
+      • FloodWait is global: Telethon short-circuits repeat calls of a request type
+        while a wait is active, so one wait covers every remaining folder. It is
+        slept through ONCE per occurrence and the SAME folder is retried. When the
+        total wait would exceed `max_flood_wait`, the remaining folders are counted
+        as deferred, the summary is logged and the FloodError is RE-RAISED (never
+        swallowed) — callers use _reconcile_folders(), which reports it.
+      • Per-folder rejections (the Filter* RPC errors, FILTERS_TOO_MUCH, network
+        errors, a False answer) are logged at WARNING with folder id/title/error
+        class, counted, and never abort the loop. CancelledError always propagates.
+      • No module-level state: the cache is a parameter, so a hot reload simply
+        re-defines this function.
+
+    `result` may be passed in so a caller still has the partial counts if the
+    FloodError escapes. Returns the (possibly caller-supplied) EnsureResult.
+    """
+    res = result if result is not None else EnsureResult()
+    ctx = f" [{context}]" if context else ""
+    waited = 0.0
+
+    try:
+        # ── 1. Fresh read ────────────────────────────────────────────────
+        while True:
             try:
-                await client(UpdateDialogFilterRequest(id=folder.id, filter=folder))
-                _update_folder_in_cache(client, cache, folder)  # N2: write-through
-                log.debug(
-                    "[Account%d] Removed %d peer(s) from exclusion list of folder '%s'.",
-                    account_index, len(excl) - len(new_excl), _folder_title(folder),
-                )
+                filters = await _fetch_all_filters(client)
                 break
-            except errors.FloodWaitError as exc:
-                if attempt < 2:
-                    await asyncio.sleep(exc.seconds + 2)
-                else:
-                    break
+            except errors.FloodError as exc:
+                wait = _flood_seconds(exc) + _FLOOD_PAD
+                if waited + wait > max_flood_wait:
+                    res.fetch_error = f"FloodWait {_flood_seconds(exc)}s exceeds the wait budget"
+                    log.warning(
+                        "[Account%d] ensure_exclude_archived%s: FloodWait %ds (%s) while reading "
+                        "folders exceeds the %ds budget — deferring to the next reconcile.",
+                        account_index, ctx, _flood_seconds(exc), type(exc).__name__, int(max_flood_wait),
+                    )
+                    raise
+                log.info(
+                    "[Account%d] ensure_exclude_archived%s: FloodWait %ds while reading folders — waiting.",
+                    account_index, ctx, _flood_seconds(exc),
+                )
+                await asyncio.sleep(wait)
+                waited += wait
             except Exception as exc:
+                res.fetch_error = f"{type(exc).__name__}: {exc}"
+                log.warning(
+                    "[Account%d] ensure_exclude_archived%s: could not read the folder list: %s",
+                    account_index, ctx, res.fetch_error,
+                )
+                return res
+
+        _store_folders_in_cache(client, cache, [f for f in filters if isinstance(f, DialogFilter)])
+
+        # ── 2. Classify ──────────────────────────────────────────────────
+        candidates: list[DialogFilter] = []
+        for f in filters:
+            if isinstance(f, (DialogFilterDefault, DialogFilterChatlist)):
+                res.skipped += 1
+                continue
+            if not isinstance(f, DialogFilter):
+                res.skipped += 1
                 log.debug(
-                    "[Account%d] Could not clean exclusion for folder '%s': %s",
-                    account_index, _folder_title(folder), exc,
+                    "[Account%d] ensure_exclude_archived%s: skipping unknown filter type %s.",
+                    account_index, ctx, type(f).__name__,
+                )
+                continue
+            if _get_joined_folder_number(_folder_title(f)) is not None:
+                res.skipped += 1
+                continue
+            if f.exclude_archived:
+                res.already_ok += 1
+                continue
+            candidates.append(f)
+
+        # ── 3. Write, paced, FloodWait-global ────────────────────────────
+        for idx, folder in enumerate(candidates):
+            if idx > 0 and pace > 0:
+                await asyncio.sleep(pace * random.uniform(0.8, 1.2))
+            label = f"'{_folder_title(folder)}' (id={folder.id})"
+
+            while True:
+                try:
+                    updated = copy.copy(folder)
+                    updated.exclude_archived = True
+                    answer = await client(UpdateDialogFilterRequest(id=updated.id, filter=updated))
+                except errors.FloodError as exc:
+                    wait = _flood_seconds(exc) + _FLOOD_PAD
+                    if waited + wait > max_flood_wait:
+                        res.deferred += len(candidates) - idx
+                        log.warning(
+                            "[Account%d] ensure_exclude_archived%s: FloodWait %ds (%s) at %s exceeds the "
+                            "%ds budget — %d folder(s) deferred to the next reconcile.",
+                            account_index, ctx, _flood_seconds(exc), type(exc).__name__, label,
+                            int(max_flood_wait), len(candidates) - idx,
+                        )
+                        raise
+                    log.info(
+                        "[Account%d] ensure_exclude_archived%s: FloodWait %ds at %s — waiting once, "
+                        "then resuming.",
+                        account_index, ctx, _flood_seconds(exc), label,
+                    )
+                    await asyncio.sleep(wait)
+                    waited += wait
+                    continue
+                except Exception as exc:
+                    # Every sibling lands here: FilterIdInvalid, FilterIncludeEmpty,
+                    # FilterNotSupported, FilterTitleEmpty, InputFilterInvalid,
+                    # FILTERS_TOO_MUCH, … (all errors.RPCError) and network errors.
+                    res.failed += 1
+                    res.failures.append(f"{label}: {type(exc).__name__}: {exc}")
+                    log.warning(
+                        "[Account%d] ensure_exclude_archived%s: could not update folder %s: %s: %s",
+                        account_index, ctx, label, type(exc).__name__, exc,
+                    )
+                    break
+
+                if answer is False:
+                    res.failed += 1
+                    res.failures.append(f"{label}: server answered false")
+                    log.warning(
+                        "[Account%d] ensure_exclude_archived%s: Telegram refused the update of folder %s.",
+                        account_index, ctx, label,
+                    )
+                    break
+
+                _update_folder_in_cache(client, cache, updated)
+                res.updated += 1
+                log.debug(
+                    "[Account%d] ensure_exclude_archived%s: set exclude_archived=True on folder %s.",
+                    account_index, ctx, label,
                 )
                 break
 
+        return res
 
-# ── Req 3: Mute and archive helpers ──────────────────────────────────────────
+    finally:
+        # One line per run: INFO when something happened, DEBUG when it was a no-op.
+        if res.changed:
+            log.info("[Account%d] ensure_exclude_archived%s: %s", account_index, ctx, res.summary())
+        else:
+            log.debug("[Account%d] ensure_exclude_archived%s: %s", account_index, ctx, res.summary())
+
+
+# ── Req 3: Mute and archive helpers (v3.2.0: first-class, never silent) ───────
+
+async def _call_with_flood_retry(
+    client: TelegramClient,
+    entity,
+    build_request,
+    *,
+    action: str,
+    account_index: int,
+) -> bool:
+    """
+    Run one per-chat action (mute / archive) with a bounded, LOGGED retry.
+
+    v3.2.0 (N2): the previous helpers waited once (capped at 30 s), retried once, and
+    swallowed a second FloodWait with `except Exception: return False` — no log at
+    all. Under the exclude_archived design a chat whose archive or mute failed is
+    visible in every type-flag folder (or pops out of the archive on its next
+    message), so a silent failure is no longer acceptable. Now: up to
+    _ACTION_MAX_ATTEMPTS attempts; a FloodWait (any flood sibling) is slept through
+    only if it is <= _ACTION_FLOOD_CAP; every give-up is a WARNING; the caller gets
+    an honest bool and queues the chat for the retry sweep.
+
+    `build_request(input_peer)` returns a fresh request object per attempt.
+    """
+    ent_id = getattr(entity, "id", entity)
+    try:
+        input_peer = await client.get_input_entity(entity)
+    except Exception as exc:
+        log.warning(
+            "[Account%d] Could not %s chat id=%s: peer resolution failed (%s: %s)",
+            account_index, action, ent_id, type(exc).__name__, exc,
+        )
+        return False
+
+    for attempt in range(1, _ACTION_MAX_ATTEMPTS + 1):
+        try:
+            await client(build_request(input_peer))
+            log.debug("[Account%d] %s ok for chat id=%s.", account_index, action.capitalize(), ent_id)
+            return True
+        except errors.FloodError as exc:
+            wait = _flood_seconds(exc) + _FLOOD_PAD
+            if attempt >= _ACTION_MAX_ATTEMPTS or wait > _ACTION_FLOOD_CAP:
+                log.warning(
+                    "[Account%d] Could not %s chat id=%s: FloodWait %ds (%s), attempt %d/%d, "
+                    "inline cap %ds — queued for the retry sweep.",
+                    account_index, action, ent_id, _flood_seconds(exc), type(exc).__name__,
+                    attempt, _ACTION_MAX_ATTEMPTS, int(_ACTION_FLOOD_CAP),
+                )
+                return False
+            log.debug(
+                "[Account%d] FloodWait %ds on %s for chat id=%s (attempt %d/%d) — waiting.",
+                account_index, _flood_seconds(exc), action, ent_id, attempt, _ACTION_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(wait)
+        except Exception as exc:
+            log.warning(
+                "[Account%d] Could not %s chat id=%s: %s: %s",
+                account_index, action, ent_id, type(exc).__name__, exc,
+            )
+            return False
+    return False
+
 
 async def _mute_chat(client: TelegramClient, entity, account_index: int) -> bool:
     """
     Req 3: Mute a chat immediately after joining.
     Sets mute_until to year 2038 (effectively permanent).
+
+    The mute is LOAD-BEARING (v3.2.0): Telegram moves an UNMUTED archived chat back
+    to the main list when a new message arrives (unless the account has
+    keep_archived_unmuted set); a muted one stays archived. Without a successful
+    mute the exclude_archived protection would evaporate on the first message.
     Returns True on success.
     """
-    try:
-        input_peer = await client.get_input_entity(entity)
-        await client(UpdateNotifySettingsRequest(
+    def build(input_peer):
+        return UpdateNotifySettingsRequest(
             peer=InputNotifyPeer(peer=input_peer),
             settings=InputPeerNotifySettings(
                 show_previews=False,
                 silent=False,
                 mute_until=2147483647,  # max Unix timestamp (year 2038)
             ),
-        ))
-        log.debug(
-            "[Account%d] Muted chat id=%s.",
-            account_index, getattr(entity, "id", entity),
         )
-        return True
-    except errors.FloodWaitError as exc:
-        log.debug("[Account%d] FloodWait %ds on mute — waiting.", account_index, exc.seconds)
-        await asyncio.sleep(min(exc.seconds + 2, 30))
-        try:
-            input_peer = await client.get_input_entity(entity)
-            await client(UpdateNotifySettingsRequest(
-                peer=InputNotifyPeer(peer=input_peer),
-                settings=InputPeerNotifySettings(
-                    show_previews=False,
-                    silent=False,
-                    mute_until=2147483647,
-                ),
-            ))
-            return True
-        except Exception:
-            return False
-    except Exception as exc:
-        log.debug("[Account%d] Could not mute chat: %s", account_index, exc)
-        return False
+
+    return await _call_with_flood_retry(
+        client, entity, build, action="mute", account_index=account_index
+    )
 
 
 async def _archive_chat(client: TelegramClient, entity, account_index: int) -> bool:
     """
     Req 3: Archive a chat immediately after joining.
-    Uses EditPeerFoldersRequest to move it to folder_id=1 (Archive).
-    Returns True on success.
+    Uses EditPeerFoldersRequest to move it to folder_id=1 (Archive — the only
+    folder id Telegram allows besides 0).
+
+    Under exclude_archived this IS the protection: an un-archived joined chat is
+    visible in every type-flag folder. Returns True on success.
     """
-    try:
-        input_peer = await client.get_input_entity(entity)
-        await client(EditPeerFoldersRequest(
-            folder_peers=[InputFolderPeer(peer=input_peer, folder_id=1)],
-        ))
-        log.debug(
-            "[Account%d] Archived chat id=%s.",
-            account_index, getattr(entity, "id", entity),
+    def build(input_peer):
+        return EditPeerFoldersRequest(
+            folder_peers=[InputFolderPeer(peer=input_peer, folder_id=_ARCHIVE_FOLDER_ID)],
         )
-        return True
-    except errors.FloodWaitError as exc:
-        log.debug("[Account%d] FloodWait %ds on archive — waiting.", account_index, exc.seconds)
-        await asyncio.sleep(min(exc.seconds + 2, 30))
-        try:
-            input_peer = await client.get_input_entity(entity)
-            await client(EditPeerFoldersRequest(
-                folder_peers=[InputFolderPeer(peer=input_peer, folder_id=1)],
-            ))
-            return True
-        except Exception:
-            return False
-    except Exception as exc:
-        log.debug("[Account%d] Could not archive chat: %s", account_index, exc)
-        return False
 
-
-async def _mute_and_archive(client: TelegramClient, entity, account_index: int) -> tuple[bool, bool]:
-    """Mute and archive a chat. Returns (muted, archived)."""
-    muted    = await _mute_chat(client, entity, account_index)
-    archived = await _archive_chat(client, entity, account_index)
-    return muted, archived
+    return await _call_with_flood_retry(
+        client, entity, build, action="archive", account_index=account_index
+    )
 
 
 # ── Folder reset helper ───────────────────────────────────────────────────────
@@ -1082,7 +1524,9 @@ async def _leave_and_reset_joined_folder(
     I1: Leave all chats from ALL joined* folders (joined, joined2, joined3, …),
     delete ALL joined* folders, then recreate only the base 'joined' folder.
 
-    Req 4: Also removes each left chat from all other folders' exclusion lists.
+    v3.2.0: the per-chat exclusion cleanup is gone with the exclusion system; what
+    remains is the scoped legacy sweep for the chats just left (see
+    _sweep_legacy_exclusions). Failures to delete a folder are logged at WARNING.
     Req 5: Uses paced loop (_LEFT_INTER_DELAY) instead of a tight loop.
 
     Returns (left_count, failed_count).
@@ -1116,12 +1560,13 @@ async def _leave_and_reset_joined_folder(
                     break
                 except errors.UserNotParticipantError:
                     left_count += 1  # already left — still counts as handled
+                    left_entities.append(peer)  # its legacy exclusions still need sweeping
                     break
-                except errors.FloodWaitError as exc:
+                except errors.FloodError as exc:
                     fw_retries += 1
                     if fw_retries > _LEFT_MAX_FW_RETRIES:
                         failed_count += 1
-                        log.debug(
+                        log.warning(
                             "[Account%d] Folder reset: FloodWait retry cap on peer id=%d "
                             "in '%s' — skipping.",
                             account_index, pid, folder_label,
@@ -1130,15 +1575,15 @@ async def _leave_and_reset_joined_folder(
                     log.debug(
                         "[Account%d] Folder reset: FloodWait %ds on peer id=%d "
                         "in '%s' (retry %d/%d).",
-                        account_index, exc.seconds, pid, folder_label,
+                        account_index, _flood_seconds(exc), pid, folder_label,
                         fw_retries, _LEFT_MAX_FW_RETRIES,
                     )
-                    await asyncio.sleep(exc.seconds + 2)
+                    await asyncio.sleep(_flood_seconds(exc) + _FLOOD_PAD)
                 except Exception as exc:
                     failed_count += 1
-                    log.debug(
-                        "[Account%d] Folder reset: could not leave peer id=%d in '%s': %s",
-                        account_index, pid, folder_label, exc,
+                    log.warning(
+                        "[Account%d] Folder reset: could not leave peer id=%d in '%s': %s: %s",
+                        account_index, pid, folder_label, type(exc).__name__, exc,
                     )
                     break
 
@@ -1150,15 +1595,21 @@ async def _leave_and_reset_joined_folder(
         try:
             await client(UpdateDialogFilterRequest(id=folder.id))
         except Exception as exc:
-            log.debug(
-                "[Account%d] Could not delete folder '%s': %s",
-                account_index, folder_label, exc,
+            log.warning(
+                "[Account%d] Could not delete folder '%s': %s: %s",
+                account_index, folder_label, type(exc).__name__, exc,
             )
         _invalidate_folder_cache(client, cache)
 
-    # Req 4: clean exclusion lists for everything we left
+    # v3.2.0: scoped legacy sweep for everything we left (never raises)
     if left_entities:
-        await _remove_from_all_folders_exclusion(client, left_entities, account_index, cache)
+        try:
+            await _sweep_legacy_exclusions(client, left_entities, account_index, cache)
+        except Exception as exc:
+            log.warning(
+                "[Account%d] Legacy-exclusion sweep after folder reset failed: %s: %s",
+                account_index, type(exc).__name__, exc,
+            )
 
     # Recreate only the base 'joined' folder
     await _create_joined_folder(client, account_index, cache, number=1)
@@ -1189,6 +1640,11 @@ class JoinLeft(Module):
 
         self._folder_cache: dict[int, tuple[float, list[DialogFilter]]] = {}
 
+        # v3.2.0: joined chats whose mute / folder-add / archive has not fully
+        # succeeded yet. Per-account, in memory (an instance attribute, not module
+        # state, so hot-reload and multi-account isolation are unaffected).
+        self._pending_actions: dict[int, _PendingActions] = {}
+
         # Layer 1: persistent invite hash → username cache
         self._invite_cache: dict[str, dict] = {}
         self._invite_cache_file = self.cfg.settings_dir / "join_left_invite_cache.json"
@@ -1210,6 +1666,7 @@ class JoinLeft(Module):
             self._auto_leave_task.cancel()
         self._auto_leave_task = None
         self._folder_cache.clear()
+        self._pending_actions.clear()
         super().teardown(client)
 
     # ── Settings I/O ──────────────────────────────────────────────────────────
@@ -1430,35 +1887,160 @@ class JoinLeft(Module):
             return True
         return False
 
-    # ── Per-join post-processing (mute, archive, folder, exclusion) ───────────
+    # ── Per-join post-processing (mute, folder, archive) ──────────────────────
 
     async def _post_join_actions(
         self,
         client: TelegramClient,
         entity,
         account_index: int,
-    ) -> tuple[bool, bool, bool]:
+    ) -> PostJoinResult:
         """
-        Req 3 + Req 4: Immediately after a successful join, in this exact order:
-        1. Mute the chat
-        2. Add to joined* folder (incremental, with exclude_archived=True patch)
-        3. Add to exclude_peers of all OTHER folders (unconditional — I2's type-aware check was reverted)
-        4. Archive the chat (LAST — prevents folder operations from un-archiving)
+        Req 3: Immediately after a successful join, in this exact order:
+        1. Mute the chat        — keeps it archived (an unmuted archived chat is moved
+                                  back to the main list by Telegram on its next message)
+        2. Add to joined* folder (incremental, N1-safe copy-then-commit write)
+        3. Archive the chat     — with exclude_archived on every other folder, this IS
+                                  what hides the chat from them
 
-        Archive is deliberately last: UpdateDialogFilterRequest with
-        exclude_archived=False would silently move the chat back to folder_id=0.
-        By archiving after all folder operations are complete, no subsequent
-        Telegram-side side-effect can undo it.
+        v3.2.0: the old step "add to exclude_peers of every OTHER folder" is gone —
+        ensure_exclude_archived() does that job once per batch instead. The
+        order (archive last) is kept as it was: it costs nothing. (Older comments
+        claimed a folder update with exclude_archived=False "silently moves the
+        chat back to folder_id=0"; that was never verified and is not relied on —
+        see the v3.2.0 CHANGELOG correction.)
 
-        Returns (muted, archived, folder_added).
+        Returns a PostJoinResult. Every failed step has already been logged at
+        WARNING by its helper; _record_join() queues the chat for the retry sweep.
         """
         muted        = await _mute_chat(client, entity, account_index)
         folder_added = await _add_single_peer_to_joined_folder(
             client, entity, account_index, self._folder_cache
         )
-        await _add_to_all_other_folders_exclusion(client, entity, account_index, self._folder_cache)
         archived     = await _archive_chat(client, entity, account_index)
-        return muted, archived, folder_added
+        return PostJoinResult(muted=muted, folder_added=folder_added, archived=archived)
+
+    async def _record_join(self, client: TelegramClient, entity) -> PostJoinResult:
+        """
+        The ONE place a joined chat is recorded (v3.2.0, Pattern 1.3 — three call sites
+        used to repeat "write joined_chats, then run the post-join actions" and
+        ignore the result): persist the tracking timestamp, run the post-join actions
+        and, if any step failed, queue the chat in self._pending_actions for the
+        retry sweep. Returns the PostJoinResult so the caller can report it.
+        """
+        async with self._settings_lock:
+            self._settings["joined_chats"][str(entity.id)] = \
+                datetime.datetime.now(datetime.UTC).isoformat()
+            await self._save_settings()
+
+        result = await self._post_join_actions(client, entity, self.cfg.index)
+        if result.complete:
+            self._pending_actions.pop(entity.id, None)
+        else:
+            missing = result.missing()
+            self._pending_actions[entity.id] = _PendingActions(entity=entity, missing=missing)
+            self._log_warning(
+                "Post-join actions incomplete for chat id=%s (missing: %s) — queued for retry.",
+                entity.id, ", ".join(sorted(missing)),
+            )
+        return result
+
+    async def _forget_joined_chat(self, chat_id: int) -> None:
+        """Drop a chat we are no longer a member of from tracking AND from the retry queue."""
+        async with self._settings_lock:
+            self._settings["joined_chats"].pop(str(chat_id), None)
+            await self._save_settings()
+        self._pending_actions.pop(chat_id, None)
+
+    async def _run_missing_steps(
+        self, client: TelegramClient, chat_id: int, pending: _PendingActions
+    ) -> bool:
+        """Re-run the still-missing post-join steps of one chat. True once all are done."""
+        entity = pending.entity
+        if "mute" in pending.missing and await _mute_chat(client, entity, self.cfg.index):
+            pending.missing.discard("mute")
+        if "folder" in pending.missing and await _add_single_peer_to_joined_folder(
+            client, entity, self.cfg.index, self._folder_cache
+        ):
+            pending.missing.discard("folder")
+        if "archive" in pending.missing and await _archive_chat(client, entity, self.cfg.index):
+            pending.missing.discard("archive")
+
+        if pending.missing:
+            return False
+        self._pending_actions.pop(chat_id, None)
+        self._log_info("Retry completed the post-join actions of chat id=%s.", chat_id)
+        return True
+
+    async def _retry_missing_actions(self, client: TelegramClient, *, reason: str) -> tuple[int, int]:
+        """
+        Bounded retry sweep over chats whose mute / folder-add / archive failed.
+        Runs at the end of every join batch and every 6 hours. Bounded three ways:
+        _SWEEP_ROUNDS passes, a _SWEEP_TIME_BUDGET wall-clock ceiling, and
+        _PENDING_MAX_SWEEPS sweeps per chat, after which the chat is given up on
+        with a WARNING (it will not be retried again). Returns (resolved, still_pending).
+        """
+        if not self._pending_actions:
+            return 0, 0
+
+        for pending in self._pending_actions.values():
+            pending.attempts += 1
+
+        deadline = time.monotonic() + _SWEEP_TIME_BUDGET
+        resolved = 0
+        for round_no in range(_SWEEP_ROUNDS):
+            if not self._pending_actions or time.monotonic() >= deadline:
+                break
+            if round_no > 0:
+                await asyncio.sleep(_SWEEP_ROUND_DELAY)
+            for chat_id, pending in list(self._pending_actions.items()):
+                if time.monotonic() >= deadline:
+                    self._log_warning(
+                        "Retry sweep (%s) reached its %ds time budget — %d chat(s) left for later.",
+                        reason, int(_SWEEP_TIME_BUDGET), len(self._pending_actions),
+                    )
+                    break
+                if await self._run_missing_steps(client, chat_id, pending):
+                    resolved += 1
+
+        for chat_id, pending in list(self._pending_actions.items()):
+            if pending.attempts >= _PENDING_MAX_SWEEPS:
+                self._pending_actions.pop(chat_id, None)
+                self._log_warning(
+                    "Giving up on chat id=%s after %d sweeps — still missing: %s. "
+                    "Fix it by hand (mute / archive / add to a joined* folder) or re-run `join`.",
+                    chat_id, pending.attempts, ", ".join(sorted(pending.missing)),
+                )
+
+        remaining = len(self._pending_actions)
+        if resolved or remaining:
+            self._log_info(
+                "Retry sweep (%s): resolved=%d still_pending=%d", reason, resolved, remaining
+            )
+        return resolved, remaining
+
+    async def _reconcile_folders(self, client: TelegramClient, *, reason: str) -> EnsureResult:
+        """
+        Run ensure_exclude_archived() and absorb its outcome. Called at the end of every
+        join batch, once at startup and every 6 hours — the last two cover folders the
+        user creates (or edits to add type flags) after a batch. Never raises except
+        CancelledError; a FloodError that escapes ensure_exclude_archived() (wait budget
+        spent) is logged here at WARNING and the unfinished folders wait for the next run.
+        """
+        res = EnsureResult()
+        try:
+            await ensure_exclude_archived(
+                client, self.cfg.index, self._folder_cache, result=res, context=reason
+            )
+        except errors.FloodError as exc:
+            self._log_warning(
+                "Folder reconcile (%s) deferred by FloodWait %ds (%s): %s",
+                reason, _flood_seconds(exc), type(exc).__name__, res.summary(),
+            )
+        except Exception as exc:
+            res.fetch_error = res.fetch_error or f"{type(exc).__name__}: {exc}"
+            self._log_error("Folder reconcile (%s) failed: %s: %s", reason, type(exc).__name__, exc)
+        return res
 
     # ── I3: Pre-join invite link validation ───────────────────────────────────
 
@@ -1711,10 +2293,22 @@ class JoinLeft(Module):
             if self._settings.get("auto_leave_days") is not None:
                 await self._sync_folder_to_tracking(client)
 
+            first_cycle = True
             while True:
                 if client.is_connected():
+                    # v3.2.0: every cycle (the first one is the startup run) retries chats
+                    # whose post-join actions failed and re-checks that every non-joined
+                    # folder hides archived chats — this is what protects a folder the
+                    # user created after the last `join`. Independent of auto_leave_days.
+                    await self._retry_missing_actions(
+                        client, reason="startup" if first_cycle else "periodic"
+                    )
+                    await self._reconcile_folders(
+                        client, reason="startup" if first_cycle else "periodic"
+                    )
                     await self._check_auto_leave(client)
-                await asyncio.sleep(6 * 3600)
+                first_cycle = False
+                await asyncio.sleep(_AUTO_LEAVE_INTERVAL)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -1722,15 +2316,21 @@ class JoinLeft(Module):
 
     async def _check_auto_leave(self, client: TelegramClient) -> None:
         """
-        Check for expired chats and leave them.
+        Leave tracked chats that have been joined for at least `auto_leave_days` days.
 
-        Req 4 extension: also verifies that chats we've ever joined are still
-        joined — covers manual leaves (Telegram doesn't reliably push
-        "you left" notifications). Any chat found to be no longer joined is
-        cleaned from tracking AND from all folder exclusion lists.
+        AGE-BASED ONLY: only chats whose stored join time has aged out are examined.
+        (Older docstrings claimed this also "verifies manual leaves" for every
+        tracked chat; it never did. A chat the account left by hand is cleaned up
+        lazily — when it ages out, the leave attempt finds we are no longer a
+        participant and the branches below clean tracking AND folders.)
 
         Req 5: paced loop with FloodWait retry cap.
-        I1: uses _remove_peers_from_all_joined_folders to clean ALL joined* folders.
+        v3.2.0 (Pattern 1.3): EVERY branch that establishes "we are no longer a member"
+        — successful leave, not-a-participant, private/inaccessible, not found —
+        now removes the chat from tracking AND from all joined* folders through the
+        shared _remove_left_from_folders(). Previously only the success branch
+        touched the folders, so the other three left stale entries that used up
+        the 100-chat cap and showed up in `list`.
         """
         if not client.is_connected():
             return
@@ -1760,60 +2360,48 @@ class JoinLeft(Module):
                     continue
 
         for idx, (chat_id, joined_at_str) in enumerate(to_leave):
-            left_entity = None
+            gone = None   # entity (or raw id) of a chat this account is no longer a member of
             try:
                 entity = await client.get_entity(chat_id)
                 name   = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
 
                 await leave_dialog(client, entity)
 
-                left_entity = entity
+                gone = entity
                 self._log_debug("Auto-left '%s' (id=%d, joined %s).", name, chat_id, joined_at_str)
-
-                async with self._settings_lock:
-                    self._settings["joined_chats"].pop(str(chat_id), None)
-                    await self._save_settings()
-
-                # I1: remove from ALL joined* folders
-                await _remove_peers_from_all_joined_folders(
-                    client, [entity], self.cfg.index, self._folder_cache
-                )
+                await self._forget_joined_chat(chat_id)
 
             except errors.UserNotParticipantError:
                 self._log_debug("Auto-leave: not participant in %d, removing from tracking", chat_id)
-                async with self._settings_lock:
-                    self._settings["joined_chats"].pop(str(chat_id), None)
-                    await self._save_settings()
+                await self._forget_joined_chat(chat_id)
                 try:
-                    entity      = await client.get_entity(chat_id)
-                    left_entity = entity
+                    gone = await client.get_entity(chat_id)
                 except Exception:
-                    pass
+                    gone = chat_id
 
             except errors.ChannelPrivateError:
                 self._log_debug("Auto-leave: channel %d is private/inaccessible, removing from tracking", chat_id)
-                async with self._settings_lock:
-                    self._settings["joined_chats"].pop(str(chat_id), None)
-                    await self._save_settings()
+                await self._forget_joined_chat(chat_id)
+                gone = chat_id
 
             except (ValueError, errors.UsernameNotOccupiedError) as exc:
                 self._log_debug("Auto-leave: entity %d not found (%s), removing from tracking", chat_id, exc)
-                async with self._settings_lock:
-                    self._settings["joined_chats"].pop(str(chat_id), None)
-                    await self._save_settings()
+                await self._forget_joined_chat(chat_id)
+                gone = chat_id
 
-            except errors.FloodWaitError as exc:
-                self._log_debug("Auto-leave FloodWait %ds for %d (will retry next cycle).", exc.seconds, chat_id)
-                await asyncio.sleep(min(exc.seconds + 2, 60))
+            except errors.FloodError as exc:
+                self._log_warning(
+                    "Auto-leave FloodWait %ds (%s) for %d (will retry next cycle).",
+                    _flood_seconds(exc), type(exc).__name__, chat_id,
+                )
+                await asyncio.sleep(min(_flood_seconds(exc) + _FLOOD_PAD, 60))
 
             except Exception as exc:
-                self._log_debug("Auto-leave failed for %d (will retry): %s", chat_id, exc)
+                self._log_warning("Auto-leave failed for %d (will retry): %s: %s", chat_id, type(exc).__name__, exc)
 
-            # Req 4: clean exclusion lists for anything we left
-            if left_entity is not None:
-                await _remove_from_all_folders_exclusion(
-                    client, [left_entity], self.cfg.index, self._folder_cache
-                )
+            # I1 + v3.2.0: remove from ALL joined* folders + scoped legacy sweep
+            if gone is not None:
+                await _remove_left_from_folders(client, [gone], self.cfg.index, self._folder_cache)
 
             # Req 5: pace the auto-leave loop
             if idx < len(to_leave) - 1:
@@ -1914,6 +2502,7 @@ class JoinLeft(Module):
             async with self._settings_lock:
                 self._settings["joined_chats"] = {}
                 await self._save_settings()
+            self._pending_actions.clear()  # v3.2.0: every tracked chat was just left
 
             extra_folders_note = ""
             if len(all_joined) > 1:
@@ -2003,7 +2592,7 @@ class JoinLeft(Module):
             if current_len + line_len > _LIST_CHUNK_SIZE and current_lines:
                 chunks.append("\n".join(current_lines))
                 current_lines = ["_(ادامه در پیام بعدی...)_\n", line]
-                current_len   = sum(len(l) + 1 for l in current_lines)
+                current_len   = sum(len(ln) + 1 for ln in current_lines)
             else:
                 current_lines.append(line)
                 current_len += line_len
@@ -2042,8 +2631,14 @@ class JoinLeft(Module):
         - Req 1: folder addition is incremental (per-chat, immediately)
         - Req 2: already-member errors on ALL paths treated as success
         - Req 3: mute+archive immediately after each join
-        - Req 4: exclusion added to all other folders per-chat
+        - Req 4: [removed in v3.2.0 — exclude_archived replaces per-chat exclusion]
         - Req 5: per-entity FloodWait retry cap (_MAX_FLOODWAIT_RETRIES)
+
+        v3.2.0:
+        - every join outcome is recorded through _record_join() (one shared path;
+          its PostJoinResult is kept and reported — Pattern 1.3 / 1.6)
+        - after the loop: retry sweep for incomplete chats, then ONE
+          ensure_exclude_archived() run, both BEFORE the summary is built
         """
         client    = event.client
         reply_msg = await event.get_reply_message()
@@ -2082,6 +2677,7 @@ class JoinLeft(Module):
 
         results: list[str]    = []
         joined_entities: list = []
+        post_results: list[tuple[object, PostJoinResult]] = []   # v3.2.0: (entity, outcome)
 
         start_time    = time.monotonic()
         join_times: list[float] = []
@@ -2103,9 +2699,9 @@ class JoinLeft(Module):
                 try:
                     await processing_msg.edit(text, parse_mode="Markdown")
                     last_edit_time = now
-                except errors.FloodWaitError as e:
-                    self._log_warning("Edit FloodWait %ds", e.seconds)
-                    await asyncio.sleep(e.seconds)
+                except errors.FloodError as e:
+                    self._log_warning("Edit FloodWait %ds (%s)", _flood_seconds(e), type(e).__name__)
+                    await asyncio.sleep(_flood_seconds(e))
                 except Exception as exc:
                     self._log_error("Throttled edit failed: %s", exc)
 
@@ -2126,10 +2722,10 @@ class JoinLeft(Module):
                 await asyncio.sleep(sleep_for)
                 remaining -= sleep_for
 
-        async def handle_floodwait(exc: errors.FloodWaitError, label: str) -> float:
+        async def handle_floodwait(exc: errors.FloodError, label: str) -> float:
             nonlocal adaptive_mult
 
-            seconds = exc.seconds
+            seconds = _flood_seconds(exc)
             self._log_debug(
                 "[Account%d] FloodWait %ds for '%s' (current mult=%.1f)",
                 self.cfg.index, seconds, label, adaptive_mult,
@@ -2240,12 +2836,7 @@ class JoinLeft(Module):
                             success_count += 1
                             join_times.append(time.monotonic() - attempt_start)
                             joined_entities.append(joined_entity)
-
-                            async with self._settings_lock:
-                                self._settings["joined_chats"][str(joined_entity.id)] = \
-                                    datetime.datetime.now(datetime.UTC).isoformat()
-                                await self._save_settings()
-                            await self._post_join_actions(client, joined_entity, self.cfg.index)
+                            post_results.append((joined_entity, await self._record_join(client, joined_entity)))
                         else:
                             results.append(f"ℹ️ [{identifier}] — قبلاً عضو بود (جوین موفق)")
                             success_count += 1
@@ -2409,9 +3000,11 @@ class JoinLeft(Module):
                                                 break
                                         except errors.UserAlreadyParticipantError:
                                             joined_entity = await client.get_entity(f"@{resolved_username}")
+                                            already_member = True   # v3.2.0 (K5): same wording as every other path
                                         except Exception as exc2:
                                             if self._is_already_member_error(exc2):
                                                 joined_entity = await client.get_entity(f"@{resolved_username}")
+                                                already_member = True   # v3.2.0 (K5)
                                             else:
                                                 raise exc2
 
@@ -2471,7 +3064,7 @@ class JoinLeft(Module):
                                 # entity (e.g. raised an exception or returned ChatInvite),
                                 # and Layer 1 had resolved the invite to a public username,
                                 # use get_entity to obtain the entity so _post_join_actions
-                                # (archive, mute, folder, exclusion) can still run.
+                                # (mute, folder, archive) can still run.
                                 if joined_entity is None and resolved_username:
                                     try:
                                         joined_entity = await client.get_entity(f"@{resolved_username}")
@@ -2484,11 +3077,7 @@ class JoinLeft(Module):
                                 join_times.append(time.monotonic() - attempt_start)
                                 if joined_entity:
                                     joined_entities.append(joined_entity)
-                                    async with self._settings_lock:
-                                        self._settings["joined_chats"][str(joined_entity.id)] = \
-                                            datetime.datetime.now(datetime.UTC).isoformat()
-                                        await self._save_settings()
-                                    await self._post_join_actions(client, joined_entity, self.cfg.index)
+                                    post_results.append((joined_entity, await self._record_join(client, joined_entity)))
                                 break
 
                     # ── Record success ─────────────────────────────────────────
@@ -2518,18 +3107,14 @@ class JoinLeft(Module):
                         if use_adaptive and adaptive_mult > 1.0:
                             adaptive_mult = max(1.0, adaptive_mult * _ADAPTIVE_DECAY)
 
-                        async with self._settings_lock:
-                            self._settings["joined_chats"][str(joined_entity.id)] = \
-                                datetime.datetime.now(datetime.UTC).isoformat()
-                            await self._save_settings()
-
-                        # Req 1 + Req 3 + Req 4: immediate per-chat post-processing
-                        await self._post_join_actions(client, joined_entity, self.cfg.index)
+                        # Req 1 + Req 3: immediate per-chat recording + post-processing
+                        # (v3.2.0: through the shared _record_join(); outcome is kept)
+                        post_results.append((joined_entity, await self._record_join(client, joined_entity)))
 
                     break  # ← success (or handled WebView), exit retry loop
 
                 # ── FloodWait handling (Layer 3 + Req 5 retry cap) ────────────
-                except errors.FloodWaitError as exc:
+                except errors.FloodError as exc:
                     fw_retry_count += 1
                     flood_count    += 1
 
@@ -2545,7 +3130,7 @@ class JoinLeft(Module):
                     if use_adaptive:
                         adaptive_mult = await handle_floodwait(exc, str(identifier))
                     else:
-                        await floodwait_countdown(exc.seconds + 2, str(identifier))
+                        await floodwait_countdown(_flood_seconds(exc) + 2, str(identifier))
                     continue  # retry
 
                 # ── Other errors ──────────────────────────────────────────────
@@ -2651,11 +3236,40 @@ class JoinLeft(Module):
             else ""
         )
 
-        folder_count = len(joined_entities)
-        folder_note  = (
-            f"\n📁 `{folder_count}` چت به فولدر joined اضافه شد (incremental)."
-            if folder_count > 0 else ""
-        )
+        # ═══════════════════════════════════════════════════════════════════════
+        # v3.2.0 POST-LOOP: retry sweep → exclude_archived reconcile (BEFORE the summary,
+        # so the summary states real outcomes; it used to report len(joined_entities)
+        # as "added to folder" without looking at a single result — Pattern 1.6)
+        # ═══════════════════════════════════════════════════════════════════════
+        folder_note = ""
+        if post_results:
+            try:
+                await processing_msg.edit(
+                    f"🧹 در حال نهایی‌سازی (mute / فولدر / archive)...\n"
+                    f"_تا کنون: {success_count} موفق / {fail_count} ناموفق_",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+
+            await self._retry_missing_actions(client, reason="join batch")
+            ensure_res = await self._reconcile_folders(client, reason="join batch")
+
+            unresolved = [e for e, _ in post_results if getattr(e, "id", None) in self._pending_actions]
+            fully_done = len(post_results) - len(unresolved)
+            folder_note = f"\n📁 `{fully_done}`/`{len(post_results)}` چت کامل پردازش شد (mute + فولدر + archive)."
+            if unresolved:
+                step_fa = {"mute": "mute", "folder": "فولدر", "archive": "archive"}
+                missing_all = sorted({step_fa[m] for e in unresolved for m in self._pending_actions[e.id].missing})
+                folder_note += (
+                    f"\n⚠️ `{len(unresolved)}` چت ناقص ماند ({'، '.join(missing_all)}) — "
+                    f"بعداً خودکار دوباره تلاش می‌شود (جزئیات در لاگ)."
+                )
+            if ensure_res.changed:
+                folder_note += f"\n🗂 فولدرها: `{ensure_res.updated}` به‌روزرسانی شد (exclude_archived)"
+                if ensure_res.problems:
+                    folder_note += f" | ⚠️ `{ensure_res.problems}` ناموفق/معوق (جزئیات در لاگ)"
+                folder_note += "."
 
         summary = (
             f"--- **نتایج جوین** ({join_mode}) ---\n"
@@ -2693,7 +3307,10 @@ class JoinLeft(Module):
         I1: After leaving, remove from ALL joined* folders.
         I5: Fixed invite-link membership detection (isinstance check).
         N3: Deduplicate input entities to prevent double-leave.
-        Req 4: Remove from all folder exclusion lists.
+        v3.2.0: no exclusion lists to clean any more (exclude_archived keeps archived
+        chats hidden); the shared _remove_left_from_folders() also sweeps legacy
+        exclude_peers entries of the chats left, and now runs for the
+        "not a participant" case too (Pattern 1.3).
         Req 5: Paced loop with FloodWait retry cap.
         """
         client    = event.client
@@ -2784,32 +3401,34 @@ class JoinLeft(Module):
                     results.append(f"✅ [{name}] — ترک شد")
                     any_successful_left = True
                     left_entities.append(target_entity)
-
-                    async with self._settings_lock:
-                        self._settings["joined_chats"].pop(str(target_entity.id), None)
-                        await self._save_settings()
+                    await self._forget_joined_chat(target_entity.id)
 
                     break
 
                 except errors.UserNotParticipantError:
                     results.append(f"ℹ️ [{identifier}] — از قبل عضو نبود")
+                    # v3.2.0 (Pattern 1.3): we are not a member, so a stale joined* entry /
+                    # tracking record / legacy exclusion for this chat must go too.
+                    if target_entity is not None:
+                        left_entities.append(target_entity)
+                        await self._forget_joined_chat(target_entity.id)
                     break
 
-                except errors.FloodWaitError as exc:
+                except errors.FloodError as exc:
                     fw_retries += 1
                     if fw_retries > _LEFT_MAX_FW_RETRIES:
-                        self._log_debug(
+                        self._log_warning(
                             "[Account%d] Left: FloodWait retry cap on '%s' — skipping.",
                             self.cfg.index, identifier,
                         )
                         results.append(f"⏳ [{identifier}] — FloodWait زیاد، رد شد")
                         break
-                    self._log_debug("Left FloodWait %ds", exc.seconds)
+                    self._log_debug("Left FloodWait %ds (%s)", _flood_seconds(exc), type(exc).__name__)
                     try:
-                        await processing_msg.edit(f"⏳ Flood wait {exc.seconds}s برای `{identifier}`...")
+                        await processing_msg.edit(f"⏳ Flood wait {_flood_seconds(exc)}s برای `{identifier}`...")
                     except Exception:
                         pass
-                    await asyncio.sleep(exc.seconds + 2)
+                    await asyncio.sleep(_flood_seconds(exc) + _FLOOD_PAD)
                     continue
 
                 except Exception as exc:
@@ -2820,25 +3439,17 @@ class JoinLeft(Module):
             if idx < len(all_entities) - 1:
                 await asyncio.sleep(_LEFT_INTER_DELAY)
 
-        # I1 + Req 4: remove from ALL joined* folders AND clean all exclusion lists
+        # I1 + v3.2.0: remove from ALL joined* folders (+ scoped legacy sweep) through the
+        # shared cleanup. It never raises and reports failures instead of hiding them.
+        folder_note = ""
         if left_entities:
-            try:
-                removed = await _remove_peers_from_all_joined_folders(
-                    client, left_entities, self.cfg.index, self._folder_cache
-                )
-                folder_note = (
-                    f"\n📁 `{removed}` چت از فولدرهای joined حذف شد." if removed else ""
-                )
-            except Exception as exc:
-                self._log_error("Failed to remove peers from joined* folders: %s", exc)
-                folder_note = ""
-
-            # Req 4: synchronous exclusion cleanup
-            await _remove_from_all_folders_exclusion(
+            removed, _swept, failed = await _remove_left_from_folders(
                 client, left_entities, self.cfg.index, self._folder_cache
             )
-        else:
-            folder_note = ""
+            if removed:
+                folder_note += f"\n📁 `{removed}` چت از فولدرهای joined حذف شد."
+            if failed:
+                folder_note += f"\n⚠️ پاکسازی `{failed}` فولدر ناموفق بود (جزئیات در لاگ)."
 
         final_text = "--- نتایج ترک ---\n" + "\n".join(results) + "\n------------------" + folder_note
         try:
@@ -2887,6 +3498,19 @@ help_extra = (
     "• لینک‌های خصوصی قدیمی | `t.me/joinchat/AbCdEfGh`\n"
     "• شناسه عددی | `1234567890`\n"
     "• لینک‌های خصوصی کانال | `t.me/c/1234567890/123`\n\n"
+    "تغییرات v3.2.0:\n"
+    "• سیستم جدید پنهان‌سازی: هر چت جوین‌شده mute و archive می‌شود و فولدرهای دیگر شما\n"
+    "  به‌جای فهرست exclusion تک‌تک چت‌ها، تنظیم رسمی تلگرام `exclude_archived` را می‌گیرند\n"
+    "  → دیگر برای هر جوین یک درخواست API به ازای هر فولدر لازم نیست و سقف ۱۰۰ تایی exclusion حذف شد\n"
+    "  → این بررسی در پایان هر `join`، هنگام شروع ربات و هر ۶ ساعت انجام می‌شود\n"
+    "    (فولدرهایی که بعداً می‌سازید هم پوشش داده می‌شوند)\n"
+    "• ⚠️ توجه: چون این تنظیم روی فولدرهای شما هم اعمال می‌شود، چت‌هایی که خودتان دستی\n"
+    "  archive کرده‌اید دیگر در فولدرهایی که بر اساس نوع (گروه/کانال/ربات/مخاطب) فیلتر می‌کنند\n"
+    "  نمایش داده نمی‌شوند. فولدرهای joined* و فولدرهایی که فقط چت‌های مشخص دارند تغییری نمی‌کنند\n"
+    "• رفع باگ حیاتی: اگر هنگام افزودن چت به فولدر FloodWait می‌آمد، چت گاهی «اضافه‌شده» گزارش می‌شد\n"
+    "  ولی هرگز ذخیره نمی‌شد (N1) — اکنون فقط پس از تأیید تلگرام ثبت می‌شود\n"
+    "• mute / archive / فولدر حالا نتیجه‌شان بررسی و لاگ می‌شود؛ موارد ناقص خودکار دوباره تلاش می‌شوند\n"
+    "• ترک چت (left / autoleave) در همه حالت‌ها چت را از فولدرهای joined* هم پاک می‌کند\n\n"
     "تغییرات v3.1.8:\n"
     "• رفع باگ حیاتی: لینک‌های منقضی گاهی عملیات جوین را لغو نمی‌کردند (G1)\n"
     "  → InviteHashExpiredError نوع متفاوتی از خطا نسبت به InviteHashInvalidError است\n"
@@ -2894,7 +3518,7 @@ help_extra = (
     "• پیام خطای واضح‌تر برای لینک‌های منقضی در حلقه اصلی جوین (G3, G5)\n\n"
     "تغییرات v3.1.6:\n"
     "• رفع باگ حیاتی: خطای 'ChatInviteJoinResultOk' روی کانال‌های عمومی (C1)\n"
-    "  → JoinChannelRequest در Telethon 1.44 ممکن است ChatInviteJoinResultOk برگرداند\n"
+    "  → JoinChannelRequest ممکن است ChatInviteJoinResultOk برگرداند\n"
     "  → تمام ۵ مسیر جوین اکنون با _unwrap_join_result() ایمن شدند\n"
     "• پشتیبانی چند فولدر: وقتی joined پر شد، joined2، joined3 ایجاد می‌شود (I1)\n"
     "• اعتبارسنجی قبل از جوین: لینک‌های منقضی/نامعتبر قبل از شروع بررسی می‌شوند (I3)\n"
@@ -2922,11 +3546,14 @@ help_extra = (
     "  → بعد از هر ۴ جوین: استراحت ۳۰s\n"
     "  → بعد از هر ۳ دسته: استراحت ۱۲۰s\n"
     "  → jitter ±۲۰٪ روی تمام تأخیرها\n\n"
-    "مدیریت فولدر (v3.1.6):\n"
+    "مدیریت فولدر و پنهان‌سازی (v3.2.0):\n"
+    "• هر چت جوین‌شده به فولدر joined* اضافه، mute و archive می‌شود\n"
     "• `folder` | ایجاد یا ریست فولدرهای joined*\n"
     "  → اگر joined پر شد (۱۰۰ چت)، joined2 خودکار ایجاد می‌شود\n"
     "  → `folder` تمام joined* را ریست کرده و فقط joined پایه را نگه می‌دارد\n"
-    "• `list` | نمایش تمام چت‌های joined* (با نام فولدر در صورت چند فولدر)\n\n"
+    "• `list` | نمایش تمام چت‌های joined* (با نام فولدر در صورت چند فولدر)\n"
+    "• فولدرهای غیر-joined شما `exclude_archived` می‌گیرند تا چت‌های archive شده در آن‌ها دیده نشوند\n"
+    "• هر چت mute می‌شود چون تلگرام چت‌های بی‌صدا نشده را با پیام جدید از archive بیرون می‌آورد\n\n"
     "ترک خودکار:\n"
     "• `autoleave <days>` | ترک چت‌های joined* پس از N روز\n"
     "  → شامل چت‌های از قبل موجود در همه فولدرها هم می‌شود\n"
@@ -2941,7 +3568,7 @@ help_extra = (
     "نکات مهم:\n"
     "• `join`, `left`, `join delay`, `join mode` در هر چتی کار می‌کنند\n"
     "• `folder`, `list`, `autoleave` فقط در Saved Messages کار می‌کنند\n"
-    "• چت‌های 'قبلاً عضو' مانند جوین موفق مدیریت می‌شوند (mute، archive، folder)\n"
+    "• چت‌های 'قبلاً عضو' مانند جوین موفق مدیریت می‌شوند (mute، folder، archive)\n"
     "• در صورت FloodWait، شمارش معکوس زنده نمایش داده می‌شود\n"
     "• هر entity حداکثر ۵ بار retry FloodWait دارد — بعد skip می‌شود\n"
     "• پس از `left` موفق، پیام دستور به‌صورت خودکار حذف می‌شود\n"

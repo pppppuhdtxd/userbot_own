@@ -21,9 +21,10 @@ Messages are classified into ONE of these types based on priority:
 The `link` type detection is comprehensive and covers:
     • MessageMediaWebPage (auto-generated preview for download links, etc.)
     • MessageEntityUrl / MessageEntityTextUrl (inline URL entities)
-    • URL buttons in ReplyInlineMarkup (دکمه شیشه‌ای — KeyboardButtonUrl on
+    • PLAIN URL buttons in ReplyInlineMarkup (دکمه شیشه‌ای — KeyboardButtonUrl on
       Telethon <= 1.44, KeyboardInlineButton + InlineButtonTypeUrl on >= 1.45,
-      detected via is_url_button())
+      detected via is_url_button()). Login (URL-auth) and Web-App buttons are
+      deliberately NOT links — see get_inline_button_url().
     • Raw URL patterns in text (fallback when entities aren't parsed)
 
 This ensures each message has exactly one type, avoiding ambiguity
@@ -66,6 +67,8 @@ from telethon.tl.types import (
 )
 from telethon.tl.types import messages as tl_msg_types
 
+from userbot_own.core.logging_setup import get_logger
+
 # ── Inline-keyboard URL-button compatibility (Telethon <1.45 vs >=1.45) ──
 #
 # Telethon 1.45.0 (TL layer 229) removed ``KeyboardButtonUrl`` entirely:
@@ -74,8 +77,9 @@ from telethon.tl.types import messages as tl_msg_types
 #
 # Importing the old name unconditionally is what crashed startup with
 # ``ImportError: cannot import name 'KeyboardButtonUrl'`` on 1.45.x.
-# Both imports below are optional; the helpers underneath duck-type so the
-# code works on either Telethon version (and on mixed/dummy objects in tests).
+# Both imports below are optional; the helpers underneath match EXACT button
+# types (v3.2.0 — they used to duck-type on any ``.url`` attribute, which also
+# matched login and Web-App buttons) so the code works on either Telethon version.
 try:  # Telethon <= 1.44
     from telethon.tl.types import KeyboardButtonUrl as _KeyboardButtonUrl
 except ImportError:  # Telethon >= 1.45 — removed
@@ -93,8 +97,6 @@ except ImportError:  # Telethon <= 1.44 — does not exist yet
 KeyboardButtonUrl = _KeyboardButtonUrl
 KeyboardInlineButton = _KeyboardInlineButton
 InlineButtonTypeUrl = _InlineButtonTypeUrl
-
-from userbot_own.core.logging_setup import get_logger
 
 if TYPE_CHECKING:
     pass
@@ -447,55 +449,59 @@ def is_non_file_media(media) -> bool:
 
 # ── Link detection ────────────────────────────────────────────────────────────
 
+def _non_empty_str(value) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def get_inline_button_url(button) -> str | None:
-    """Return the URL of an inline-keyboard button, or ``None``.
+    """Return the URL of a PLAIN URL button of an inline keyboard, or ``None``.
 
-    Works on both Telethon generations (duck-typed, no hard dependency on
-    either TL constructor existing):
+    v3.2.0 (N13): EXACT types only. The earlier duck-typed version returned
+    ``.url`` from any button that had one, so on both Telethon generations a
+    URL-auth ("Login with Telegram"), Web-App or simple-Web-App button counted as a
+    "link" — which made ``clear link`` / auto-clear delete messages that merely
+    carried a login or app button, and made ``join`` harvest those buttons' URLs.
+    Those buttons are not shared links and are no longer matched:
 
-    - Telethon <= 1.44: ``KeyboardButtonUrl`` carries ``.url`` directly.
-    - Telethon >= 1.45: ``KeyboardInlineButton`` carries
-      ``.type == InlineButtonTypeUrl(url=...)``; the URL lives on the
-      nested ``type`` object (``button.type.url``).
+    - Telethon <= 1.44: only ``KeyboardButtonUrl``. (KeyboardButtonUrlAuth,
+      KeyboardButtonWebView and KeyboardButtonSimpleWebView are SIBLING classes
+      — verified: none subclasses KeyboardButtonUrl — so ``isinstance`` is exact.)
+    - Telethon >= 1.45: only ``KeyboardInlineButton`` whose ``.type`` is exactly
+      ``InlineButtonTypeUrl`` (InlineButtonTypeUrlAuth / InlineButtonTypeWebView
+      are siblings of it).
 
-    Any other button kind (callback, switch_inline, …) returns ``None``.
+    Objects that are not instances of the real classes (vendored copies, test
+    doubles) are matched by their EXACT class name — never by "has a ``.url``".
+    Every other button kind (callback, switch_inline, url_auth, web_view, …)
+    returns ``None``.
     """
     if button is None:
         return None
-    # Old model: url straight on the button.
-    url = getattr(button, "url", None)
-    if isinstance(url, str) and url:
-        return url
-    # New model: url nested under button.type.
-    btn_type = getattr(button, "type", None) or getattr(button, "button_type", None)
-    if btn_type is not None:
-        nested = getattr(btn_type, "url", None)
-        if isinstance(nested, str) and nested:
-            return nested
-        # Defensive: class-name check in case the TL class object differs
-        # (e.g. vendored copies) but the shape matches.
-        if type(btn_type).__name__ == "InlineButtonTypeUrl":
-            return nested if isinstance(nested, str) else None
-    # Defensive fallback for duck-typed test doubles exposing url elsewhere.
+
+    # Telethon <= 1.44
     if _KeyboardButtonUrl is not None and isinstance(button, _KeyboardButtonUrl):
-        url = getattr(button, "url", None)
-        return url if isinstance(url, str) and url else None
+        return _non_empty_str(getattr(button, "url", None))
+
+    # Telethon >= 1.45
     if _KeyboardInlineButton is not None and isinstance(button, _KeyboardInlineButton):
-        return get_inline_button_url(btn_type) if btn_type is not None else None
-    # Last resort: class-name match (covers fake TL objects in unit tests
-    # and any future rename that keeps the text/type shape).
-    if type(button).__name__ in ("KeyboardButtonUrl", "KeyboardInlineButton"):
-        if isinstance(url, str) and url:
-            return url
-        if btn_type is not None:
-            nested = getattr(btn_type, "url", None)
-            if isinstance(nested, str) and nested:
-                return nested
+        btn_type = getattr(button, "type", None)
+        if _InlineButtonTypeUrl is not None and isinstance(btn_type, _InlineButtonTypeUrl):
+            return _non_empty_str(getattr(btn_type, "url", None))
+        return None
+
+    # Exact class-name fallback (vendored copies / fakes) — NOT duck typing on ``.url``.
+    name = type(button).__name__
+    if name == "KeyboardButtonUrl":
+        return _non_empty_str(getattr(button, "url", None))
+    if name == "KeyboardInlineButton":
+        btn_type = getattr(button, "type", None)
+        if type(btn_type).__name__ == "InlineButtonTypeUrl":
+            return _non_empty_str(getattr(btn_type, "url", None))
     return None
 
 
 def is_url_button(button) -> bool:
-    """Return ``True`` if *button* is an inline-keyboard URL button."""
+    """Return ``True`` if *button* is a plain inline-keyboard URL button (not login / Web-App)."""
     return get_inline_button_url(button) is not None
 
 
@@ -530,9 +536,10 @@ def is_link(msg) -> bool:
     2. It contains ``MessageEntityUrl`` or ``MessageEntityTextUrl`` in its
        entities (clickable URL hyperlinks in text)
     3. Its inline keyboard (``reply_markup``) contains at least one
-       URL button (دکمه شیشه‌ای) — ``KeyboardButtonUrl`` on Telethon
+       plain URL button (دکمه شیشه‌ای) — ``KeyboardButtonUrl`` on Telethon
        <= 1.44, ``KeyboardInlineButton`` + ``InlineButtonTypeUrl`` on
-       Telethon >= 1.45 (detected via ``is_url_button()``).
+       Telethon >= 1.45 (detected via ``is_url_button()``). Login (URL-auth)
+       and Web-App buttons do NOT count.
     4. Its text matches a raw URL pattern (fallback for cases where Telegram
        didn't parse the URL as an entity)
 
@@ -852,6 +859,11 @@ def write_json_file_atomic(
 
     Returns:
         ``None`` on success, or the exception on failure. Never raises.
+        (v3.2.0: this used to catch only ``OSError`` while promising "never
+        raises" — a non-serializable value made ``json.dumps`` raise ``TypeError``
+        / ``ValueError`` straight through to the caller. Those are now returned
+        like any other failure; the serialization happens BEFORE the temp file
+        is touched, so a bad value can never damage the existing file.)
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -860,7 +872,7 @@ def write_json_file_atomic(
         tmp_path.write_text(payload, encoding="utf-8")
         tmp_path.replace(path)
         return None
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         return exc
 
 

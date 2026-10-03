@@ -5,6 +5,266 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.2.0] — 2026-10-03
+
+**Source:** AI — research-first redesign requested by the project owner. A
+seven-phase investigation came first (a line-by-line read of `join_left.py`, a
+TL-schema diff of Telethon 1.44.0 vs 1.45.0, Telegram's official documentation,
+and the source of two first-party Telegram clients). The report was reviewed and
+approved — with eight explicit decisions — before any code was written.
+
+**Headline:** the per-chat folder-exclusion system is replaced by Telegram's own
+server-side `exclude_archived` flag, and the review found and fixed several
+silent-failure paths that the new design depends on (two of them real
+data-integrity bugs that predate this release).
+
+### Design — `exclude_archived` replaces per-chat exclusion
+
+**What it was.** After every join, the chat was written into the `exclude_peers`
+list of *every other folder*: one `UpdateDialogFilterRequest` per folder per join
+(≈ 1,000 calls for a 100-chat batch with 9 other folders), a 100-entry cap per
+folder, a tracking/sync apparatus to keep those lists in step with reality, and a
+cleanup path on every leave.
+
+**What it is now.** Every joined chat is added to a `joined*` folder, **muted** and
+**archived** (`folder_id=1`). Then `ensure_exclude_archived()` makes sure every
+*other* regular folder carries the `exclude_archived` flag — once, only where it
+is missing. The same 100-chat batch now costs ≈ 100 + 9 folder writes (≈ 89 %
+fewer; illustrative arithmetic, not a measurement). Leaving a chat only removes
+it from the `joined*` folders.
+
+**Why it is safe — precedence, verified in two first-party clients.** Telegram's
+documentation says only "whether to exclude archived chats from this folder" and
+is silent on how the flag interacts with `include_peers`. Telegram Desktop
+(`ChatFilter::contains`) and the Android client (`DialogFilter.includesDialog`)
+agree: a chat in `exclude_peers` is never shown; otherwise a chat in
+`include_peers` is always shown; only then do the archived / muted / read
+conditions and the type flags apply. So `exclude_archived` hides archived chats
+that match a folder **by type flag** (contacts / non-contacts / groups / channels
+/ bots) and can never hide an explicitly included chat — which is why every
+`joined*` folder can, and does, keep the flag. (iOS was not checked.)
+
+**Why the mute is load-bearing.** Telegram moves an *unmuted* archived chat back to
+the main list when a new message arrives (unless the account has
+`keep_archived_unmuted`); a muted one stays archived. The archive is the
+protection under the new design, and the mute is what keeps the archive in place.
+
+**Visible side effect (accepted by the owner; there is no opt-out setting).**
+Because the flag is set on the user's own folders too, chats the user archived
+**by hand** no longer appear in folders that filter by chat type. Folders that
+list only specific chats are unaffected, and `joined*` folders always show their
+chats. Un-archiving a chat makes it visible again. Documented in `help_extra` and
+the README.
+
+### Added
+
+- **`ensure_exclude_archived()`** — idempotent (a second run costs one read and
+  zero writes); reads the folder list *fresh* so a concurrent edit from another
+  Telegram client is never overwritten with stale data; skips
+  `DialogFilterDefault` (the "All chats" placeholder), `DialogFilterChatlist`
+  (shared folders — no such field, and they hold only explicit includes) and every
+  `joined*` folder; read-modify-write on a *copy* so every other field survives
+  (verified by a serializer round-trip on both Telethon versions); `None` and
+  `False` are wire-identical, so the check is truthiness-based; writes are paced
+  (≈1.2 s ±20 %); a FloodWait is treated as global (Telethon short-circuits repeat
+  calls of a request type during a wait) — slept through once, the same folder is
+  retried, and when the total wait would exceed 180 s the remaining folders are
+  counted as deferred and the `FloodError` is **re-raised**, never swallowed;
+  per-folder rejections (the `Filter*` family, `FILTERS_TOO_MUCH`, network errors)
+  are logged at WARNING with folder id/title/error class and never abort the loop.
+  It keeps no module-level state, so hot-reload and per-account isolation hold.
+- **Three trigger points:** the end of every `join` batch, once at startup, and
+  every 6 hours (independent of `auto_leave_days`) — the last two protect a folder
+  the user creates, or edits to add a type flag, *after* a batch.
+- **`PostJoinResult` + `_record_join()`** — mute / folder-add / archive are now
+  first-class results. `_record_join()` is the single path for every join outcome
+  (it replaces three copies of "write tracking, run post-actions, ignore the
+  result") and queues incomplete chats for retry.
+- **Bounded retry sweep** (`_retry_missing_actions`) — at the end of every batch
+  (2 passes, 180 s ceiling) and every 6 hours; a chat is given up on, with a
+  WARNING, after 4 sweeps. The join summary reports real counts
+  ("`N`/`M` fully processed", "`K` incomplete: …") instead of the old
+  `len(joined_entities)` "added to folder" claim.
+- **`_remove_left_from_folders()`** — the one post-leave cleanup shared by `left`,
+  auto-leave and the folder reset. Includes a **scoped legacy sweep**
+  (`_sweep_legacy_exclusions`): when a chat is left, *that chat's* id is removed
+  from other folders' `exclude_peers`, nothing else.
+
+### Bug Fixes (root causes)
+
+- **N1 — a folder add could be reported as successful although nothing was
+  written (data integrity).** `_add_single_peer_to_joined_folder` appended the peer
+  to the *cached* `DialogFilter` object **before** calling the API. If the write
+  hit a FloodWait, the cache claimed a state the server never had; the retry saw
+  the peer "already present", returned `True`, and the chat was silently missing
+  from its folder. Reproduced with a fake client before the fix (function returned
+  `True`, server unchanged). The cache holds shared objects, so every folder write
+  now builds the new state on a copy and updates the cache only after Telegram
+  accepted it (`_write_folder_with_retry`). A failed write also invalidates the
+  cache. `_remove_peers_from_all_joined_folders` had the identical flaw (N3).
+- **N2 — mute/archive failures were silent.** A second FloodWait was swallowed by
+  `except Exception: return False` with no log, the wait was capped at 30 s and
+  then retried once, and `_post_join_actions` returned a tuple that all three call
+  sites ignored. Now: bounded retries (3 attempts; a FloodWait is waited out only
+  if ≤ 60 s, otherwise the action goes to the sweep), every give-up is a WARNING,
+  and the result is kept.
+- **N3 — the leave path swallowed FloodWait and failures at DEBUG level.**
+  `_remove_peers_from_all_joined_folders` had no FloodWait branch at all. It now
+  retries with the same bounded policy and returns `(removed, folders_failed)`;
+  `left` shows "⚠️ cleanup of K folder(s) failed" instead of hiding it.
+- **N4 — Pattern 1.2: sibling exceptions.** `FloodWaitError`,
+  `FloodPremiumWaitError`, `FloodTestPhoneWaitError` and `SlowModeWaitError` are
+  *siblings* under `errors.FloodError`; the module caught only the first. All
+  sites now catch `errors.FloodError` and read the wait via `_flood_seconds()`.
+  Folder writes treat every `errors.RPCError` (the five `Filter*` errors and more)
+  as a per-folder failure.
+- **N5 — Pattern 1.3: parallel paths disagreed.** In auto-leave and `left`, only the
+  success branch cleaned the `joined*` folders; the not-a-participant, private and
+  not-found branches dropped tracking only, leaving stale folder entries that used
+  up the 100-chat cap and showed in `list`. All of them now clean tracking *and*
+  folders through the shared helper.
+- **K5 — "already a member" wording.** The two already-member handlers in the
+  hash-fallback branch of `invite_with_username` did not set the flag, so those
+  results read as a fresh join (✅).
+- **N9 — `joinedN` creation failures** (e.g. `FILTERS_TOO_MUCH` at the account's
+  folder cap) were logged at DEBUG while the user saw ✅. Now WARNING, and the chat
+  is reported as incomplete.
+- **N13 — URL-button detection was too broad (`helpers/utils.py`).** The 1.45
+  compatibility shim duck-typed on "has a `.url`", so URL-auth ("Login with
+  Telegram"), Web-App and simple-Web-App buttons counted as links on **both**
+  Telethon generations — making `clear link` / auto-clear delete messages that only
+  carried a login or app button, and making `join` harvest those buttons' URLs.
+  `get_inline_button_url()` now matches the exact plain-URL types
+  (`KeyboardButtonUrl` ≤ 1.44; `KeyboardInlineButton` + `InlineButtonTypeUrl`
+  ≥ 1.45; verified: the other kinds are siblings, not subclasses) and, for
+  vendored copies/test doubles, the exact class name — never a bare `.url`.
+- **`write_json_file_atomic` kept a promise it did not keep.** It documented
+  "never raises" but caught only `OSError`; a non-serializable value raised
+  `TypeError` through the caller. Serialization happens before the temp file is
+  touched, so a bad value could never damage the existing file — the error is now
+  simply returned like any other.
+- **Lint.** `ruff` now reports nothing for the whole package: removed the unlogged
+  shim's `E402` (late `get_logger` import in `helpers/utils.py`), the `I001` that
+  the shim's import line introduced in `join_left.py`, and the pre-existing `E741`.
+- **Auto-leave failures** (`Auto-leave failed … will retry`, FloodWait) are now
+  logged at WARNING instead of DEBUG.
+
+### Removed
+
+- `_add_to_all_other_folders_exclusion`, `_remove_from_all_folders_exclusion`,
+  `_EXCLUDE_PEERS_CAPACITY` — the exclusion system (~135 lines) and its call sites
+  in `_post_join_actions`, `_check_auto_leave`, `_handle_left` and the folder reset.
+- Dead code confirmed by static analysis: `_ensure_joined_folder_exists`,
+  `_find_joined_folder` (its only caller), `_add_peers_to_joined_folder`,
+  `_mute_and_archive`.
+- **Deliberately kept:** `_sync_folder_to_tracking`. It was listed as exclusion
+  code in the planning brief but is the auto-leave tracking sync (called from
+  `_handle_autoleave` and `_auto_leave_loop`); removing it would have broken
+  `autoleave`.
+
+### Documentation Corrections (earlier text that was wrong or incomplete)
+
+1. **v3.0.5, "Issue 2 / Issue 3" explained `exclude_archived` backwards.** The
+   entry says that `exclude_archived=True` "tells Telegram 'show archived chats in
+   this folder'". Telegram's definition is the opposite: the flag means *exclude*
+   archived chats from the folder. The code (`True` on every `joined*` folder) kept
+   working because **`include_peers` wins over `exclude_archived`** in the clients,
+   not for the reason the entry gives. The entry's second claim — that a folder
+   update with `exclude_archived=False` "moves any newly-added peer to
+   `folder_id=0` (un-archives it)" — was never verified; no documentation or client
+   source supports it, and 3.2.0 does not rely on it (the archive is still the last
+   step, which costs nothing). Issue 1 of that entry (`FolderPeer` vs
+   `InputFolderPeer`) is a genuine type error and stands. Correction notes were
+   added under those headings.
+2. **v3.1.10, "Telethon is capped at `<1.45.0`" no longer described the tree.** The
+   source tree that preceded this release already contained a Telethon-1.45 URL
+   button shim (`is_url_button()` / `get_inline_button_url()` in
+   `helpers/utils.py`, used by `info_handler.py` and `join_left.py`) and a
+   `requirements.txt` with the cap removed (`telethon>=1.44.0`, annotated "v3.1.11")
+   — with no CHANGELOG entry, no version bump, and the 3.1.10 entry still saying the
+   port was "not done here". That unlogged change is recorded here, and its
+   over-broad matching is fixed (N13). A correction note was added under the 3.1.10
+   *Dependency Updates* heading.
+3. **README.** Said `requirements.txt` "pins Telethon to 1.44.x" (it no longer did),
+   and described `folder` / `list` as acting on "the `joined` folder" (it has meant
+   all `joined*` folders since v3.1.6). Both corrected; the folder/archive behavior
+   is now documented.
+4. **`_check_auto_leave` docstring** (and the module header) claimed it "verifies
+   that chats we've ever joined are still joined — covers manual leaves". It is
+   age-based only; a chat left by hand is cleaned when it ages out and the leave
+   attempt finds the account is no longer a participant.
+5. **Module header of `join_left.py`.** Historical entries that describe the
+   removed exclusion system ("Req 4", "Fix I2", "Fix N4", "Fix G") are marked as
+   superseded rather than deleted.
+
+### Dependency Updates
+
+- **`requirements.txt`: `telethon>=1.44.0` → `telethon>=1.45.0,<2`.** 1.45.0 is TL
+  layer 229. Verified against the real packages: all 37 project modules import on
+  both 1.44.0 and 1.45.0; the `DialogFilter` family, `UpdateDialogFilterRequest`,
+  `EditPeerFoldersRequest`, `InputFolderPeer`, `JoinChannelRequest`,
+  `ImportChatInviteRequest` and the exception sets are unchanged between them;
+  `_unwrap_join_result` handles `ChatInviteJoinResultOk` and the (changed-shape)
+  `ChatInviteJoinResultWebView` identically on both; 1.45's `Dialog` handles the
+  new `Community` type, so the one `iter_dialogs()` loop (`auto_clearer.py`) is
+  unaffected. The `<2` cap is defensive: Telethon 2.x is a ground-up rewrite with a
+  different API and must never be picked up by a plain `pip install -r`. The shim
+  keeps its ≤ 1.44 branch (harmless on a 1.45 install). `install.sh` and
+  `update.sh` are unchanged — they install through `requirements.txt`.
+- **`VERSION`, `pyproject.toml`, `_FALLBACK_VERSION`, README "Current version":**
+  `3.1.10` → `3.2.0`.
+
+### Upgrading from 3.1.x
+
+Nothing to do. On the first start after the update, the startup reconcile flips
+`exclude_archived` on any folder that lacks it — that run *is* the migration, and
+it is idempotent. **Existing `exclude_peers` entries are left in place:** they are
+harmless, they cannot be told apart from exclusions the user wrote by hand (so
+they are never bulk-cleared), and until a chat is left each acts as an extra safety
+net. A chat's legacy entry is removed when that chat is left (`left`, auto-leave,
+`folder` reset). No settings-schema change; `join_left.json` is untouched.
+
+### Verification performed
+
+- A fake-Telegram harness (a stateful fake client/server driving the *real*
+  functions, including `_handle_join`, `_handle_left`, `_check_auto_leave`,
+  `_auto_leave_loop` and the folder reset): **26/26 scenarios pass on both Telethon
+  1.45.0 and 1.44.0** — covering N1 (persisted-or-reported, cache never poisoned),
+  N2/N3, all four flood siblings, `ensure_exclude_archived` (classification,
+  idempotency, read-modify-write field preservation, fresh-read, global FloodWait,
+  budget exhaustion + re-raise, per-folder `Filter*` errors, fetch failures),
+  the scoped legacy sweep (a user-authored exclusion survives), the retry sweep
+  and give-up, the honest join summary, hot-reload isolation (two accounts loaded
+  from the same file share no state; the only module-level mutable is the constant
+  `_SMART_DELAYS`), and the project invariants.
+- Shim / utils: 18/18 (Telethon 1.44.0) and 16/16 (1.45.0), including a wire-level
+  serialize→parse round trip, and `is_link()` on messages carrying only a login or
+  Web-App button.
+- `ruff check userbot_own`: clean. `vulture`: no unused code beyond the framework
+  entry points (`setup`, `create_module`, `category`).
+
+### Not verified / still open
+
+- **Live-account validation has not been run** and is the release gate (owner
+  tests T1–T4): that an archived joined chat is hidden from a type-flag folder once
+  the flag is set and visible in `joined*`; that a filter update does not change a
+  chat's `folder_id`; that a muted archived chat stays archived after a new message.
+  The client-side precedence is verified in source; server-side behavior cannot be
+  verified offline.
+- iOS folder-matching was not checked.
+- Deferred by decision: the numeric-ID-resolves-to-a-User/Chat guard (N8);
+  title-collision hardening for `joined*` detection; an archive-state audit command;
+  a raw `UpdateDialogFilter` event handler for instant reaction.
+
+### Not changed (deliberately)
+
+`history_limit = 2000`; `from_user="me"` in groups only; the Composition Root / DI
+architecture; atomic settings writes through `write_json_file_atomic()`; the
+four-layer anti-FloodWait strategy; the dynamic help system; `install.sh` /
+`update.sh`.
+
+---
+
 ## [3.1.10] — 2026-09-30
 
 **Source:** AI — full-codebase audit requested by the project owner (three
@@ -110,6 +370,11 @@ front rather than buried:**
   `UserNotParticipantError` handler already used for the same situation.
 
 ### Dependency Updates
+
+> **Correction (added in 3.2.0):** this cap did not survive. The tree that preceded
+> 3.2.0 already carried a Telethon-1.45 URL-button shim and a `requirements.txt`
+> without the cap, unlogged and un-versioned; 3.2.0 records that, tightens the shim
+> and sets `telethon>=1.45.0,<2`. See the [3.2.0] *Documentation Corrections*.
 
 - **`requirements.txt`: `telethon>=1.36.0` → `telethon>=1.44.0,<1.45.0`.**
   On Telethon 1.45.0 (TL layer 229) `KeyboardButtonUrl` no longer exists (replaced
@@ -2289,6 +2554,13 @@ the chat is never archived.
 ---
 
 #### Issue 2 — `_create_joined_folder()` Sets `exclude_archived = False`
+
+> **Correction (added in 3.2.0):** this entry explains the flag backwards. Telegram's
+> definition of `exclude_archived` is "exclude archived chats from this folder", so
+> `True` does *not* "show archived chats"; it works on `joined*` folders because
+> `include_peers` wins over `exclude_archived` in the Telegram clients. The claim
+> below that a folder update with `exclude_archived=False` un-archives newly added
+> peers was never verified. See the [3.2.0] *Documentation Corrections*.
 
 **Root cause:** The `joined` folder was created with `exclude_archived=False`.
 This flag instructs Telegram: "do not show archived chats in this folder."

@@ -72,7 +72,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.1.10`
+**Current version:** `3.2.0`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -140,7 +140,7 @@ cd userbot_own
 python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-# 3. Install dependencies (requirements.txt pins Telethon to 1.44.x — see the note in that file)
+# 3. Install dependencies (requirements.txt requires Telethon >=1.45.0,<2 — see the note in that file)
 pip install -r requirements.txt
 
 # 4. Add your first account
@@ -564,11 +564,38 @@ Automatically forward bot messages back to the same bot.
 | `left` (reply) | Leave all chats found in the replied message |
 | `join delay <sec>` | Fixed delay between joins (`0` restores smart throttling) |
 | `join mode fast\|safe\|human` | Anti-FloodWait aggressiveness (see module help for the 4-layer strategy) |
-| `folder` | Create / reset the `joined` folder (Saved Messages only) |
-| `list` | List chats in the `joined` folder (Saved Messages only) |
+| `folder` | Create / reset the `joined*` folders — `joined`, `joined2`, … (Saved Messages only) |
+| `list` | List chats in all `joined*` folders (Saved Messages only) |
 | `autoleave <days>` | Auto-leave joined chats after N days |
 | `autoleave off` | Disable auto-leave |
 | `autoleave status` | Show auto-leave status |
+
+#### Folders, archive and `exclude_archived` (v3.2.0)
+
+Every chat joined with `join` is added to a `joined` folder (`joined2`, `joined3`, …
+once a folder reaches Telegram's 100-chat limit), **muted** and **archived**. To keep
+those archived chats out of your *other* folders, the bot sets Telegram's own
+`exclude_archived` flag on them:
+
+- It checks every regular folder that is not a `joined*` folder at the end of each
+  `join` batch, once when the bot starts and every 6 hours (so a folder you create
+  later is covered too), and updates only the folders that lack the flag. Shared
+  folders and the "All chats" entry are skipped — they cannot carry the flag.
+- `joined*` folders keep showing their chats: in Telegram clients a chat that is
+  explicitly included in a folder is shown even when the folder has `exclude_archived`
+  set.
+- The mute matters: Telegram moves an *unmuted* archived chat back to the main list
+  when a new message arrives, a muted one stays archived.
+- If `mute`, the folder add or `archive` fails for a chat, it is logged at WARNING,
+  shown in the `join` summary and retried automatically (end of the batch, then every
+  6 hours).
+- **Visible side effect:** because the flag is set on your own folders too, chats you
+  archived *by hand* no longer appear in folders that filter by chat type (contacts,
+  non-contacts, groups, channels, bots). Folders that list only specific chats are
+  unaffected. Un-archive a chat to see it in those folders again. There is no setting
+  to turn this off.
+- Upgrading from < 3.2.0 needs no action. Old per-chat `exclude_peers` entries are
+  harmless and are left alone; a chat's entry is removed when that chat is left.
 
 ### Info & Whois (work in any chat)
 

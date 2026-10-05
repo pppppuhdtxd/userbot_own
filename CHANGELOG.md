@@ -5,6 +5,77 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.2.1] — 2026-10-04
+
+**Source:** AI — silent-failure investigation of the `help` command, ordered by
+the project owner after 3.2.0. A six-phase static trace (import → registration →
+router match → Saved-Messages gate → render → send), a live import test of all
+ten modules against Telethon 1.45.0, and a measured length audit of every
+module's `help_extra` were reviewed and approved before any code was written.
+
+**Headline:** `help <module>` now chunks oversized output instead of silently
+exceeding Telegram's ~4096-char message limit. The investigation *measured* the
+regression it fixes: 3.2.0's own `join_left` `help_extra` additions pushed that
+text to 4,849 chars, so `help join_left` — the example the compact help itself
+advertises in its footer — produced **no output at all**, with only a DEBUG line
+as a trace.
+
+### Fixed
+
+- **`help <module>` overflow (real, introduced by 3.2.0's help-text growth).**
+  `_show_module_help` sent `help_extra` as a single `event.edit`; Telegram
+  rejects anything over ~4096 chars. `help join_left` was silently dead at
+  4,849 chars (pre-3.2.0: ≈ 2,084). Output now splits at line boundaries into
+  ≤ 3500-char messages — first via `edit`, the rest as new messages — mirroring
+  the v3.0.9 compact-help fix, with a final hard-slice guard so even a single
+  pathological line cannot overflow. Joining the pieces back reproduces the
+  original text exactly.
+- **`help` has a real failure channel now.** If the edit of the typed command
+  message fails (message deleted first, flood-wait above the client's 0.5 s
+  threshold, ...), every chunk is re-sent as new messages instead of vanishing,
+  and a total failure is logged at ERROR. Previously the compact path logged at
+  ERROR but showed nothing, and the module path could not even manage that.
+- **`Module._safe_edit` logs its catch-all branch at WARNING.** It was DEBUG, so
+  a failed edit was invisible at default log levels in *every* module — the
+  exact amplifier that made the help failures undiagnosable. Benign cases
+  (`MessageNotModified`, deleted message id) stay at DEBUG on purpose.
+
+### Changed
+
+- **Blocked `help` invocations are recorded.** The Saved-Messages gate still
+  refuses silently in chat (behaviour unchanged), but now logs
+  `help command ignored — not in Saved Messages (chat_id=…)` at INFO. The
+  investigation's top hypothesis for "`help` does nothing" was this return —
+  previously completely unobservable.
+- **Load-time warning for oversized `help_extra`** (> 3900 chars) in
+  `AccountLoader._do_load`, covering core *and* enabled extra modules, so a
+  bloated help page is flagged when it loads rather than first seen — as a
+  broken command — by the end user.
+
+### Removed
+
+- **Dead code:** `HelpHandler._get_loaded_stems` (never called anywhere — the
+  compact help builds its list inline via `loader.list_modules()`) and
+  `CommandRouter.commands` (never read anywhere). Their presence contradicted
+  3.2.0's claim that the vulture pass found no dead code beyond framework
+  entry points.
+
+### Documentation
+
+- **README:** the Help System section now says "Saved Messages only" and
+  documents multi-message output. The restriction existed only in the module
+  docstring and `help_extra` — exactly how a user ends up typing `help` in the
+  wrong chat and concluding the command is broken.
+
+### Not changed (deliberately)
+
+- The compact-help renderer's grouping and content, the router's exact-token
+  matching, the Saved-Messages gate itself, and every module's help *text* —
+  this release makes the existing design observable and overflow-proof; it does
+  not change what the help system does.
+
+---
+
 ## [3.2.0] — 2026-10-03
 
 **Source:** AI — research-first redesign requested by the project owner. A

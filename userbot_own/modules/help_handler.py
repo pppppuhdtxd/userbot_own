@@ -16,7 +16,7 @@ Design principles:
 """
 from __future__ import annotations
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, errors, events
 
 from userbot_own.core.context import ModuleContext
 from userbot_own.core.exceptions import LoaderNotFoundError
@@ -43,6 +43,14 @@ CATEGORIES: list[tuple[str, str]] = [
 #: drift apart. Used to detect a module whose `category` attribute doesn't
 #: match any known key (see _show_compact_help's grouping loop below).
 _VALID_CATEGORY_KEYS: frozenset[str] = frozenset(key for key, _ in CATEGORIES)
+
+# Telegram rejects any message over ~4096 chars. Chunk at 3500 to leave
+# margin for markup and for the chunker's own line-based splitting. Single
+# source of truth for both the compact list and `help <module>` — v3.2.1
+# moved the module-detail path onto the same limit the v3.0.9 fix gave the
+# compact path (join_left's help_extra alone measured 4,849 chars in 3.2.0
+# and was silently rejected as one message).
+_MAX_HELP_CHUNK = 3500
 
 # v3.0.13: MODULE_MAP (a hardcoded stem → (category, desc) dict) has been
 # removed. It required every new module's author to also manually add a
@@ -91,6 +99,14 @@ class HelpHandler(Module):
 
         # Only in Saved Messages
         if not await self._is_saved_messages(event):
+            # v3.2.1: this silent return was the leading hypothesis for
+            # "help does nothing" reports — behaviour is unchanged (still
+            # no reply in chat), but the block is now observable in the
+            # per-account log instead of invisible.
+            self._log_info(
+                "help command ignored — not in Saved Messages (chat_id=%s).",
+                getattr(event, "chat_id", None),
+            )
             return
 
         await handler(event)
@@ -121,7 +137,7 @@ class HelpHandler(Module):
         # Fetch the loader once — not inside the loop.
         loader = self._get_loader(client)
         if loader is None:
-            await self._safe_edit(event, "خطا: loader در دسترس نیست.")
+            await self._send_help(event, "خطا: loader در دسترس نیست.")
             return
 
         loaded_stems = loader.list_modules()
@@ -222,7 +238,7 @@ class HelpHandler(Module):
         # feedback. Now split into multiple messages by category block
         # if needed, so a chat with many modules degrades to "more than
         # one message" instead of "no output at all".
-        _MAX_CHUNK = 3500  # margin below Telegram's ~4096 char limit
+        _MAX_CHUNK = _MAX_HELP_CHUNK  # margin below Telegram's ~4096 char limit
         chunks: list[str] = []
         current = "\n".join(header_lines)
         for block in category_blocks:
@@ -239,12 +255,10 @@ class HelpHandler(Module):
         else:
             chunks.append(current)
 
-        try:
-            await event.edit(chunks[0])
-            for extra_chunk in chunks[1:]:
-                await event.respond(extra_chunk)
-        except Exception as exc:
-            self._log_error("Failed to show help: %s", exc)
+        # v3.2.1: was a bare try/edit/except-log — an edit failure left no
+        # user-facing output at all. The shared sender re-checks every chunk
+        # against the limit and falls back to plain responses.
+        await self._send_help_chunks(event, chunks)
 
     # ── Module help (`help <module>` command) ──────────────────────────────
 
@@ -257,7 +271,7 @@ class HelpHandler(Module):
         """Display detailed help for a specific module."""
         loader = self._get_loader(client)
         if loader is None:
-            await self._safe_edit(event, "خطا: loader در دسترس نیست.")
+            await self._send_help(event, "خطا: loader در دسترس نیست.")
             return
 
         # Try exact match first
@@ -277,7 +291,7 @@ class HelpHandler(Module):
             # or a fuzzy guess at some unrelated module, and it's the exact
             # scenario a user hits right after reading `.extra`'s listing.
             if stem in loader.list_available_extra() and not loader.is_extra_enabled(stem):
-                await self._safe_edit(
+                await self._send_help(
                     event,
                     f"⚠️ ماژول `{stem}` غیرفعال است.\n"
                     f"برای فعال‌سازی: `.extra enable {stem}`"
@@ -289,14 +303,14 @@ class HelpHandler(Module):
             matches = self._fuzzy_search(query, loader.list_modules())
             if matches:
                 suggestions = "، ".join(f"`{m}`" for m in matches[:5])
-                await self._safe_edit(
+                await self._send_help(
                     event,
                     f"ماژول `{query}` یافت نشد.\n\n"
                     f"شاید منظورتان این بود:\n{suggestions}\n\n"
                     f"برای لیست کامل: `help`"
                 )
             else:
-                await self._safe_edit(
+                await self._send_help(
                     event,
                     f"ماژول `{query}` یافت نشد.\n\n"
                     f"برای لیست کامل: `help`"
@@ -309,19 +323,21 @@ class HelpHandler(Module):
             # Fall back to help_text
             help_text = getattr(instance, "help_text", "") or ""
             if help_text.strip():
-                await self._safe_edit(
+                await self._send_help(
                     event,
                     f"{stem}\n\n{help_text}"
                 )
             else:
-                await self._safe_edit(
+                await self._send_help(
                     event,
                     f"ماژول `{stem}` اطلاعات تکمیلی ندارد."
                 )
             return
 
-        # Show help_extra
-        await self._safe_edit(event, extra)
+        # Show help_extra (v3.2.1: chunked — join_left's help_extra measured
+        # 4,849 chars in 3.2.0, over Telegram's ~4096 limit, so this edit was
+        # silently rejected and `help join_left` produced nothing).
+        await self._send_help(event, extra)
 
     # ── Fuzzy search helper ────────────────────────────────────────────────
 
@@ -361,13 +377,6 @@ class HelpHandler(Module):
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
-    def _get_loaded_stems(self, client: TelegramClient) -> list[str]:
-        """Return the list of currently loaded module stems for this account."""
-        loader = self._get_loader(client)
-        if loader is None:
-            return []
-        return loader.list_modules()
-
     def _get_loader(self, client: TelegramClient):
         """
         Retrieve the AccountLoader for the given client's account, via the
@@ -382,6 +391,82 @@ class HelpHandler(Module):
             return self.context.loader_registry.get(account_index)
         except LoaderNotFoundError:
             return None
+
+    # ── Sending (v3.2.1) ─────────────────────────────────────────────────────
+
+    async def _send_help(self, event, text: str) -> None:
+        """Send *text* through the chunked sender below (splitting first)."""
+        await self._send_help_chunks(event, self._split_help_chunks(text))
+
+    async def _send_help_chunks(self, event, chunks: list[str]) -> None:
+        """
+        Send *chunks* as Telegram messages: the first chunk edits the command
+        message the user just typed, any further chunks are sent as new
+        messages. Every chunk is re-checked against the ~4096-char limit so no
+        caller can overflow it, and if the edit itself fails (typed message
+        deleted first, flood-wait above the client's threshold, ...) the whole
+        output is re-sent as new messages instead of vanishing — `help` must
+        never fail with zero user-facing output while a log line is the only
+        trace (the failure mode this method was added to close, v3.2.1).
+        """
+        safe: list[str] = []
+        for chunk in chunks:
+            safe.extend(self._split_help_chunks(chunk))
+        if not safe:
+            return
+
+        try:
+            await event.edit(safe[0])
+        except errors.MessageNotModifiedError:
+            # Identical text is already displayed — that is a success, not a
+            # failure; fall through so follow-up chunks still go out.
+            pass
+        except Exception as exc:
+            self._log_warning(
+                "help: edit of the command message failed (%s) — re-sending "
+                "the output as new messages.", exc,
+            )
+            try:
+                for chunk in safe:
+                    await event.respond(chunk)
+            except Exception as exc2:
+                self._log_error("help: failed to send help output: %s", exc2)
+            return
+
+        for chunk in safe[1:]:
+            try:
+                await event.respond(chunk)
+            except Exception as exc:
+                self._log_error("help: failed to send follow-up part: %s", exc)
+
+    @staticmethod
+    def _split_help_chunks(text: str, limit: int = _MAX_HELP_CHUNK) -> list[str]:
+        """
+        Split *text* into pieces of at most *limit* characters, preferring
+        line boundaries; a hard character slice is the last resort for a
+        single pathological line. Joining the pieces back with ``"\\n"``
+        reproduces *text* exactly — no separators are dropped or invented.
+        """
+        chunks: list[str] = []
+        current = ""
+        for line in text.split("\n"):
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) > limit and current:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
+        hardened: list[str] = []
+        for chunk in chunks:
+            while len(chunk) > limit:
+                hardened.append(chunk[:limit])
+                chunk = chunk[limit:]
+            if chunk:
+                hardened.append(chunk)
+        return hardened
 
 
 # ── Help Texts (در انتهای ماژول طبق قوانین) ─────────────────────────────────

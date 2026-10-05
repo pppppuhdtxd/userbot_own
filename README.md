@@ -72,7 +72,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.2.0`
+**Current version:** `3.2.1`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -453,7 +453,13 @@ for the full system.
 | `.extra disable <name>` | Disable a module — tears it down immediately, no restart |
 | `.extra info <name>` | Status, category, and description for one extra module |
 
-### Help System
+### Help System (Saved Messages only)
+
+Like the Module Manager above, `help` only responds inside Saved Messages —
+elsewhere the command is ignored (v3.2.1: the block is now recorded as a log
+line so it can be diagnosed instead of looking like a dead command). Module
+help longer than Telegram's ~4096-character message limit arrives as more than
+one message.
 
 | Command | Description |
 | --- | --- |

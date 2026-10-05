@@ -70,11 +70,6 @@ class CommandRouter:
         for cmd in commands:
             self._routes[cmd.lower()] = handler
 
-    @property
-    def commands(self) -> frozenset[str]:
-        """All registered command strings — handy for help-text generation."""
-        return frozenset(self._routes)
-
     def resolve(self, text: str) -> tuple[CommandHandler | None, list[str]]:
         """
         Split *text* and look up a handler for its first token.

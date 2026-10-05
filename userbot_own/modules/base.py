@@ -264,7 +264,13 @@ class Module:
         except errors.MessageIdInvalidError:
             self._log.debug("_safe_edit: invalid message id (already deleted?)")
         except Exception as exc:
-            self._log.debug("_safe_edit error: %s", exc)
+            # v3.2.1: was DEBUG — a failed edit (flood-wait above the client's
+            # threshold, message too long, deleted peer, ...) left zero trace
+            # at default log levels, which made failures look like the command
+            # had never run. WARNING so it reaches the per-account log file
+            # without turning on DEBUG globally. The benign cases above stay
+            # at DEBUG on purpose — they are expected, not defects.
+            self._log.warning("_safe_edit error: %s", exc)
 
     # ── Auto-delete after delay ───────────────────────────────────────────────
 

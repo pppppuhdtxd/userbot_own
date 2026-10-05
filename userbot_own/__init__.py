@@ -38,7 +38,8 @@ _version_file = Path(__file__).parent.parent / "VERSION"
 #
 # v3.2.0: bumped to "3.2.0" in the same change as VERSION (and pyproject.toml, and
 # README.md's "Current version" line — see README "Versioning Guide").
-_FALLBACK_VERSION = "3.2.0"
+# v3.2.1: same four hand-maintained copies bumped together again.
+_FALLBACK_VERSION = "3.2.1"
 
 try:
     __version__ = _version_file.read_text(encoding="utf-8").strip() or _FALLBACK_VERSION

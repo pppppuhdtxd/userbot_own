@@ -222,6 +222,19 @@ class AccountLoader:
 
         self._loaded[stem] = (instance, py_mod)
 
+        # v3.2.1: Telegram rejects any message over ~4096 chars. `help
+        # <module>` chunks oversized help_extra instead of failing silently
+        # now, but a bloated help_extra still means a multi-message page the
+        # author never looked at — flag it at load time. 3900 leaves margin
+        # below the limit for markup and splitting overhead.
+        extra_len = len(getattr(instance, "help_extra", "") or "")
+        if extra_len > 3900:
+            self._log.warning(
+                "%s.help_extra is %d chars (> 3900) — `help %s` will be split "
+                "across multiple messages; consider splitting the text itself.",
+                stem, extra_len, stem,
+            )
+
         self._log.info("Loaded: %s", stem)
         return True
 

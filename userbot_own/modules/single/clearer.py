@@ -84,7 +84,6 @@ from telethon.tl.types import User
 
 from userbot_own.core.context import ModuleContext
 from userbot_own.helpers.utils import (
-    FILTER_TYPES,
     FLOOD_ERRORS,
     MEDIA_TYPES,
     MESSAGE_TYPES,
@@ -100,21 +99,6 @@ from userbot_own.modules.single.clearer_info import (
     help_text,
     name,
 )
-
-# ── Valid command arguments ──────────────────────────────────────────────────
-
-#: Any argument not in this set causes the command to be silently ignored.
-#:
-#: v3.2.2 (B-14): the type names come from the canonical FILTER_TYPES list
-#: in helpers.utils, so a new message type added to classify_message() is
-#: automatically selectable here.
-VALID_ARGS: frozenset[str] = frozenset(
-    set(FILTER_TYPES) | {
-        # Scope filters
-        "self", "bot",
-    }
-)
-
 
 # ── Type filters ─────────────────────────────────────────────────────────────
 
@@ -142,6 +126,26 @@ TYPE_FILTERS: dict[str, set[str]] = {
     "media": set(MEDIA_TYPES),   # Real media only — no `link`
     "all":   set(MESSAGE_TYPES),
 }
+
+
+# ── Valid command arguments ──────────────────────────────────────────────────
+
+#: Any argument not in this set causes the command to be silently ignored.
+#:
+#: v3.2.3: this was derived from ``FILTER_TYPES`` (the list of message
+#: TYPES), which is the wrong source. ``all`` is a KEY of
+#: ``TYPE_FILTERS`` — a composite filter — not a message type, so it was
+#: missing from the set and `clear all` was rejected by the strict
+#: validation and silently did nothing. The set is now derived from the
+#: keys of ``TYPE_FILTERS`` (the things a user can actually type, minus
+#: the internal ``default`` alias) plus the two scope filters, so it can
+#: never drift from the filter table again.
+VALID_ARGS: frozenset[str] = frozenset(
+    (set(TYPE_FILTERS) - {"default"}) | {
+        # Scope filters
+        "self", "bot",
+    }
+)
 
 
 # ── Module ───────────────────────────────────────────────────────────────────

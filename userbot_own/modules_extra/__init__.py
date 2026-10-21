@@ -10,10 +10,22 @@ account's own ``data/settings/account{N}/enabled_modules.json``. New
 extra modules are disabled by default; enable one with
 ``.extra enable <name>`` (see ``modules/single/module_manager.py``).
 
+Layout (v3.2.4)
+---------------
+``single/``     one logical module per ``.py`` file
+``packages/``   one logical module per folder
+
+The layout mirrors ``userbot_own/modules/`` exactly, so an extra module
+is written the same way as a core one.
+
 Two forms are accepted, and both work identically:
 
 - a single file — ``my_mod.py``
 - a package   — ``my_mod/__init__.py`` (+ any helper files beside it)
+
+The old flat layout (a file or folder directly in ``modules_extra/``) is
+still discovered, so a plugin written against an earlier release keeps
+working without being moved.
 
 Disabled modules are never imported — no import cost, no handler
 registration, no `help` visibility — so dropping a large collection of

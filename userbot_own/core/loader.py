@@ -10,11 +10,34 @@ Each account has its own independent `AccountLoader` instance:
 • Each module has access to its own `ModuleContext` (cfg + injected
   application-scoped services).
 
-`watch()` monitors `modules_dir` for `.py` file changes and triggers
+`watch()` monitors the module roots for `.py` file changes and triggers
 hot-reload automatically (requires the `watchdog` package).
 
 `watch_files()` accepts additional `(path, callback)` pairs so external
 files like `account.json` can also drive callbacks.
+
+Module layout (v3.2.3 / v3.2.4)
+──────────────────────────────
+A module is a *logical unit with a name*, written either as one file
+or as a package. The loader treats both identically — it only ever
+looks for the `create_module(context)` factory and the `Module`
+subclass:
+
+    modules/single/<name>.py            one-file module
+    modules/single/<name>_info.py       its metadata (data only)
+    modules/packages/<name>/            package module
+        __init__.py                     create_module() + public API
+        info.py                         its metadata (data only)
+
+`modules_extra/` has the SAME shape (`single/` + `packages/`), so a
+user-written plugin is written exactly like a core one. The old flat
+layout — a file or folder directly in the root — is still discovered,
+so plugins written against 3.2.x keep working untouched.
+
+`modules/_infra/` holds the shared infrastructure (`base.py`,
+`router.py`, `bridge.py`). It is NOT a module root: the leading
+underscore is the project's existing convention for "not a plugin",
+and the loader skips it without any special-casing.
 
 v3.1.0: optional second root, `extra_modules_dir` (`modules_extra/`).
 Files there behave exactly like core `modules/` files (same `Module`
@@ -86,6 +109,12 @@ _DEBOUNCE_MAX_ENTRIES = 256
 #: module (``clearer.py`` → ``clearer_info.py``). It is DATA, not a
 #: module, and is skipped by discovery.
 _INFO_SUFFIX = "_info"
+
+#: v3.2.4: the folder names that make up the module layout. They are
+#: reserved — a module may not be called "single" or "packages", and
+#: they are skipped when the flat (backwards-compatible) root is
+#: scanned, so the layout folders are not mistaken for package modules.
+_LAYOUT_FOLDERS: frozenset[str] = frozenset({"single", "packages"})
 
 #: v3.2.3: the PACKAGE root (``.../userbot_own``), used to derive a
 #: package's real dotted module name
@@ -462,22 +491,45 @@ class AccountLoader:
         """
         Return the module roots to search, as ``(directory, is_extra)``.
 
-        v3.2.3: ``modules/`` now holds two sub-roots — ``single/`` for
-        one-file modules and ``packages/`` for package-style modules —
-        and ``modules_extra/`` accepts BOTH forms so a user-written
-        plugin can be either a file or a folder.
+        v3.2.3: ``modules/`` holds two sub-roots — ``single/`` for
+        one-file modules and ``packages/`` for package-style modules.
+
+        v3.2.4: ``modules_extra/`` now has the SAME shape — ``single/``
+        and ``packages/`` — so a user-written plugin is written exactly
+        like a core one. The OLD flat layout (a ``.py`` file or a folder
+        directly inside ``modules_extra/``) is still accepted, so
+        plugins written against 3.2.x keep working untouched.
 
         The order is the precedence order: a single-file module in
         ``single/`` beats a package of the same name in ``packages/``,
         and any core module beats an extra one.
         """
         roots: list[tuple[Path, bool]] = []
-        for sub in ("single", "packages"):
-            candidate = self.modules_dir / sub
-            if candidate.is_dir():
-                roots.append((candidate, False))
-        if self.extra_modules_dir is not None and self.extra_modules_dir.is_dir():
-            roots.append((self.extra_modules_dir, True))
+        for base, is_extra in (
+            (self.modules_dir, False),
+            (self.extra_modules_dir, True),
+        ):
+            if base is None or not base.is_dir():
+                continue
+            for sub in ("single", "packages"):
+                candidate = base / sub
+                if candidate.is_dir():
+                    roots.append((candidate, is_extra))
+            # Compatibility: the flat layout (module files directly in
+            # the root) is still discovered, so a plugin written for an
+            # earlier release keeps loading. The sub-roots are listed
+            # first, so they take precedence.
+            #
+            # The flat root is only a module root when it actually holds
+            # module files — otherwise the `single/` and `packages/`
+            # FOLDERS themselves would be mistaken for modules (they are
+            # directories, and a directory with an __init__.py looks
+            # exactly like a package module to the discovery code).
+            if any(
+                p.suffix == ".py" and not p.stem.startswith("_")
+                for p in base.glob("*.py")
+            ):
+                roots.append((base, is_extra))
         return roots
 
     def _discover_modules(self, root: Path) -> list[tuple[str, Path]]:
@@ -515,6 +567,13 @@ class AccountLoader:
             if not path.is_dir():
                 continue
             if path.name.startswith("_") or path.name in _INFRASTRUCTURE_STEMS:
+                continue
+            # v3.2.4: the layout folder names are reserved. When the flat
+            # root is scanned (the backwards-compatible layout), the
+            # `single/` and `packages/` folders would otherwise look like
+            # package modules — they have an __init__.py, so discovery
+            # would try to load them and log "no valid Module — skipped".
+            if path.name in _LAYOUT_FOLDERS:
                 continue
             entry = path / "__init__.py"
             if not entry.exists():
@@ -597,6 +656,9 @@ class AccountLoader:
             folder = parts[0]
             if folder.startswith("_") or folder in _INFRASTRUCTURE_STEMS:
                 return None
+            if folder in _LAYOUT_FOLDERS:
+                # v3.2.4: the layout folders are not modules.
+                return None
             # Only a real package counts as a module.
             if not (root_resolved / folder / "__init__.py").exists():
                 return None
@@ -639,15 +701,9 @@ class AccountLoader:
         to_disable = sorted(self._enabled_extra - new_enabled)
 
         for stem in to_enable:
-            # v3.2.3: the extra module may be a file or a package.
-            candidate = None
-            for option in (
-                self.extra_modules_dir / f"{stem}.py",
-                self.extra_modules_dir / stem / "__init__.py",
-            ):
-                if option.exists():
-                    candidate = option
-                    break
+            # v3.2.3/v3.2.4: the extra module may be a file or a package,
+            # in either the new roots or the old flat layout.
+            candidate = self._find_entry(stem, extra_only=True)
             if candidate is None:
                 self._log.warning(
                     "enabled_modules.json now lists '%s', but no such "
@@ -723,20 +779,57 @@ class AccountLoader:
     # change or inspect extra-module enablement — mirrors get_module()'s
     # role as "the public replacement for reaching into _loaded directly".
 
+    def _find_entry(self, stem: str, extra_only: bool = False) -> Path | None:
+        """
+        Find the entry point (file or package ``__init__.py``) of a module.
+
+        v3.2.4: searches every applicable module root, so the new
+        ``single/`` + ``packages/`` layout of ``modules_extra/`` works
+        exactly like the core layout — and the old flat layout still
+        works too.
+
+        Args:
+            stem:       The module's name.
+            extra_only: Restrict the search to the extra roots.
+
+        Returns:
+            The entry point path, or ``None`` if the module is not found.
+        """
+        for root, is_extra in self._module_roots():
+            if extra_only and not is_extra:
+                continue
+            for candidate in (
+                root / f"{stem}.py",
+                root / stem / "__init__.py",
+            ):
+                if candidate.exists():
+                    return candidate
+        return None
+
     def list_available_extra(self) -> list[str]:
         """
-        Return every module name present in ``extra_modules_dir``,
+        Return every module name present in the extra module roots,
         regardless of enabled state — i.e. "available", not "active".
 
         v3.2.3: an extra module may be a single file (``<stem>.py``) or a
         package (``<stem>/__init__.py``); both are listed.
+
+        v3.2.4: the extra roots follow the core layout
+        (``single/`` + ``packages/``), with the old flat layout still
+        accepted for backwards compatibility.
 
         Returns ``[]`` if this loader wasn't configured with an
         ``extra_modules_dir`` (never raises).
         """
         if self.extra_modules_dir is None:
             return []
-        return [stem for stem, _ in self._discover_modules(self.extra_modules_dir)]
+        names: set[str] = set()
+        for root, is_extra in self._module_roots():
+            if not is_extra:
+                continue
+            for stem, _ in self._discover_modules(root):
+                names.add(stem)
+        return sorted(names)
 
     def is_extra_enabled(self, stem: str) -> bool:
         """Return whether *stem* is currently in this account's enabled-set."""
@@ -755,15 +848,9 @@ class AccountLoader:
             return False, "Extra modules are not configured for this account."
         if stem in self._enabled_extra:
             return False, f"'{stem}' is already enabled."
-        # v3.2.3: the extra module may be a file or a package.
-        entry = None
-        for candidate in (
-            self.extra_modules_dir / f"{stem}.py",
-            self.extra_modules_dir / stem / "__init__.py",
-        ):
-            if candidate.exists():
-                entry = candidate
-                break
+        # v3.2.3/v3.2.4: the extra module may be a file or a package, in
+        # either the new single/ + packages/ roots or the old flat layout.
+        entry = self._find_entry(stem, extra_only=True)
         if entry is None:
             return False, f"No such extra module: '{stem}'."
         if stem in self._loaded:

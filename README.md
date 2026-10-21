@@ -72,7 +72,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.2.3`
+**Current version:** `3.2.4`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -238,11 +238,14 @@ userbot_own/
     │           └── handlers.py       ← the JoinLeft class — dispatch + flows
     │
     ├── modules_extra/                 ← optional plugins, per-account enable/disable
-    │   ├── __init__.py
-    │   └── example_module/           ← template / smoke-test module, ships disabled
-    │       ├── __init__.py
-    │       ├── info.py
-    │       └── handlers.py
+    │   ├── single/                   ← one logical module per .py file
+    │   │   └── (your_plugin.py + your_plugin_info.py)
+    │   ├── packages/                 ← one logical module per folder
+    │   │   └── example_module/       ← template / smoke-test module, ships disabled
+    │   │       ├── __init__.py
+    │   │       ├── info.py
+    │   │       └── handlers.py
+    │   └── __init__.py
     │
     ├── account_management/
     │   └── cli.py                    ← interactive `python add_account.py` menu
@@ -729,12 +732,19 @@ opt into deliberately than have silently active after a `git pull`.
 An extra module can be written either way, and both work identically:
 
 ```
-modules_extra/my_mod.py              ← single file
-modules_extra/my_mod/__init__.py     ← package (with helper files beside it)
+modules_extra/single/my_mod.py              ← single file
+modules_extra/single/my_mod_info.py         ← its metadata
+modules_extra/packages/my_mod/__init__.py   ← package
+modules_extra/packages/my_mod/info.py       ← its metadata
 ```
 
 The loader discovers either form, and the same `enabled_modules.json`
 entry works for both.
+
+> The **old flat layout** — a file or folder directly in
+> `modules_extra/` — is still discovered, so a plugin written against
+> `3.2.x` keeps working without being moved. The new `single/` and
+> `packages/` roots simply take precedence.
 
 ### How it works
 
@@ -796,6 +806,8 @@ few hundred lines.
 
 1. Create `userbot_own/modules/single/my_module.py` and
    `userbot_own/modules/single/my_module_info.py`.
+   (For an *extra* module, use `userbot_own/modules_extra/single/`
+   instead — the layout is identical.)
 2. Put the **metadata** (help texts, category, description) in the info
    file — data only, no imports:
 
@@ -858,7 +870,8 @@ def create_module(context: ModuleContext) -> Module:
 
 ### Form 2 — a package
 
-For a bigger module, make it a folder — `userbot_own/modules/packages/my_module/`:
+For a bigger module, make it a folder — `userbot_own/modules/packages/my_module/`
+(or `userbot_own/modules_extra/packages/my_module/` for an extra module):
 
 ```
 my_module/

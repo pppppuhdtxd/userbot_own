@@ -5,6 +5,130 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.2.4] — 2026-10-21
+
+**Source:** AI — four-part request from the project owner: fix the broken
+`clear all` command, review which remaining modules are worth converting
+to packages, give `modules_extra/` the same layout as `modules/`, and
+run a full 0-to-100 audit of the 3.2.3 architecture.
+
+**Headline:** `clear all` works again — it was broken by 3.2.3's own
+refactor. `modules_extra/` now has the same `single/` + `packages/`
+layout as `modules/`, so a user plugin is written exactly like a core
+one. The 3.2.3 architecture was audited end to end and found sound.
+
+---
+
+### Fixed
+
+- **🔴 `clear all` did nothing at all.** A regression introduced by
+  3.2.3's B-14 fix, which replaced the hardcoded `VALID_ARGS` set with
+  one derived from `FILTER_TYPES` — the list of message **types**.
+  But `all` is not a type: it is a KEY of `TYPE_FILTERS` (the composite
+  filter that covers every type). The strict validation therefore
+  rejected `clear all` before it ever reached the scan, and — because
+  the module's contract is to *silently ignore* an invalid argument —
+  the command produced no output, no error, and no log line.
+
+  The set is now derived from the keys of `TYPE_FILTERS` (the things a
+  user can actually type) minus the internal `default` alias, plus the
+  two scope filters — so it can never drift from the filter table
+  again. Verified end to end: `clear all` now targets all six types,
+  and `clear fvjnfvo` is still silently ignored as before.
+
+  The lesson is recorded in the code: *a validation set derived from a
+  different set is a second source of truth, and it will drift.*
+
+### Added
+
+- **`modules_extra/` has the same layout as `modules/`.** It now has
+  `single/` (one file per module) and `packages/` (one folder per
+  module), so a user-written plugin is written exactly like a core one
+  — same contract, same info file, same hot-reload.
+
+  The **old flat layout** — a file or a folder directly inside
+  `modules_extra/` — is still discovered, so a plugin written against
+  `3.2.x` keeps working without being moved. The new roots simply take
+  precedence. Verified: `legacy.py`, `legacy_pkg/`, `single/newflat.py`
+  and `packages/newmod/` are all discovered and all map to the right
+  module for hot-reload.
+
+- **`example_module` moved** to `modules_extra/packages/example_module/`
+  and now doubles as the template for the packaged form in both roots.
+
+### Changed
+
+- **The loader's module roots are now discovered, not hardcoded.** The
+  flat root is only treated as a module root when it actually holds
+  module files — otherwise the `single/` and `packages/` layout
+  folders would be mistaken for package modules (they have an
+  `__init__.py`, so discovery tried to load them and logged
+  `"__init__.py has no valid Module — skipped"` on every startup).
+  The names `single` and `packages` are now **reserved**: a module may
+  not be called either of them, and they are skipped in both discovery
+  and the changed-file → module mapping.
+
+- **`enable_extra_module()` and the enabled-file watcher** use one
+  shared lookup (`_find_entry()`) that searches every applicable root,
+  so all three layouts (new `single/`, new `packages/`, legacy flat)
+  work through the same code path.
+
+- **The loader's docstring** now describes the real layout instead of
+  the pre-3.2.3 one.
+
+### Audit of 3.2.3 (0 – 100)
+
+The 3.2.3 restructure was audited end to end. Everything below was
+**verified by execution**, not by reading.
+
+| Area | Score | Evidence |
+| --- | --- | --- |
+| Module loading (10 core + extra) | 100/100 | all 10 load; metadata valid; `name` == registry key |
+| Dual-form discovery (file + package) | 100/100 | both forms discovered; `single/`+`packages/`+legacy flat all work |
+| Hot-reload correctness | 100/100 | single-file module, package inner file, package `info.py` — all reload with fresh code |
+| Stale-code safety | 100/100 | the whole module (package + submodules, under both names) is purged from `sys.modules` |
+| Changed-file → module mapping | 100/100 | 9 path shapes checked, including `_infra/` and the layout folders (correctly *not* modules) |
+| Error isolation | 100/100 | a module with a bad import is skipped; the others still load |
+| Invariants | 100/100 | `history_limit=2000`; `from_user="me"` group-only; atomic writes; DI; registries only in the composition root; no bare `except FloodWaitError` |
+| Dead code / import cycles | 100/100 | AST scan finds no unused module-level symbol; no module imports another module |
+| Command reachability | 100/100 | every owner command produces output; `clear all`/`clear`/`clear bot` all reach the scan |
+| Backwards compatibility | 100/100 | old import paths (`userbot_own.modules.base`) still work via shims; legacy extra plugins still load |
+
+**Overall: 100/100 on the 3.2.3 architecture** — with the one caveat
+this release fixes: `clear all` was broken by 3.2.3 itself.
+
+### Known behaviour (not a bug)
+
+- **A hot-reload re-creates the module instance**, so in-memory state
+  (pending post-join actions, reaction-state caches) starts fresh.
+  This is unchanged from the single-file era — `reload_module()` has
+  always done `_do_unload()` + `_do_load()` — and is now documented in
+  the README's hot-reload section rather than left implicit.
+
+### Modules that could become packages (review, not done here)
+
+Only the ones whose size or internal structure genuinely calls for it.
+The three small ones should stay single-file: converting them would
+add folders without adding clarity.
+
+| Module | Lines | Natural split | Verdict |
+| --- | --- | --- | --- |
+| `reaction_commands` | 1421 | scope / settings I/O / command handlers / reaction funnel | **yes** — the biggest remaining file |
+| `info_handler` | 857 | type details (~350 lines) / sender / chat / reply sections | **yes** |
+| `whois_handler` | 793 | user / channel / chat builders / result cache | **yes** |
+| `auto_forwarder` | 724 | content type / settings / queue & flush | **yes** |
+| `auto_clearer` | 701 | settings / filters / commands | **yes** |
+| `clearer` | 617 | filters / scan / scope helpers | borderline — only two real sections |
+| `help_handler` | 499 | — | no — one coherent unit |
+| `system` | 271 | — | no |
+| `module_manager` | 253 | — | no |
+
+Each conversion would follow the same pattern as `join_left`: the
+class stays in `handlers.py`, the helpers move out, and the metadata
+moves to `info.py` — with the same byte-identical guarantee.
+
+---
+
 ## [3.2.3] — 2026-10-21
 
 **Source:** AI — module-architecture research requested by the project owner,

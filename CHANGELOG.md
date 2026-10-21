@@ -5,6 +5,90 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.2.5] — 2026-10-21
+
+**Source:** AI — the project owner's request to convert the six remaining
+substantial modules into packages, following the `join_left` pattern
+established in 3.2.3.
+
+**Headline:** `clearer`, `auto_clearer`, `auto_forwarder`, `info_handler`,
+`whois_handler` and `reaction_commands` are now packages. Only three
+modules remain single-file — `system`, `help_handler` and
+`module_manager` — because they are one coherent unit each and turning
+them into folders would add structure without adding clarity.
+
+**Behaviour is unchanged.** Every function and method body was
+compared against the 3.2.4 source: **108 of 109 are byte-identical**,
+and the 109th (`_format_scope_lines`) was moved into a shared module
+whose output was verified to be **character-for-character identical**.
+
+---
+
+### Changed
+
+- **Six modules converted to packages.** Each follows the same shape
+  `join_left` established: the class stays whole in `handlers.py`, the
+  genuinely free-standing code moves out, and the metadata moves to
+  `info.py`.
+
+  | Module | Package layout |
+  | --- | --- |
+  | `clearer` | `filters.py` (the type filters + the valid arguments), `handlers.py`, `info.py` |
+  | `auto_clearer` | `filters.py` (the type filters, the scope rules, the defaults), `handlers.py`, `info.py` |
+  | `auto_forwarder` | `content.py` (the content classification + the defaults), `handlers.py`, `info.py` |
+  | `info_handler` | `labels.py` (the display labels for the message/entity types), `handlers.py`, `info.py` |
+  | `whois_handler` | `const.py` (the caption/message limits + the cache TTL), `handlers.py`, `info.py` |
+  | `reaction_commands` | `const.py` (the tunables), `scope.py` (the persisted chat-scope set), `handlers.py`, `info.py` |
+
+  The split was deliberately conservative: only **top-level** blocks
+  (constants and free functions) were extracted. The class bodies were
+  left intact rather than being decomposed into per-concern modules —
+  splitting a class's methods across files would have meant rewriting
+  `self.` references throughout, and the risk of a subtle behaviour
+  change would have outweighed the readability gain. Where a module
+  really does have independent parts (the type filters, the content
+  classification, the display labels, the limits), those now live in
+  their own file and can be read on their own.
+
+- **`reaction_commands`' scope handling moved to `scope.py`.** The scope
+  vocabulary, the file format and the display formatting are now one
+  place instead of being spread across three class methods. The class
+  keeps the same three methods as thin wrappers, so nothing else in the
+  module changed.
+
+### Verification
+
+- **108 / 109 function bodies byte-identical** to 3.2.4 (the one
+  exception is `_format_scope_lines`, whose output was verified
+  character-for-character identical).
+- **All metadata byte-identical** — every module's `name`, `category`,
+  `desc`, `help_text` and `help_extra` is unchanged.
+- **All ten modules load**, with valid metadata and `name` matching the
+  registry key.
+- **Every command still produces output** — `clear all`, `clear`,
+  `clear bot`, `clear self`, `autoclear status`, `forward status`,
+  `autofor txt on`, `info`, `whois`, `reactions`, `reaction` and
+  `.reaction_scope` were each driven with a fake event.
+- **Hot-reload works for every new package** — a changed file inside any
+  of them (a filter, a label, a constant, the scope module) reloads the
+  right module with fresh code, and the changed-file → module mapping
+  was checked for all 14 new files.
+- `ruff check` — no findings.
+
+### Not changed (deliberately)
+
+- **No behaviour, command, setting or help text changed.**
+- **`system`, `help_handler` and `module_manager` stay single-file.**
+  They are 253–499 lines of one coherent concern each; packaging them
+  would create folders and `info.py` files without making anything
+  easier to read.
+- **The module names are unchanged**, so `reaction_commands`' cross-module
+  lookups (`get_module("clearer")`, `get_module("join_left")`, …) keep
+  working, and the `enabled_modules.json` entries for user plugins keep
+  their meaning.
+
+---
+
 ## [3.2.4] — 2026-10-21
 
 **Source:** AI — four-part request from the project owner: fix the broken

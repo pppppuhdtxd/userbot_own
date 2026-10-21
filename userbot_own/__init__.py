@@ -42,7 +42,8 @@ _version_file = Path(__file__).parent.parent / "VERSION"
 # v3.2.2: same four hand-maintained copies bumped together again.
 # v3.2.3: same four hand-maintained copies bumped together again.
 # v3.2.4: same four hand-maintained copies bumped together again.
-_FALLBACK_VERSION = "3.2.4"
+# v3.2.5: same four hand-maintained copies bumped together again.
+_FALLBACK_VERSION = "3.2.5"
 
 try:
     __version__ = _version_file.read_text(encoding="utf-8").strip() or _FALLBACK_VERSION

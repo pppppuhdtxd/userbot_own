@@ -72,7 +72,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.2.4`
+**Current version:** `3.2.5`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -211,31 +211,50 @@ userbot_own/
     │   │   ├── module_manager.py     ← .extra enable/disable/info for modules_extra/
     │   │   ├── module_manager_info.py
     │   │   ├── help_handler.py      ← `help` + `help <module>` commands
-    │   │   ├── help_handler_info.py
-    │   │   ├── clearer.py            ← manual message clearing
-    │   │   ├── clearer_info.py
-    │   │   ├── auto_clearer.py       ← automatic message clearing
-    │   │   ├── auto_clearer_info.py
-    │   │   ├── auto_forwarder.py     ← auto-forward bot messages
-    │   │   ├── auto_forwarder_info.py
-    │   │   ├── reaction_commands.py  ← execute commands via emoji reactions
-    │   │   ├── reaction_commands_info.py
-    │   │   ├── info_handler.py       ← message info (reply)
-    │   │   ├── info_handler_info.py
-    │   │   └── whois_handler.py      ← user/chat info
-    │   │       whois_handler_info.py
+    │   │   └── help_handler_info.py
     │   │
     │   └── packages/                 ← one logical module per folder
-    │       └── join_left/            ← join/leave chats + folder management
-    │           ├── __init__.py       ← create_module() + the module's public API
-    │           ├── info.py           ← help texts + metadata (data only)
-    │           ├── const.py          ← tunable numbers
-    │           ├── types.py          ← result records
-    │           ├── entities.py       ← pulling chat IDs out of text
-    │           ├── folders.py        ← joined* folders + exclude_archived
-    │           ├── post_join.py      ← mute + archive after a join
-    │           ├── leave.py          ← leave everything + reset the folders
-    │           └── handlers.py       ← the JoinLeft class — dispatch + flows
+    │       ├── join_left/            ← join/leave chats + folder management
+    │       │   ├── __init__.py       ← create_module() + the module's public API
+    │       │   ├── info.py           ← help texts + metadata (data only)
+    │       │   ├── const.py          ← tunable numbers
+    │       │   ├── types.py          ← result records
+    │       │   ├── entities.py       ← pulling chat IDs out of text
+    │       │   ├── folders.py        ← joined* folders + exclude_archived
+    │       │   ├── post_join.py      ← mute + archive after a join
+    │       │   ├── leave.py          ← leave everything + reset the folders
+    │       │   └── handlers.py       ← the JoinLeft class — dispatch + flows
+    │       ├── clearer/              ← manual message clearing
+    │       │   ├── __init__.py       ← create_module() + the module's public API
+    │       │   ├── info.py           ← help texts + metadata (data only)
+    │       │   ├── filters.py        ← the type filters + valid arguments
+    │       │   └── handlers.py       ← the Clearer class — dispatch + scan/delete
+    │       ├── auto_clearer/         ← automatic message clearing
+    │       │   ├── __init__.py
+    │       │   ├── info.py
+    │       │   ├── filters.py        ← the type filters, scope rules, defaults
+    │       │   └── handlers.py       ← the AutoClearer class — filter + commands
+    │       ├── auto_forwarder/       ← auto-forward bot messages
+    │       │   ├── __init__.py
+    │       │   ├── info.py
+    │       │   ├── content.py       ← content classification + defaults
+    │       │   └── handlers.py      ← the AutoForwarder class — flow + commands
+    │       ├── info_handler/         ← message info (reply)
+    │       │   ├── __init__.py
+    │       │   ├── info.py
+    │       │   ├── labels.py        ← the display labels for message/entity types
+    │       │   └── handlers.py      ← the InfoHandler class — dispatch + report
+    │       ├── whois_handler/        ← user/chat info
+    │       │   ├── __init__.py
+    │       │   ├── info.py
+    │       │   ├── const.py         ← the caption/message limits + cache TTL
+    │       │   └── handlers.py      ← the WhoisHandler class — dispatch + cache
+    │       └── reaction_commands/   ← execute commands via emoji reactions
+    │           ├── __init__.py
+    │           ├── info.py
+    │           ├── const.py         ← the tunables (caps, cooldown, heartbeat)
+    │           ├── scope.py         ← the persisted chat-scope set
+    │           └── handlers.py      ← the ReactionCommands class — funnel + commands
     │
     ├── modules_extra/                 ← optional plugins, per-account enable/disable
     │   ├── single/                   ← one logical module per .py file

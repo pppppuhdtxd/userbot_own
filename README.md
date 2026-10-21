@@ -72,7 +72,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.2.2`
+**Current version:** `3.2.3`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -199,23 +199,50 @@ userbot_own/
     │   └── utils.py                  ← shared utilities + classify_message()
     │
     ├── modules/
-    │   ├── base.py                   ← abstract Module base class
-    │   ├── router.py                 ← CommandRouter (declarative command dispatch)
-    │   ├── bridge.py                 ← MockEvent (bridges reaction triggers into normal handlers)
-    │   ├── system.py                 ← owner commands: .modules .account .stats .ping
-    │   ├── module_manager.py          ← .extra enable/disable/info for modules_extra/ (v3.1.0)
-    │   ├── help_handler.py           ← `help` + `help <module>` commands
-    │   ├── clearer.py                 ← manual message clearing
-    │   ├── auto_clearer.py            ← automatic message clearing
-    │   ├── auto_forwarder.py          ← auto-forward bot messages
-    │   ├── join_left.py               ← join/leave chats + folder management
-    │   ├── reaction_commands.py       ← execute commands via emoji reactions
-    │   ├── info_handler.py            ← message info (reply)
-    │   └── whois_handler.py           ← user/chat info
+    │   ├── _infra/                   ← shared infrastructure (NOT plugins)
+    │   │   ├── base.py               ← abstract Module base class
+    │   │   ├── router.py             ← CommandRouter (declarative command dispatch)
+    │   │   └── bridge.py             ← MockEvent (bridges reaction triggers into normal handlers)
+    │   ├── base.py / router.py / bridge.py   ← compat re-exports of _infra/
+    │   │
+    │   ├── single/                   ← one logical module per .py file
+    │   │   ├── system.py             ← owner commands: .modules .account .stats .ping
+    │   │   ├── system_info.py        ← its help texts + metadata (data only)
+    │   │   ├── module_manager.py     ← .extra enable/disable/info for modules_extra/
+    │   │   ├── module_manager_info.py
+    │   │   ├── help_handler.py      ← `help` + `help <module>` commands
+    │   │   ├── help_handler_info.py
+    │   │   ├── clearer.py            ← manual message clearing
+    │   │   ├── clearer_info.py
+    │   │   ├── auto_clearer.py       ← automatic message clearing
+    │   │   ├── auto_clearer_info.py
+    │   │   ├── auto_forwarder.py     ← auto-forward bot messages
+    │   │   ├── auto_forwarder_info.py
+    │   │   ├── reaction_commands.py  ← execute commands via emoji reactions
+    │   │   ├── reaction_commands_info.py
+    │   │   ├── info_handler.py       ← message info (reply)
+    │   │   ├── info_handler_info.py
+    │   │   └── whois_handler.py      ← user/chat info
+    │   │       whois_handler_info.py
+    │   │
+    │   └── packages/                 ← one logical module per folder
+    │       └── join_left/            ← join/leave chats + folder management
+    │           ├── __init__.py       ← create_module() + the module's public API
+    │           ├── info.py           ← help texts + metadata (data only)
+    │           ├── const.py          ← tunable numbers
+    │           ├── types.py          ← result records
+    │           ├── entities.py       ← pulling chat IDs out of text
+    │           ├── folders.py        ← joined* folders + exclude_archived
+    │           ├── post_join.py      ← mute + archive after a join
+    │           ├── leave.py          ← leave everything + reset the folders
+    │           └── handlers.py       ← the JoinLeft class — dispatch + flows
     │
-    ├── modules_extra/                 ← optional plugins, per-account enable/disable (v3.1.0)
+    ├── modules_extra/                 ← optional plugins, per-account enable/disable
     │   ├── __init__.py
-    │   └── example_module.py          ← template / smoke-test module, ships disabled
+    │   └── example_module/           ← template / smoke-test module, ships disabled
+    │       ├── __init__.py
+    │       ├── info.py
+    │       └── handlers.py
     │
     ├── account_management/
     │   └── cli.py                    ← interactive `python add_account.py` menu
@@ -258,11 +285,25 @@ consumer — see [FAQ](#faq).)*
 
 ```
 AccountLoader.load_all(client)
-    └─ for each .py in modules/ (except base.py / router.py / bridge.py)
+    └─ for each module found in the module roots
+        │   (single/<name>.py  OR  packages/<name>/__init__.py)
         ├─ importlib.util.spec_from_file_location()
         ├─ create_module(context)      ← factory call, context = this account's ModuleContext
         └─ instance.setup(client)      ← handler registration
 ```
+
+A module is a *logical unit* with a name. It can be written in one file
+(`modules/single/<name>.py`) or as a package
+(`modules/packages/<name>/`) — the loader treats both identically. The
+shared infrastructure in `modules/_infra/` is skipped by discovery (the
+leading underscore is the existing convention for "not a plugin"), and the
+old import paths `userbot_own.modules.base` / `.router` / `.bridge` still
+work through thin re-export shims.
+
+Every module also has an **info file** holding its help texts and
+metadata — `single/<name>_info.py`, or `packages/<name>/info.py`. It is
+pure data with no imports, so the help text can be read and edited
+without touching any logic.
 
 `ModuleContext` bundles everything a plugin might need: its own
 `AccountConfig`, the shared `AccountLoaderRegistry`, `AccountRegistry`, and
@@ -276,6 +317,15 @@ AccountLoader.reload_module(stem)
     ├─ instance.teardown(client)   ← remove handlers
     └─ [re-import + re-setup]
 ```
+
+Changing **any** file that belongs to a module reloads that whole module —
+for a package, that includes a file inside the package folder, and the
+package's own `info.py`. The whole module (and its submodules) is purged
+from `sys.modules` first, so a reload always runs the new code.
+
+Note that a reload re-creates the module instance, so any state it holds
+(settings cache, pending actions) starts fresh — the same behaviour the
+single-file modules have always had.
 
 ### Connection resilience
 
@@ -505,7 +555,7 @@ reaction add 🔥 whois      ← react with 🔥 → show sender info
 # Then react with the configured emoji on any message where reactions are enabled!
 ```
 
-Reacted-to commands run through a direct-invocation bridge (`modules/bridge.py`,
+Reacted-to commands run through a direct-invocation bridge (`modules/_infra/bridge.py`,
 `MockEvent`) rather than a real round-trip message — currently wired up for
 `clear`, `join`/`left`, `info`, and `whois`.
 
@@ -630,17 +680,32 @@ those archived chats out of your *other* folders, the bot sets Telegram's own
 
 ## Hot-Reload System
 
-The bot monitors the `modules/` directory with `watchdog`. When a `.py`
-file is created, modified, or deleted:
+The bot monitors the module roots with `watchdog`. When a `.py` file that
+belongs to a module is created, modified, or deleted:
 
 1. The old module instance's `teardown()` is called (handlers removed).
-2. The file is re-imported from disk.
+2. The module is re-imported from disk.
 3. A new instance is created (via `create_module(context)`) and `setup()` is called.
 
 This means you can iterate on module code without restarting the bot.
 Syntax errors in a module are caught and logged — the rest of the plugins
-continue running normally. `base.py`, `router.py`, and `bridge.py` are
-shared infrastructure, not plugins, and are never imported as one.
+continue running normally.
+
+**Which file belongs to which module** is worked out automatically:
+
+| File you change | Module reloaded |
+| --- | --- |
+| `single/clearer.py` | `clearer` |
+| `single/clearer_info.py` (the help text) | `clearer` |
+| `packages/join_left/handlers.py` | `join_left` |
+| `packages/join_left/info.py` | `join_left` |
+
+The shared infrastructure in `modules/_infra/` is not a plugin and is never
+reloaded as one.
+
+> A reload re-creates the module instance, so any state it holds (settings
+> cache, pending actions) starts fresh — the same behaviour single-file
+> modules have always had.
 
 There is currently no in-chat command to trigger a manual reload — edit the
 file and the watcher picks it up automatically.
@@ -652,12 +717,24 @@ file and the watcher picks it up automatically.
 v3.1.0 adds a second, optional plugin directory alongside `modules/`. The
 two are functionally identical — same `Module` base class, same
 `create_module(context)` factory, same hot-reload — with one difference:
-**a file in `modules_extra/` only runs for an account if that account has
+**a module in `modules_extra/` only runs for an account if that account has
 explicitly enabled it.** New extra modules are disabled by default.
 
 This exists for modules you don't want active on every account by
 default — experiments, per-account personal tweaks, anything you'd rather
 opt into deliberately than have silently active after a `git pull`.
+
+### Two forms, one contract
+
+An extra module can be written either way, and both work identically:
+
+```
+modules_extra/my_mod.py              ← single file
+modules_extra/my_mod/__init__.py     ← package (with helper files beside it)
+```
+
+The loader discovers either form, and the same `enabled_modules.json`
+entry works for both.
 
 ### How it works
 
@@ -687,7 +764,7 @@ opt into deliberately than have silently active after a `git pull`.
 
 ### Trying it out
 
-The repo ships with one example module, `modules_extra/example_module.py`,
+The repo ships with one example module, `modules_extra/example_module/`,
 disabled by default, that does nothing but respond to `پینگ اضافی` (typed in
 Saved Messages) with a pong — enough to verify the whole system end-to-end
 on a real account:
@@ -711,47 +788,52 @@ until you `.extra enable` it.
 
 ## Writing a New Module
 
-1. Create `userbot_own/modules/my_module.py`.
-2. Implement the module:
+A module can be **one file** or **a package**. Pick the file form while
+the module is small; switch to the package form when it grows past a
+few hundred lines.
+
+### Form 1 — a single file
+
+1. Create `userbot_own/modules/single/my_module.py` and
+   `userbot_own/modules/single/my_module_info.py`.
+2. Put the **metadata** (help texts, category, description) in the info
+   file — data only, no imports:
 
 ```python
+# my_module_info.py
+name = "my_module"
+
+category = "general"          # cleaning | forward | info | social | reaction | system | general
+desc = "توضیح کوتاه ماژول من"
+
+help_text = (
+    "• `mycommand` — does something cool\n"
+)
+
+help_extra = (
+    "🎯 **My Module - Extended Info:**\n\n"
+    "**Commands:**\n"
+    "• `mycommand` — detailed description\n\n"
+    "**Notes:**\n"
+    "• Important edge case 1\n"
+)
+```
+
+3. Put the **behaviour** in the module file — it imports the metadata and
+   copies it onto the class:
+
+```python
+# my_module.py
 from telethon import TelegramClient, events
 
 from userbot_own.core.context import ModuleContext
-from userbot_own.modules.base import Module
+from userbot_own.modules._infra.base import Module
+from userbot_own.modules.single.my_module_info import (
+    category, desc, help_extra, help_text, name,
+)
 
 
 class MyModule(Module):
-    name = "my_module"
-
-    # Which group this module appears under in the compact `help` output.
-    # One of: cleaning, forward, info, social, reaction, system, general
-    # (see modules/help_handler.py's CATEGORIES list). Defaults to
-    # "general" if omitted — but set it explicitly so `help` groups your
-    # module sensibly instead of dumping it in "عمومی".
-    category = "general"
-
-    # Short one-line description shown next to your module's name in the
-    # compact `help` listing (distinct from help_text below).
-    desc = "توضیح کوتاه ماژول من"
-
-    # Compact help text shown in `help` (2-5 lines max)
-    help_text = "• `mycommand` — does something cool\n"
-
-    # Extended help shown via `help my_module` (optional)
-    help_extra = (
-        "🎯 **My Module - Extended Info:**\n\n"
-        "**Commands:**\n"
-        "• `mycommand` — detailed description\n"
-        "• `mycommand arg` — with arguments\n\n"
-        "**Examples:**\n"
-        "• `mycommand` → does X\n"
-        "• `mycommand foo` → does Y\n\n"
-        "**Notes:**\n"
-        "• Important edge case 1\n"
-        "• Important edge case 2\n"
-    )
-
     def setup(self, client: TelegramClient) -> None:
         self._add_handler(client, events.NewMessage(outgoing=True), self._on_msg)
 
@@ -761,15 +843,52 @@ class MyModule(Module):
         await event.edit("Hello from my_module!")
 
 
+# The metadata must be class attributes — help_handler.py reads them off
+# the instance.
+MyModule.name = name
+MyModule.category = category
+MyModule.desc = desc
+MyModule.help_text = help_text
+MyModule.help_extra = help_extra
+
+
 def create_module(context: ModuleContext) -> Module:
     return MyModule(context)
 ```
 
-3. The file is picked up automatically (hot-reload) — the module loads and
-   its commands work immediately, no restart needed, and it's automatically
-   visible in `help` / `help <module>` too — as of `3.0.13`, help visibility
-   is derived directly from the module's own attributes below, not from any
-   separate list you need to remember to update.
+### Form 2 — a package
+
+For a bigger module, make it a folder — `userbot_own/modules/packages/my_module/`:
+
+```
+my_module/
+├── __init__.py    ← create_module() + the module's public API
+├── info.py        ← the metadata (same fields as above)
+├── const.py       ← tunable numbers
+├── handlers.py    ← the Module subclass
+└── …              ← any other files you need
+```
+
+`__init__.py` does the same job as the tail of a single-file module: it
+imports the class and the metadata, copies the metadata onto the class, and
+exports `create_module(context)`.
+
+The files inside a package are yours to organise. A useful split is
+`const.py` (numbers), `info.py` (metadata), `handlers.py` (the class),
+and one file per concern for the rest — e.g. `join_left/` has
+`entities.py`, `folders.py`, `post_join.py` and `leave.py` for the four
+things it does.
+
+### Both forms
+
+4. The module is picked up automatically (hot-reload) — it loads and its
+   commands work immediately, no restart needed, and it's automatically
+   visible in `help` / `help <module>`. Help visibility is derived from
+   the module's own metadata, not from any separate list to remember to
+   update.
+
+5. `name` must match the file/folder name — the loader registers the
+   module under that name and warns if the two disagree.
 
 ### Key Module Attributes
 
@@ -778,7 +897,7 @@ def create_module(context: ModuleContext) -> Module:
 | `name` | ✅ | Short identifier (used in logs, and as the key the loader tracks this module under) |
 | `help_text` | ✅ | Compact help shown in `help` (2-5 lines) |
 | `help_extra` | ❌ | Extended help shown via `help <module_name>` |
-| `category` | ❌ | Which group this module appears under in the compact `help` output — one of `cleaning`, `forward`, `info`, `social`, `reaction`, `system`, `general` (see `modules/help_handler.py`'s `CATEGORIES` list). Defaults to `"general"` if omitted. |
+| `category` | ❌ | Which group this module appears under in the compact `help` output — one of `cleaning`, `forward`, `info`, `social`, `reaction`, `system`, `general` (see `modules/single/help_handler.py`'s `CATEGORIES` list). Defaults to `"general"` if omitted. |
 | `desc` | ❌ | Short one-line description shown next to the module's name in the compact `help` listing. Defaults to `""` if omitted. |
 
 There is no admin/permission attribute — every account is equal, and every
@@ -909,7 +1028,7 @@ A: `reaction_commands.py` registers two push-based Telethon event handlers
 the latter instead of the former). There is no polling of any kind. When
 your own reaction matches a configured emoji, the module invokes the target
 command's handler directly via a small adapter (`MockEvent`, in
-`modules/bridge.py`) rather than sending a real message — faster and avoids
+`modules/_infra/bridge.py`) rather than sending a real message — faster and avoids
 a round trip through the event loop.
 
 *(`3.0.2` note: the `UpdateMessageReactions` path was silently non-functional
@@ -973,7 +1092,7 @@ See `CHANGELOG.md` for the full rationale.
 
 A: Removed — see `CHANGELOG.md` for the version where `is_admin`,
 `is_admin_only`, and related permission checks were stripped from
-`config.py`, `modules/base.py`, `system.py`, `help_handler.py`, and the
+`config.py`, `modules/_infra/base.py`, `system.py`, `help_handler.py`, and the
 plugin loader. This is now a single-owner tool: every configured account is
 equal, and every command is available from every account.
 

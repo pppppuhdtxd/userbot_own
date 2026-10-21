@@ -192,7 +192,7 @@ def flood_seconds(exc: BaseException) -> int:
     bare ``FloodError`` base class carries no ``.seconds`` attribute, hence
     the defensive ``getattr``. Always returns at least 1.
 
-    v3.2.2 (B-01): promoted from ``modules/join_left.py``'s private
+    v3.2.2 (B-01): promoted from ``modules/packages/join_left/``'s private
     ``_flood_seconds()`` so every module shares one implementation. The
     behaviour is byte-for-byte the same as the original helper.
 

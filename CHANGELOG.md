@@ -5,6 +5,143 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.2.3] — 2026-10-21
+
+**Source:** AI — module-architecture research requested by the project owner,
+followed by a full implementation. The research phase mapped the loader, the
+registry and every inter-module dependency from the real files, then
+proposed a folder-per-module layout; the implementation followed it.
+
+**Headline:** the plugin layer is restructured. `modules/` now holds two
+module roots — `single/` (one file per module) and `packages/` (one folder
+per module) — and the loader accepts **both** forms, for core modules and
+for user-written extra modules alike. `join_left` (3,647 lines) becomes a
+package of seven focused files. Every module's help texts move out of the
+code into a dedicated **info file** that holds data and nothing else.
+
+**Behaviour is unchanged.** Every one of `join_left`'s 62 functions and
+methods was compared body-by-body against the 3.2.2 source: **61 are
+byte-identical** and the 62nd (`create_module`) differs only by a
+docstring. All ten modules' `help_text` / `help_extra` are byte-identical
+to 3.2.2.
+
+---
+
+### Added
+
+- **Two module roots, one contract.** `modules/single/` holds one logical
+  module per `.py` file; `modules/packages/` holds one logical module per
+  folder. The loader discovers both and gives them the same lifecycle
+  (`create_module(context)` → `setup(client)` → `teardown(client)`).
+  Neither form is second-class: the loader does not care which one it is
+  loading.
+- **A dedicated info file per module.** `single/<name>_info.py` and
+  `packages/<name>/info.py` hold `name`, `category`, `desc`, `help_text`
+  and `help_extra`. The info file imports **nothing** — it is pure data,
+  which makes an import cycle structurally impossible and lets the help
+  text be read and edited without opening any logic. The module imports
+  the values and copies them onto its class, because
+  `help_handler.py` and `core/loader.py` read them off the *instance*.
+  Fields are plain Python names, so more can be added later without
+  touching the loader.
+- **`modules/_infra/`** — the shared infrastructure (`base.py`,
+  `router.py`, `bridge.py`) moved into a package of its own. The leading
+  underscore is the project's existing convention for "not a plugin"
+  (the loader skips every path whose name starts with `_`), so `_infra/`
+  is invisible to discovery **without any special-casing in the
+  discovery code**.
+- **Compatibility shims.** `userbot_own/modules/base.py`, `router.py`
+  and `bridge.py` are now thin re-exports of the real files in
+  `_infra/`, so `from userbot_own.modules.base import Module` keeps
+  working — for `core/loader.py`, for `modules_extra/` plugins written
+  against the previous release, and for any third-party code.
+- **`modules_extra/` accepts both forms.** A user plugin can be
+  `my_mod.py` or `my_mod/__init__.py`; the same `enabled_modules.json`
+  entry works for both, and `.extra enable <name>` loads either.
+- **`example_module` is now a package** (`modules_extra/example_module/`
+  with `__init__.py`, `info.py`, `handlers.py`) — it doubles as the
+  template for the packaged form.
+
+### Changed
+
+- **`join_left` is a package.** 3,647 lines → seven focused files:
+
+  | File | Contents |
+  | --- | --- |
+  | `const.py` | every tunable number (delays, caps, thresholds) |
+  | `types.py` | the result records (`PostJoinResult`, `EnsureResult`, …) |
+  | `entities.py` | pulling chat identifiers out of free-form text |
+  | `folders.py` | the joined* folders and the `exclude_archived` protection |
+  | `post_join.py` | mute + archive right after a join |
+  | `leave.py` | leaving everything and resetting the folders |
+  | `handlers.py` | the `JoinLeft` class — dispatch and the join/left flows |
+  | `info.py` | the help texts and metadata |
+
+  The class is the only stateful file; every sibling is a set of free
+  functions over plain arguments, so the interesting parts (folder
+  handling, post-join actions, entity extraction) can be read without
+  walking the whole command flow.
+- **The loader maps a changed file to its module.** `_module_for_path()`
+  works out which module owns a file — a single-file module, a package's
+  `__init__.py`, a file *inside* a package, or a module's info file — so
+  editing `packages/join_left/folders.py` or `single/clearer_info.py`
+  reloads the right module. The shared infrastructure and the
+  compatibility shims are not modules and are never reloaded as one.
+
+### Fixed
+
+- **🔴 A package hot-reload served stale code.** A package ends up in
+  `sys.modules` under **two** names: the synthetic one the loader
+  imports it under (`_modules_a1.join_left`) and the real dotted one
+  Python creates the moment the package executes a relative import
+  (`userbot_own.modules.packages.join_left`, plus its `.folders`,
+  `.handlers`, … children). Purging only the synthetic name left the real
+  package cached, so a reload re-executed `__init__.py` but handed back
+  the **old** submodule objects — the edit appeared to have no effect.
+
+  This was found by testing the reload against a real package module, not
+  by reading the code — the synthetic name looks complete, and only
+  `sys.modules` shows the second registration. The cache purge now
+  removes the module under **both** names.
+
+  (The same stale-cache hazard was found and fixed for a synthetic test
+  package earlier in the same session, where the child purge alone was
+  enough; the real package exposed the second name.)
+
+- **A package's name was taken from `__init__.py`'s stem**, i.e. the
+  useless string `"__init__"`. The package's real name is its folder's
+  name. With the wrong one, the package was registered as
+  `_modules_a1.__init__` and every relative import inside it failed with
+  `No module named '_modules_a1'`.
+
+### Not changed (deliberately)
+
+- **No command, setting or behaviour changed.** `join` / `left` / `list` /
+  `folder` / `autoleave` / `clear` / `autoclear` / `autofor` / `info` /
+  `whois` / `help` / `.extra` all behave exactly as in 3.2.2.
+- **The help texts are byte-identical** to 3.2.2 — the migration only
+  moved them to a different file.
+- **`join_left`'s logic is byte-identical** — 61 of 62 function bodies
+  unchanged, the 62nd differs only by a docstring.
+- **The invariants are untouched**: `history_limit=2000`, the
+  `from_user="me"` group-only filter, atomic settings writes, and the
+  Composition-Root DI architecture.
+- **Module names did not change** — a module is still registered under
+  its file/folder name, so `reaction_commands`' cross-module lookups
+  (`get_module("clearer")`, `get_module("join_left")`, …) keep working.
+  The loader now *warns* if a module's declared `name` disagrees with the
+  name it is registered under.
+
+### Documentation
+
+- **README** — the project structure, the plugin-lifecycle section, the
+  hot-reload section, the extra-modules section and the "Writing a New
+  Module" guide were rewritten for the new layout. The writing guide now
+  shows both forms, and the hot-reload section has a table of which file
+  reloads which module.
+
+---
+
 ## [3.2.2] — 2026-10-21
 
 **Source:** AI — exhaustive seven-phase bug hunt across the whole codebase

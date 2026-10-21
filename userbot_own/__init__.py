@@ -40,7 +40,8 @@ _version_file = Path(__file__).parent.parent / "VERSION"
 # README.md's "Current version" line — see README "Versioning Guide").
 # v3.2.1: same four hand-maintained copies bumped together again.
 # v3.2.2: same four hand-maintained copies bumped together again.
-_FALLBACK_VERSION = "3.2.2"
+# v3.2.3: same four hand-maintained copies bumped together again.
+_FALLBACK_VERSION = "3.2.3"
 
 try:
     __version__ = _version_file.read_text(encoding="utf-8").strip() or _FALLBACK_VERSION

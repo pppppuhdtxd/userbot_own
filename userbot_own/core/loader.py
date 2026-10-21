@@ -82,6 +82,17 @@ _INFRASTRUCTURE_STEMS: frozenset[str] = frozenset({"base", "router", "bridge"})
 _DEBOUNCE_WINDOW = 1.5
 _DEBOUNCE_MAX_ENTRIES = 256
 
+#: v3.2.3: suffix of the metadata file that sits next to a single-file
+#: module (``clearer.py`` → ``clearer_info.py``). It is DATA, not a
+#: module, and is skipped by discovery.
+_INFO_SUFFIX = "_info"
+
+#: v3.2.3: the PACKAGE root (``.../userbot_own``), used to derive a
+#: package's real dotted module name
+#: (``userbot_own.modules.packages.join_left``) so the import cache can be
+#: purged under that name as well as the synthetic one the loader uses.
+_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+
 
 class AccountLoader:
     """
@@ -162,21 +173,128 @@ class AccountLoader:
 
     # ── Internals ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _real_package_name(path: Path) -> str | None:
+        """
+        Return the REAL dotted package name of a package-style module.
+
+        v3.2.3: a package is registered in ``sys.modules`` under two
+        names — the synthetic one the loader uses
+        (``_modules_a1.join_left``) and the real dotted one Python
+        creates itself the moment the package executes a relative import
+        (``userbot_own.modules.packages.join_left``).
+
+        This method returns the real one, so the cache purge can remove
+        both. A single-file module has no package and returns ``None``.
+
+        The name is derived from the file's location relative to the
+        project root, which is how Python itself would name it.
+        """
+        if path.stem != "__init__" or not path.parent.is_dir():
+            return None
+        try:
+            rel = path.parent.resolve().relative_to(_PACKAGE_ROOT)
+        except (ValueError, OSError):
+            return None
+        return "userbot_own." + ".".join(rel.parts)
+
+    @staticmethod
+    def _module_name_for_entry(path: Path) -> str:
+        """
+        Return the module's name for an entry-point file.
+
+        v3.2.3: a single-file module is named after its file
+        (``clearer.py`` → ``clearer``), but a package's entry point is
+        always ``__init__.py`` — whose stem is the useless string
+        ``"__init__"``. The package's real name is its FOLDER's name
+        (``join_left/__init__.py`` → ``join_left``).
+
+        Using the wrong one breaks relative imports inside the package:
+        the module would be registered as ``_modules_a1.__init__``, and
+        ``from .logic import VALUE`` would fail with
+        ``No module named '_modules_a1'`` — because the package's
+        parent package never existed under that name.
+        """
+        if path.stem == "__init__" and path.parent.is_dir():
+            return path.parent.name
+        return path.stem
+
+    @staticmethod
+    def _purge_module_cache(qual: str, real_package: str | None = None) -> None:
+        """
+        Remove *qual* and every one of its children from ``sys.modules``.
+
+        v3.2.3: a package module ends up in ``sys.modules`` under TWO
+        names, and BOTH have to go:
+
+        - ``_modules_a1.join_left`` — the synthetic name the loader
+          imports the package's ``__init__.py`` under.
+        - ``userbot_own.modules.packages.join_left`` (and its
+          ``.folders``, ``.handlers``, … children) — the REAL dotted
+          name, which Python registers on its own the moment the package
+          executes a relative import (``from .folders import …``).
+
+        Purging only the synthetic name leaves the real package cached,
+        so the next import re-executes ``__init__.py`` but hands back the
+        OLD submodule objects — a hot-reload that silently keeps running
+        the previous code. This was caught by testing the reload against
+        a real package module, not by inspection.
+
+        Args:
+            qual:          the synthetic name, e.g. ``_modules_a1.join_left``.
+            real_package:  the real dotted package name, if the module is
+                           a package. ``None`` for a single-file module.
+        """
+        prefixes = [qual]
+        if real_package:
+            prefixes.append(real_package)
+
+        for name in [
+            n for n in sys.modules
+            if any(n == p or n.startswith(p + ".") for p in prefixes)
+        ]:
+            sys.modules.pop(name, None)
+
     def _import(self, path: Path) -> tuple[Module, ModuleType] | None:
         """
-        Import a plugin file and instantiate its ``Module``.
+        Import a plugin and instantiate its ``Module``.
+
+        *path* is the module's **entry point** — a ``.py`` file for a
+        single-file module, or a package's ``__init__.py`` for a
+        package-style module. Both are loaded identically.
 
         Returns ``(instance, py_module)`` on success, ``None`` on failure.
         Errors are logged but never re-raised so a broken plugin does not
         bring down the whole account.
+
+        v3.2.3: two things changed here for package support.
+
+        1. The whole module is purged from ``sys.modules`` before the
+           import — under BOTH names it can be registered under. A
+           package's submodules (``join_left.folders``,
+           ``join_left.handlers``, …) are cached as children of the
+           package, so popping only the top-level name leaves the
+           CHILDREN cached. A hot-reload would then re-execute the
+           package's ``__init__.py`` but hand back the OLD submodule
+           objects — silently serving stale code. (Verified against a
+           real package: without the purge, an edited submodule keeps
+           its previous contents after a reload.)
+
+        2. A relative import inside a package works because
+           ``spec_from_file_location`` sets ``submodule_search_locations``
+           for a package entry point, which is what makes ``from . import
+           folders`` resolve.
         """
-        qual = f"_modules_a{self.cfg.index}.{path.stem}"
-        sys.modules.pop(qual, None)
+        qual = f"_modules_a{self.cfg.index}.{self._module_name_for_entry(path)}"
+        self._purge_module_cache(qual, self._real_package_name(path))
 
         try:
             spec = importlib.util.spec_from_file_location(qual, path)
             if spec is None or spec.loader is None:
-                raise ModuleImportError(path.stem, ValueError("Cannot create module spec"))
+                raise ModuleImportError(
+                    self._module_name_for_entry(path),
+                    ValueError("Cannot create module spec"),
+                )
 
             py_mod = importlib.util.module_from_spec(spec)
             sys.modules[qual] = py_mod
@@ -192,8 +310,23 @@ class AccountLoader:
                 self._log.warning(
                     "%s has no valid Module — skipped.", path.name
                 )
-                sys.modules.pop(qual, None)
+                self._purge_module_cache(qual, self._real_package_name(path))
                 return None
+
+            # v3.2.3: the module's own `name` should match the name it is
+            # registered under (its file/folder name). A mismatch is not
+            # fatal — the registry key is the path, not the attribute —
+            # but it is a strong hint that something was renamed on one
+            # side only, so it is surfaced rather than left to be
+            # discovered later. The same pattern help_handler.py uses for
+            # an unknown `category`.
+            entry_name = self._module_name_for_entry(path)
+            if instance.name and instance.name != entry_name:
+                self._log.warning(
+                    "Module '%s' declares name=%r but is registered as "
+                    "'%s' — the registry key is '%s'.",
+                    entry_name, instance.name, entry_name, entry_name,
+                )
 
             return instance, py_mod
 
@@ -201,7 +334,7 @@ class AccountLoader:
             raise
         except Exception as exc:
             self._log.exception("Import failed for %s: %s", path.name, exc)
-            sys.modules.pop(qual, None)
+            self._purge_module_cache(qual, self._real_package_name(path))
             return None
 
     def _do_load(self, stem: str, path: Path) -> bool:
@@ -223,7 +356,12 @@ class AccountLoader:
             self._log.exception(
                 "setup() failed for %s: %s", stem, exc
             )
-            sys.modules.pop(f"_modules_a{self.cfg.index}.{stem}", None)
+            # v3.2.3: purge the whole module (package + its submodules),
+            # not just the top-level name — see _purge_module_cache().
+            self._purge_module_cache(
+                f"_modules_a{self.cfg.index}.{stem}",
+                self._real_package_name(path),
+            )
             return False
 
         self._loaded[stem] = (instance, py_mod)
@@ -297,21 +435,173 @@ class AccountLoader:
 
     def _resolve_path(self, stem: str) -> tuple[Path, bool] | None:
         """
-        Find *stem*'s ``.py`` file, checking ``modules_dir`` first, then
+        Find *stem*'s entry point, checking ``modules_dir`` first, then
         ``extra_modules_dir``.
 
         Returns ``(path, is_extra)``, or ``None`` if not found in either
         root. Core modules always take priority — see
         ``enable_extra_module()`` for the corresponding same-name-collision
         guard on the extra-module side.
+
+        v3.2.3: a module may be a single file (``<stem>.py``) or a package
+        (``<stem>/__init__.py``). Both are accepted, in either root, and
+        the *file* form wins when both exist for the same name (the
+        package is then reported as a conflict rather than silently
+        shadowed).
         """
-        core_path = self.modules_dir / f"{stem}.py"
-        if core_path.exists():
-            return core_path, False
-        if self.extra_modules_dir is not None:
-            extra_path = self.extra_modules_dir / f"{stem}.py"
-            if extra_path.exists():
-                return extra_path, True
+        for root, is_extra in self._module_roots():
+            file_form = root / f"{stem}.py"
+            if file_form.exists():
+                return file_form, is_extra
+            pkg_form = root / stem / "__init__.py"
+            if pkg_form.exists():
+                return pkg_form, is_extra
+        return None
+
+    def _module_roots(self) -> list[tuple[Path, bool]]:
+        """
+        Return the module roots to search, as ``(directory, is_extra)``.
+
+        v3.2.3: ``modules/`` now holds two sub-roots — ``single/`` for
+        one-file modules and ``packages/`` for package-style modules —
+        and ``modules_extra/`` accepts BOTH forms so a user-written
+        plugin can be either a file or a folder.
+
+        The order is the precedence order: a single-file module in
+        ``single/`` beats a package of the same name in ``packages/``,
+        and any core module beats an extra one.
+        """
+        roots: list[tuple[Path, bool]] = []
+        for sub in ("single", "packages"):
+            candidate = self.modules_dir / sub
+            if candidate.is_dir():
+                roots.append((candidate, False))
+        if self.extra_modules_dir is not None and self.extra_modules_dir.is_dir():
+            roots.append((self.extra_modules_dir, True))
+        return roots
+
+    def _discover_modules(self, root: Path) -> list[tuple[str, Path]]:
+        """
+        Find every module in *root*, as ``(stem, entry_point)`` pairs.
+
+        v3.2.3: a module is either
+
+        - a ``.py`` file (``<stem>.py``), or
+        - a package (``<stem>/__init__.py``).
+
+        A file and a package with the same name in the same root is a
+        conflict: the file wins and the package is reported, because
+        silently loading one of them would make the other unreachable
+        and unexplainable.
+
+        Names starting with ``_`` and the shared-infrastructure stems
+        are skipped — the same rule the loader has always used.
+        """
+        found: dict[str, Path] = {}
+        packages: dict[str, Path] = {}
+
+        for path in sorted(root.glob("*.py")):
+            if path.stem.startswith("_") or path.stem in _INFRASTRUCTURE_STEMS:
+                continue
+            # v3.2.3: `<name>_info.py` is the metadata sibling of a
+            # single-file module, not a module itself. It holds no
+            # `create_module`, so it would only produce a "no valid
+            # Module — skipped" warning on every startup.
+            if path.stem.endswith(_INFO_SUFFIX):
+                continue
+            found[path.stem] = path
+
+        for path in sorted(root.glob("*/")):
+            if not path.is_dir():
+                continue
+            if path.name.startswith("_") or path.name in _INFRASTRUCTURE_STEMS:
+                continue
+            entry = path / "__init__.py"
+            if not entry.exists():
+                continue
+            packages[path.name] = entry
+
+        for name, entry in packages.items():
+            if name in found:
+                self._log.warning(
+                    "Both %s.py and %s/ exist in %s — using the .py file; "
+                    "the package is unreachable.",
+                    name, name, root.name,
+                )
+                continue
+            found[name] = entry
+
+        return sorted(found.items())
+
+    @staticmethod
+    def _entry_name(entry: Path) -> str:
+        """Return the module name for an entry point (file or package)."""
+        if entry.stem == "__init__" and entry.parent.is_dir():
+            return entry.parent.name
+        return entry.stem
+
+    def _module_for_path(self, path: Path) -> tuple[str, Path, bool] | None:
+        """
+        Work out which module a changed file belongs to.
+
+        v3.2.3: with package-style modules, a changed file is not always
+        the module itself. Given a path, this returns
+        ``(stem, root, is_extra)`` for the module that owns it, or
+        ``None`` when the file is not part of any module.
+
+        The rules:
+        - ``<root>/<stem>.py``            -> the module is ``<stem>``
+        - ``<root>/<stem>/__init__.py``   -> the module is ``<stem>``
+        - ``<root>/<stem>/anything.py``   -> the module is ``<stem>``
+          (a file inside a package belongs to that package's module)
+
+        Files that are not part of a module — the shared infrastructure
+        in ``_infra/``, the compatibility shims, ``__init__.py`` files of
+        the roots themselves — return ``None`` and are never reloaded as
+        modules.
+        """
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return None
+
+        for root, is_extra in self._module_roots():
+            root_resolved = root.resolve()
+            if resolved == root_resolved or root_resolved not in resolved.parents:
+                continue
+
+            relative = resolved.relative_to(root_resolved)
+            parts = relative.parts
+
+            if not parts:
+                continue
+
+            if len(parts) == 1:
+                # <root>/<name>.py — a single-file module, or the metadata
+                # sibling of one (`<name>_info.py` belongs to `<name>`).
+                if not parts[0].endswith(".py"):
+                    continue
+                stem = parts[0][:-3]
+                if stem.startswith("_") or stem in _INFRASTRUCTURE_STEMS:
+                    return None
+                if stem.endswith(_INFO_SUFFIX):
+                    # The metadata file belongs to the module it sits next
+                    # to — editing the help text must reload that module.
+                    owner = stem[: -len(_INFO_SUFFIX)]
+                    if not (root_resolved / f"{owner}.py").exists():
+                        return None
+                    return owner, root, is_extra
+                return stem, root, is_extra
+
+            # <root>/<name>/... — a package (or a file inside one).
+            folder = parts[0]
+            if folder.startswith("_") or folder in _INFRASTRUCTURE_STEMS:
+                return None
+            # Only a real package counts as a module.
+            if not (root_resolved / folder / "__init__.py").exists():
+                return None
+            return folder, root, is_extra
+
         return None
 
     def _on_enabled_file_changed(self, path: Path) -> None:
@@ -349,8 +639,16 @@ class AccountLoader:
         to_disable = sorted(self._enabled_extra - new_enabled)
 
         for stem in to_enable:
-            candidate = self.extra_modules_dir / f"{stem}.py"
-            if not candidate.exists():
+            # v3.2.3: the extra module may be a file or a package.
+            candidate = None
+            for option in (
+                self.extra_modules_dir / f"{stem}.py",
+                self.extra_modules_dir / stem / "__init__.py",
+            ):
+                if option.exists():
+                    candidate = option
+                    break
+            if candidate is None:
                 self._log.warning(
                     "enabled_modules.json now lists '%s', but no such "
                     "file exists in modules_extra/ — skipped.",
@@ -427,18 +725,18 @@ class AccountLoader:
 
     def list_available_extra(self) -> list[str]:
         """
-        Return every ``.py`` stem present in ``extra_modules_dir``,
+        Return every module name present in ``extra_modules_dir``,
         regardless of enabled state — i.e. "available", not "active".
+
+        v3.2.3: an extra module may be a single file (``<stem>.py``) or a
+        package (``<stem>/__init__.py``); both are listed.
 
         Returns ``[]`` if this loader wasn't configured with an
         ``extra_modules_dir`` (never raises).
         """
         if self.extra_modules_dir is None:
             return []
-        return sorted(
-            p.stem for p in self.extra_modules_dir.glob("*.py")
-            if not p.stem.startswith("_") and p.stem not in _INFRASTRUCTURE_STEMS
-        )
+        return [stem for stem, _ in self._discover_modules(self.extra_modules_dir)]
 
     def is_extra_enabled(self, stem: str) -> bool:
         """Return whether *stem* is currently in this account's enabled-set."""
@@ -457,15 +755,23 @@ class AccountLoader:
             return False, "Extra modules are not configured for this account."
         if stem in self._enabled_extra:
             return False, f"'{stem}' is already enabled."
-        path = self.extra_modules_dir / f"{stem}.py"
-        if not path.exists():
+        # v3.2.3: the extra module may be a file or a package.
+        entry = None
+        for candidate in (
+            self.extra_modules_dir / f"{stem}.py",
+            self.extra_modules_dir / stem / "__init__.py",
+        ):
+            if candidate.exists():
+                entry = candidate
+                break
+        if entry is None:
             return False, f"No such extra module: '{stem}'."
         if stem in self._loaded:
             return False, (
                 f"'{stem}' conflicts with an already-loaded module of the "
                 f"same name — refusing to shadow it."
             )
-        if not self._do_load(stem, path):
+        if not self._do_load(stem, entry):
             return False, (
                 f"'{stem}' failed to load — check this account's log for "
                 f"the import/setup error."
@@ -523,29 +829,29 @@ class AccountLoader:
         count = 0
 
         # Core modules — always loaded, unconditionally, exactly as before.
-        for path in sorted(self.modules_dir.glob("*.py")):
-            if path.stem.startswith("_") or path.stem in _INFRASTRUCTURE_STEMS:
-                continue
-            if self._do_load(path.stem, path):
-                count += 1
+        #
+        # v3.2.3: discovery now spans the module roots, and each root may
+        # hold single-file modules AND package-style modules. The roots
+        # are searched in precedence order, and the first root that
+        # provides a given name wins — so a core module can never be
+        # shadowed by an extra one of the same name.
+        loaded_stems: set[str] = set()
 
-        # Extra modules — only the ones enabled for this account.
-        if self.extra_modules_dir is not None:
-            for path in sorted(self.extra_modules_dir.glob("*.py")):
-                if path.stem.startswith("_") or path.stem in _INFRASTRUCTURE_STEMS:
-                    continue
-                if path.stem not in self._enabled_extra:
-                    continue
-                if path.stem in self._loaded:
-                    # Same stem already loaded from modules_dir — core wins,
-                    # an extra module can never shadow a core one.
-                    self._log.error(
-                        "modules_extra/%s.py has the same name as a "
-                        "core module — skipped.", path.stem,
-                    )
-                    continue
-                if self._do_load(path.stem, path):
+        for root, is_extra in self._module_roots():
+            for stem, entry in self._discover_modules(root):
+                if is_extra:
+                    # Extra modules are opt-in per account.
+                    if stem not in self._enabled_extra:
+                        continue
+                    if stem in loaded_stems:
+                        self._log.error(
+                            "modules_extra/%s has the same name as a "
+                            "core module — skipped.", stem,
+                        )
+                        continue
+                if self._do_load(stem, entry):
                     count += 1
+                    loaded_stems.add(stem)
 
         self._log.info(
             "%d plugin(s) loaded (%d extra enabled).",
@@ -781,34 +1087,34 @@ class AccountLoader:
                         k: v for k, v in self._last.items() if v > cutoff
                     }
 
-                if (
-                    path.suffix == ".py"
-                    and not path.stem.startswith("_")
-                    and path.stem not in _INFRASTRUCTURE_STEMS
-                ):
-                    parent = path.parent.resolve()
+                if path.suffix == ".py":
+                    # v3.2.3: work out which MODULE this file belongs to.
+                    #
+                    # A changed file may be:
+                    #   - a single-file module      -> the module IS the file
+                    #   - a package's entry point    -> the module IS the folder
+                    #   - a file INSIDE a package   -> the module is the
+                    #     folder that contains it
+                    #
+                    # In every case the module is reloaded as a whole,
+                    # because a module's state (settings cache, pending
+                    # actions, …) lives on the instance, not on the file.
+                    target = loader_ref._module_for_path(path)
+                    if target is not None:
+                        stem, root, is_extra = target
 
-                    # Core modules/ — unconditional hot-reload, unchanged.
-                    if parent == loader_ref.modules_dir.resolve():
+                        # modules_extra/ (v3.1.0) — hot-reload ONLY if this
+                        # stem is currently enabled. A disabled module's
+                        # file changing is deliberately a no-op: nothing is
+                        # loaded to reload, and importing it solely because
+                        # it was edited would reintroduce a per-event-adjacent
+                        # cost the enabled-set exists specifically to avoid.
+                        if is_extra and stem not in loader_ref._enabled_extra:
+                            return
+
                         asyncio.run_coroutine_threadsafe(
-                            _hot_reload(loader_ref, path.stem), loop
+                            _hot_reload(loader_ref, stem), loop
                         )
-                        return
-
-                    # modules_extra/ (v3.1.0) — hot-reload ONLY if this
-                    # stem is currently enabled. A disabled module's file
-                    # changing is deliberately a no-op: nothing is loaded
-                    # to reload, and importing it solely because it was
-                    # edited would reintroduce a per-event-adjacent cost
-                    # the enabled-set exists specifically to avoid.
-                    if (
-                        loader_ref.extra_modules_dir is not None
-                        and parent == loader_ref.extra_modules_dir.resolve()
-                    ):
-                        if path.stem in loader_ref._enabled_extra:
-                            asyncio.run_coroutine_threadsafe(
-                                _hot_reload(loader_ref, path.stem), loop
-                            )
                         return
 
                 # Extra file watch
@@ -828,19 +1134,35 @@ class AccountLoader:
                     )
 
         # Collect all directories to schedule on the observer
-        watch_dirs: set[str] = {str(self.modules_dir)}
-        if self.extra_modules_dir is not None:
-            if self.extra_modules_dir.exists():
-                watch_dirs.add(str(self.extra_modules_dir))
-            else:
-                # Observer.schedule() raises FileNotFoundError on a missing
-                # directory — degrade to "no extra-module hot-reload" rather
-                # than taking the whole watcher down with it.
-                self._log.warning(
-                    "modules_extra/ does not exist on disk — extra "
-                    "modules will still load if enabled, but hot-reload for "
-                    "them is unavailable until the directory exists."
-                )
+        #
+        # v3.2.3: every module root is watched, and so is the folder of
+        # every package-style module — a file inside a package belongs to
+        # that package's module, and changing it must hot-reload the
+        # module. The observer stays non-recursive; the package folders
+        # are scheduled explicitly, which keeps the event volume bounded
+        # (no events from unrelated sub-directories).
+        watch_dirs: set[str] = set()
+        for root, _is_extra in self._module_roots():
+            if not root.exists():
+                continue
+            watch_dirs.add(str(root))
+            for pkg in sorted(root.glob("*/")):
+                if not pkg.is_dir():
+                    continue
+                if pkg.name.startswith("_") or pkg.name in _INFRASTRUCTURE_STEMS:
+                    continue
+                if (pkg / "__init__.py").exists():
+                    watch_dirs.add(str(pkg))
+
+        if self.extra_modules_dir is not None and not self.extra_modules_dir.exists():
+            # Observer.schedule() raises FileNotFoundError on a missing
+            # directory — degrade to "no extra-module hot-reload" rather
+            # than taking the whole watcher down with it.
+            self._log.warning(
+                "modules_extra/ does not exist on disk — extra "
+                "modules will still load if enabled, but hot-reload for "
+                "them is unavailable until the directory exists."
+            )
         for watch_path, _ in self._extra_watches:
             abs_path = watch_path.resolve()
             watch_dirs.add(str(abs_path if abs_path.is_dir() else abs_path.parent))
@@ -850,9 +1172,7 @@ class AccountLoader:
         for d in watch_dirs:
             observer.schedule(handler, d, recursive=False)
 
-        base_dirs = {str(self.modules_dir)}
-        if self.extra_modules_dir is not None and str(self.extra_modules_dir) in watch_dirs:
-            base_dirs.add(str(self.extra_modules_dir))
+        base_dirs = {str(root) for root, _ in self._module_roots()}
 
         observer.start()
         self._log.info(

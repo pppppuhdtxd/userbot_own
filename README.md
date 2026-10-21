@@ -72,7 +72,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.2.1`
+**Current version:** `3.2.2`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -415,11 +415,18 @@ Create it yourself: it is git-ignored, and no `.env.example` ships with the proj
 | `BACKOFF_START` | `1` | Initial reconnect back-off in seconds — **currently has no effect** (see note) |
 | `BACKOFF_MAX` | `300` | Maximum reconnect back-off in seconds — **currently has no effect** (see note) |
 | `HISTORY_LIMIT` | `2000` | Max messages scanned by clearer / auto_clearer modules |
+| `FAST_RECONNECT_ENABLED` | `true` | Master switch for the fast-reconnect behavior (`3.1.1`) |
+| `FAST_RECONNECT_HEALTHY_INTERVAL` | `30` | Seconds between health checks when connected |
+| `FAST_RECONNECT_PROBE_INTERVAL` | `3` | Seconds between connectivity probes while backing off from an outage |
 
 > **Note:** `BACKOFF_START` and `BACKOFF_MAX` are loaded into `Settings`, but nothing
 > reads them — the reconnect back-off schedule is fixed inside `core/reconnector.py`.
 > The reconnect settings that *do* work are the `FAST_RECONNECT_*` variables (see the
 > FAQ entry on fast reconnect below). Checked in v3.1.10.
+>
+> **Note (v3.2.2):** the `FAST_RECONNECT_*` variables used to be listed only in the
+> FAQ. They are now in this table too, so the Configuration section really is the
+> single place every environment variable is documented.
 
 ---
 
@@ -470,10 +477,12 @@ one message.
 
 Execute commands by reacting to messages with emojis. Detection is entirely
 push-based (`UpdateMessageReactions` + `UpdateEditMessage` — no polling of
-any kind). Enabled by default for bots and regular users; disabled by
-default for groups/channels (toggle via the module's `ENABLE_FOR_*` class
-attributes). Configuration is per-account in
-`data/settings/account{N}/reactions.json`.
+any kind). Only **bot** chats are enabled by default; private chats with
+users, groups and channels are disabled by default and are toggled at
+runtime with the `.reaction_scope` command (the old `ENABLE_FOR_*` class
+attributes were removed in `3.0.8` — do not look for them). Configuration is
+per-account in `data/settings/account{N}/reactions.json` (the mappings) and
+`data/settings/account{N}/reaction_scope.json` (the active scopes).
 
 **Management commands (in Saved Messages only):**
 
@@ -540,7 +549,11 @@ Automatically delete bot messages based on type and scope.
 | `autoclear <type> <on/off> <1/2/3>` | Enable/disable auto-clear |
 | `autoclear status` | Show current settings (Saved Messages only) |
 
-**Types:** `pic`, `txt`, `vid`, `file`, `link`, `media` (pic+vid+file)
+**Types:** `pic`, `txt`, `vid`, `file`, `link`, `other`, `media` (pic+vid+file)
+
+`other` covers stickers, voice messages, polls, contacts, locations and
+audio files — it is **off by default**, so enable it explicitly with
+`autoclear other on 1` if you want those cleared too.
 
 **Scopes:**
 - `1` → bot messages only
@@ -924,8 +937,11 @@ one underlying change) still correctly does *not* double-execute.
 
 **Q: Can I use reaction commands on bot messages?**
 
-A: Yes, bot chats are enabled by default (`ENABLE_FOR_BOTS = True`), via the
-same two push-based handlers above — not a separate mechanism.
+A: Yes, bot chats are enabled by default, via the same two push-based
+handlers above — not a separate mechanism. The active scope set is
+configured at runtime with `.reaction_scope` (e.g. `.reaction_scope group`
+to also enable groups); the old `ENABLE_FOR_*` class attributes were
+removed in `3.0.8`.
 
 ---
 

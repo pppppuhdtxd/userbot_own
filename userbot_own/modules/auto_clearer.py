@@ -48,7 +48,6 @@ DocumentAttributeAudio. Use `autoclear other on 1` to auto-clear them.
 from __future__ import annotations
 
 import asyncio
-import time
 
 from telethon import TelegramClient, events
 from telethon.tl.types import User
@@ -57,6 +56,9 @@ from telethon.utils import get_display_name
 from userbot_own.core.context import ModuleContext
 from userbot_own.core.logging_setup import get_logger
 from userbot_own.helpers.utils import (
+    FILTER_TYPES,
+    MEDIA_TYPES,
+    MESSAGE_TYPES,
     batch_delete,
     classify_message,
     read_json_file,
@@ -69,15 +71,22 @@ log = get_logger(__name__)
 
 
 # ── Type / scope constants ────────────────────────────────────────────────────
+#
+# v3.2.2 (B-14/B-15): the type lists are no longer hand-maintained copies.
+# They come from helpers.utils, which owns the single canonical list that
+# matches what classify_message() can actually return:
+#
+#   MESSAGE_TYPES  — the six real types, in classification-priority order
+#                    (file > vid > pic > link > txt > other)
+#   MEDIA_TYPES    — the "real media" subset the `media` composite covers
+#   FILTER_TYPES   — every selectable filter target (the six types + "media")
+#
+# The old module-local `_SINGLE_TYPES` (dead — defined with a v3.1.7 comment
+# but referenced nowhere), `_MEDIA_TYPES` and `_TYPES` were three more copies
+# of the same knowledge.
 
-# F6: Added "other" to _SINGLE_TYPES — covers stickers, voice, polls, contacts,
-# locations, audio files, and any other media type not in the named categories.
-_SINGLE_TYPES: tuple[str, ...] = ("file", "vid", "pic", "link", "txt", "other")
-
-_MEDIA_TYPES: frozenset[str] = frozenset({"pic", "vid", "file"})
-
-# F6: Added "other" to _TYPES
-_TYPES: frozenset[str] = frozenset({"pic", "txt", "vid", "file", "media", "link", "other"})
+_MEDIA_TYPES = MEDIA_TYPES
+_TYPES = FILTER_TYPES
 
 _SCOPES: frozenset[int] = frozenset({1, 2, 3})
 
@@ -142,6 +151,12 @@ class AutoClearer(Module):
     def __init__(self, context: ModuleContext) -> None:
         super().__init__(context)
         self._global:   dict[str, dict]             = _default_entry()
+        # v3.2.2 (B-02): per-bot entries hold ONLY the types the user has
+        # explicitly overridden for that bot — never a full snapshot of every
+        # type. The effective settings for a bot are computed by merging:
+        #     effective = {**self._global, **self._bots.get(bot_id, {})}
+        # See _effective() and the module docstring's "Settings precedence"
+        # section for why the old full-snapshot design was wrong.
         self._bots:     dict[int, dict[str, dict]]   = {}
         self._cache:    dict[int, object]            = {}
         self._settings_file = self.cfg.settings_dir / "autoclear.json"
@@ -156,7 +171,20 @@ class AutoClearer(Module):
     # ── Settings persistence ──────────────────────────────────────────────
 
     def _load(self) -> None:
-        """Load settings from disk, auto-migrating old files missing `link` or `other`."""
+        """
+        Load settings from disk, auto-migrating old files missing `link` or `other`.
+
+        v3.2.2 (B-02): per-bot entries are now stored as OVERRIDES ONLY —
+        they contain just the types the user explicitly set for that bot.
+        Files written by 3.2.1 and earlier stored a full snapshot of every
+        type, which is indistinguishable from "the user set all of these" and
+        therefore permanently shadowed the global settings. The migration
+        below converts an old full-snapshot entry into the equivalent
+        override set: a type is kept as an override only if it actually
+        DIFFERS from the global value for that type. A type the user never
+        touched (i.e. one that equals the global) is simply dropped, so the
+        global applies to it again — which is exactly what the user meant.
+        """
         data, err = read_json_file(self._settings_file)
         if err is not None:
             self._log_error("AutoClearer load error: %s", err)
@@ -181,14 +209,29 @@ class AutoClearer(Module):
                     bid = int(bid_str)
                 except (ValueError, TypeError):
                     continue
+                if not isinstance(bsettings, dict):
+                    continue
                 entry: dict[str, dict] = {}
                 for k in _DEFAULT:
-                    src = bsettings.get(k, {})
-                    entry[k] = {
+                    src = bsettings.get(k)
+                    if not isinstance(src, dict):
+                        # Not present in this (possibly pre-3.2.2) file —
+                        # no override for this type.
+                        continue
+                    value = {
                         "state": bool(src.get("state", False)),
                         "scope": int(src.get("scope", 3)),
                     }
-                self._bots[bid] = entry
+                    # v3.2.2 (B-02): keep only genuine overrides. A stored
+                    # value identical to the global is not an override.
+                    if value != self._global[k]:
+                        entry[k] = value
+                if entry:
+                    self._bots[bid] = entry
+                else:
+                    # Everything this bot stored matched the global —
+                    # the bot has no overrides at all.
+                    migrated = True
 
             # F6: also trigger migration if "other" is missing (in addition to "link")
             old_keys = set(g.keys()) if "global" in data else set()
@@ -218,8 +261,71 @@ class AutoClearer(Module):
             self._log_error("AutoClearer save error: %s", err)
 
     def _effective(self, bot_id: int) -> dict[str, dict]:
-        """Return bot-specific settings if present, else global."""
-        return self._bots.get(bot_id, self._global)
+        """
+        Return the effective settings for *bot_id*: the global settings with
+        this bot's explicit overrides layered on top.
+
+        v3.2.2 (B-02): this is the merge that the old design was missing.
+        Previously it returned ``self._bots.get(bot_id, self._global)`` —
+        i.e. a bot entry REPLACED the global wholesale. Because a bot entry
+        used to be a full snapshot of every type, a single per-bot command
+        (say ``autoclear pic on 1``) silently disabled every globally
+        enabled type for that bot, and nothing in the UI showed it.
+
+        The merge is now: ``{**self._global, **self._bots.get(bot_id, {})}``
+        — the global applies unless the bot explicitly overrides that type.
+        """
+        overrides = self._bots.get(bot_id)
+        if not overrides:
+            return self._global
+        return {**self._global, **overrides}
+
+    def _set_bot_override(self, bot_id: int, ftype: str, value: dict) -> None:
+        """
+        Set (or clear) one type's override for a bot.
+
+        v3.2.2 (B-02): when the new value equals the global value for that
+        type, the override is REMOVED rather than stored — so a bot's
+        override set can never grow a redundant entry that shadows a later
+        global change. If the bot ends up with no overrides at all, its
+        entry is removed entirely.
+
+        Args:
+            bot_id: The bot's user id.
+            ftype:  The message type ("file", "vid", …).
+            value:  The new {"state": bool, "scope": int} for that type.
+        """
+        overrides = dict(self._bots.get(bot_id, {}))
+        if value == self._global[ftype]:
+            overrides.pop(ftype, None)
+        else:
+            overrides[ftype] = dict(value)
+        if overrides:
+            self._bots[bot_id] = overrides
+        else:
+            self._bots.pop(bot_id, None)
+
+    def _cleanup_stale_overrides(self) -> None:
+        """
+        Drop every bot override that no longer differs from the global, and
+        remove bots whose override set becomes empty.
+
+        v3.2.2 (B-02): called after a global change. An override that now
+        matches the global is redundant — the global applies anyway — so
+        keeping it would only risk shadowing a LATER global change.
+        """
+        for bot_id in list(self._bots):
+            overrides = self._bots.get(bot_id)
+            if not overrides:
+                self._bots.pop(bot_id, None)
+                continue
+            remaining = {
+                k: v for k, v in overrides.items() if v != self._global.get(k)
+            }
+            if remaining:
+                self._bots[bot_id] = remaining
+            else:
+                self._bots.pop(bot_id, None)
 
     # ── Bot chat detection ────────────────────────────────────────────────
 
@@ -256,18 +362,24 @@ class AutoClearer(Module):
         # as `txt` or `link` and the matching filter + scope=2/3 is active,
         # safe_delete would fire on the command message immediately after
         # processing — the message would vanish with no confirmation visible.
-        # Guard: if the outgoing message starts with "autoclear" and was sent
-        # within the last 5 seconds, skip auto-deletion for this event.
+        # Guard: if the outgoing message starts with "autoclear", skip
+        # auto-deletion for this event.
+        #
+        # v3.2.2 (B-10): the "sent within the last 5 seconds" condition was
+        # removed. It compared the message's SERVER timestamp against the
+        # LOCAL clock, so any machine whose clock was more than 5 s ahead of
+        # Telegram's silently lost the guard — and since _on_outgoing is
+        # registered BEFORE _on_command (Telethon dispatches callbacks in
+        # registration order), the delete attempt happens FIRST, so the
+        # command message really can vanish before the user ever sees the
+        # confirmation. The command text is distinctive enough on its own;
+        # no age check is needed to make the guard reliable.
         if is_outgoing:
             msg_text_raw = (
                 getattr(msg, "text", None) or getattr(msg, "message", None) or ""
             ).strip()
             if msg_text_raw.lower().startswith("autoclear"):
-                msg_date = getattr(msg, "date", None)
-                if msg_date is not None:
-                    age_seconds = time.time() - msg_date.timestamp()
-                    if age_seconds < 5.0:
-                        return
+                return
 
         bot = await self._is_bot_chat(event.client, event.chat_id)
         if bot is None:
@@ -351,19 +463,24 @@ class AutoClearer(Module):
         target_chat = await event.get_chat()
         if isinstance(target_chat, User) and target_chat.bot:
             bid = target_chat.id
-            if bid not in self._bots:
-                self._bots[bid] = _default_entry()
 
-            self._bots[bid][ftype]["state"] = state
-            self._bots[bid][ftype]["scope"] = scope
+            # v3.2.2 (B-02): store an OVERRIDE for this one type, not a
+            # full snapshot. _set_bot_override() drops the override again
+            # when it matches the global, and removes the bot's entry
+            # entirely once it holds no overrides.
+            self._set_bot_override(bid, ftype, {"state": state, "scope": scope})
             self._save()
+
+            # The effective value for this bot is the merged one — it is
+            # what actually governs the live auto-delete filter.
+            effective = self._effective(bid)
 
             if state:
                 proc = await event.respond(
                     f"🗑️ در حال پاک کردن پیام‌های قدیمی `{ftype}` (scope {scope})..."
                 )
                 deleted = await self._clear_past(
-                    event.client, target_chat, {ftype: self._bots[bid][ftype]}
+                    event.client, target_chat, {ftype: effective[ftype]}
                 )
                 await self._safe_edit(
                     proc,
@@ -379,6 +496,13 @@ class AutoClearer(Module):
         elif is_saved:
             self._global[ftype]["state"] = state
             self._global[ftype]["scope"] = scope
+
+            # v3.2.2 (B-02): a global change must not leave a bot's override
+            # set pointing at a stale value. Any bot override that now
+            # equals the global is no longer an override at all, so it is
+            # dropped — otherwise the bot would keep shadowing the global
+            # for a type the user never meant to differentiate.
+            self._cleanup_stale_overrides()
             self._save()
 
             if state:
@@ -398,9 +522,11 @@ class AutoClearer(Module):
                         if not first:
                             await asyncio.sleep(1.5)
                         first = False
-                        bot_setting = self._bots.get(ent.id, {}).get(
-                            ftype, self._global[ftype]
-                        )
+                        # v3.2.2 (B-02/B-17): use the SAME merged view as
+                        # the live filter (_effective), not a third,
+                        # divergent precedence rule. A bot's own override
+                        # wins; otherwise the global applies.
+                        bot_setting = self._effective(ent.id)[ftype]
                         total += await self._clear_past(
                             event.client, ent, {ftype: bot_setting}
                         )
@@ -473,8 +599,13 @@ class AutoClearer(Module):
     async def _cmd_status(self, event, client: TelegramClient) -> None:
         lines = ["📊 **وضعیت Auto-Clear:**\n", "**تنظیمات کلی:**"]
 
-        # F6: Added "other" to type_order and type_labels
-        type_order = ["file", "vid", "pic", "link", "txt", "media", "other"]
+        # v3.2.2 (B-14): the display order is derived from the canonical
+        # MESSAGE_TYPES list instead of a hand-maintained copy that had to be
+        # updated separately from every other module's copy. The "media"
+        # composite is inserted right after the real media types so the
+        # listing keeps its familiar order.
+        type_order = list(MESSAGE_TYPES)
+        type_order.insert(type_order.index("pic") + 1, "media")
         type_labels = {
             "file":   "فایل",
             "vid":    "ویدیو",
@@ -493,13 +624,25 @@ class AutoClearer(Module):
             label = type_labels.get(k, k)
             lines.append(f"  • `{k}` ({label}): {state} (Scope: {scope_desc})")
 
+        # v3.2.2 (B-02): the per-bot block now shows the MERGED effective
+        # settings — what actually governs the live filter for that bot —
+        # and marks which types are the bot's own OVERRIDE of the global.
+        #
+        # Before this fix, a bot entry was a full snapshot, so the status
+        # output listed only the types that were ON in that snapshot. A
+        # globally-enabled type that the bot's snapshot had turned off was
+        # invisible in the output while silently disabling the feature —
+        # the global block said "ON", the bot block said nothing, and the
+        # user's own messages survived because the global rule was being
+        # shadowed. Now the merged view is shown, and an explicit override
+        # is marked as such.
         active_bots = {
             bid: s for bid, s in self._bots.items()
-            if any(c["state"] for c in s.values())
+            if any(c["state"] for c in self._effective(bid).values())
         }
         if active_bots:
-            lines.append("\n**تنظیمات مخصوص بات‌ها (فقط فعال‌ها):**")
-            for bid, settings in active_bots.items():
+            lines.append("\n**تنظیمات مخصوص بات‌ها (ادغام‌شده با کلی):**")
+            for bid, overrides in active_bots.items():
                 try:
                     if bid in self._cache:
                         ent = self._cache[bid]
@@ -509,13 +652,21 @@ class AutoClearer(Module):
                     bot_name = get_display_name(ent)
                 except Exception:
                     bot_name = f"ID {bid}"
+                effective = self._effective(bid)
                 lines.append(f"  • **{bot_name}** ([ID: {bid}](tg://user?id={bid})):")
                 for k in type_order:
-                    cfg = settings.get(k, {"state": False, "scope": 3})
-                    if cfg["state"]:
-                        scope_desc = scope_labels.get(cfg["scope"], "?")
-                        label = type_labels.get(k, k)
-                        lines.append(f"    - `{k}` ({label}): ✅ ON (Scope: {scope_desc})")
+                    cfg = effective.get(k, {"state": False, "scope": 3})
+                    if not cfg["state"]:
+                        continue
+                    scope_desc = scope_labels.get(cfg["scope"], "?")
+                    label = type_labels.get(k, k)
+                    mark = "✏️ " if k in overrides else ""
+                    lines.append(
+                        f"    - {mark}`{k}` ({label}): ✅ ON (Scope: {scope_desc})"
+                    )
+                if not overrides:
+                    lines.append("    - _(مطابق تنظیمات کلی)_")
+            lines.append("\n_✏️ = تنظیم مخصوص این بات (override)_")
 
         await self._safe_edit(event, "\n".join(lines), parse_mode="Markdown")
 

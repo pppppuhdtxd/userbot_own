@@ -610,9 +610,15 @@ async def _login(index: int, cfg: dict, account_dir: Path) -> bool:
                 )
                 code_request_ok = True
                 break
-            except tl_errors.FloodWaitError as exc:
-                _warn(f"Telegram rate-limited. Waiting {exc.seconds}s...")
-                await asyncio.sleep(exc.seconds)
+            except tl_errors.FloodError as exc:
+                # v3.2.2 (B-01): the whole flood family, not just
+                # FloodWaitError. A FloodPremiumWaitError used to fall into
+                # the generic `except Exception` below and abort the login
+                # with "Failed to send code" instead of waiting out the
+                # rate limit.
+                wait = int(getattr(exc, "seconds", 0) or 0) or 1
+                _warn(f"Telegram rate-limited. Waiting {wait}s...")
+                await asyncio.sleep(wait)
             except tl_errors.PhoneNumberInvalidError:
                 _err("Phone number is not registered with Telegram.")
                 return False

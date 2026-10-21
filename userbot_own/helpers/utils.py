@@ -10,8 +10,8 @@ Contents
 - Link detection (``is_link`` — includes WebPage, URL entities, inline
   keyboard buttons with URLs, and raw URL patterns in text)
 - Message classification (``classify_message``)
-- File-info helpers (``get_file_extension``, ``get_file_size``, ``get_media_info``)
-- URL detection (``contains_any_link``)
+- File-info helpers (``get_file_extension``, ``get_file_size``)
+- Flood-error helpers (``flood_seconds``, ``FLOOD_ERRORS``) — v3.2.2 (B-01)
 
 Message Classification System (v1.6.1+)
 ----------------------------------------
@@ -115,21 +115,18 @@ __all__ = [
     "is_sticker",
     "is_audio",
     "is_file",
-    "is_non_file_media",
     # Link detection
     "is_link",
-    "get_url_buttons",
-    "iter_inline_url_buttons",
     "get_inline_button_url",
     "is_url_button",
     # Message classification
     "classify_message",
+    "MESSAGE_TYPES",
+    "MEDIA_TYPES",
+    "FILTER_TYPES",
     # File info
     "get_file_extension",
     "get_file_size",
-    "get_media_info",
-    # URL detection
-    "contains_any_link",
     # JSON settings persistence
     "read_json_file",
     "write_json_file_atomic",
@@ -141,11 +138,81 @@ __all__ = [
     # Numeric-ID entity resolution (v3.1.5)
     "resolve_entity_by_id",
     "EntityResolutionError",
+    # Flood-error helpers (v3.2.2 — B-01)
+    "flood_seconds",
+    "FLOOD_ERRORS",
 ]
 
 
 # ── Shared regex for URL detection ───────────────────────────────────────────
 _URL_RE = re.compile(r"https?://[^\s<>\"{}|\\^`\[\]]+", re.IGNORECASE)
+
+
+# ── Flood-error helpers (v3.2.2 — B-01) ──────────────────────────────────────
+#
+# Telethon's flood family is a set of SIBLINGS under errors.FloodError, not a
+# chain: FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError and
+# SlowModeWaitError all derive from FloodError directly, and none is a
+# subclass of another. `except errors.FloodWaitError` therefore silently
+# misses the other three.
+#
+# join_left.py gained the correct `except errors.FloodError` treatment in
+# v3.2.0, but the other 20 catch sites in the project were never migrated —
+# including helpers/utils.py's own delete path, which every clearing module
+# goes through. The reproduction: a bulk delete whose server response raised
+# FloodPremiumWaitError fell through `except errors.FloodWaitError` into the
+# generic `except Exception`, which triggered the one-by-one fallback, which
+# re-raised the SAME flood error once per message (100 extra API calls under
+# flood conditions) and finally reported "0 deleted" — while the identical
+# error raised as a plain FloodWaitError was correctly slept through.
+#
+# These two helpers are the shared, project-wide replacement for that
+# pattern: catch FLOOD_ERRORS (or errors.FloodError) and read the wait
+# through flood_seconds().
+
+#: Every Telethon exception that carries a flood wait. Prefer catching this
+#: tuple (or ``errors.FloodError``) over ``errors.FloodWaitError`` alone.
+FLOOD_ERRORS: tuple[type[Exception], ...] = (
+    errors.FloodWaitError,
+    errors.FloodPremiumWaitError,
+    errors.FloodTestPhoneWaitError,
+    errors.SlowModeWaitError,
+)
+
+
+def flood_seconds(exc: BaseException) -> int:
+    """
+    Seconds Telegram asks us to wait, for ANY member of Telethon's flood family.
+
+    ``errors.FloodWaitError``, ``FloodPremiumWaitError``,
+    ``FloodTestPhoneWaitError`` and ``SlowModeWaitError`` are SIBLINGS under
+    ``errors.FloodError`` — none subclasses another — so catching only
+    ``errors.FloodWaitError`` silently misses the other three. Read the wait
+    through this helper instead of touching ``exc.seconds`` directly: the
+    bare ``FloodError`` base class carries no ``.seconds`` attribute, hence
+    the defensive ``getattr``. Always returns at least 1.
+
+    v3.2.2 (B-01): promoted from ``modules/join_left.py``'s private
+    ``_flood_seconds()`` so every module shares one implementation. The
+    behaviour is byte-for-byte the same as the original helper.
+
+    Args:
+        exc: The caught exception (any flood sibling, or a plain FloodError).
+
+    Returns:
+        The wait in seconds, never less than 1.
+
+    Example:
+        >>> try:
+        ...     await client(SomeRequest())
+        ... except errors.FloodError as exc:
+        ...     await asyncio.sleep(flood_seconds(exc))
+    """
+    try:
+        seconds = int(getattr(exc, "seconds", 0) or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    return max(1, seconds)
 
 
 # ── Delete helpers ────────────────────────────────────────────────────────────
@@ -174,8 +241,13 @@ async def safe_delete(
     try:
         await client.delete_messages(entity, ids, revoke=True)
         return True
-    except errors.FloodWaitError as exc:
-        log.warning("safe_delete: FloodWait %ds.", exc.seconds)
+    except FLOOD_ERRORS as exc:
+        # v3.2.2 (B-01): catches ALL flood siblings, not just FloodWaitError.
+        # A FloodPremiumWaitError / FloodTestPhoneWaitError / SlowModeWaitError
+        # used to fall into the generic `except Exception` below and be
+        # reported as an "unexpected error" — hiding the rate limit behind
+        # a wrong diagnosis.
+        log.warning("safe_delete: FloodWait %ds.", flood_seconds(exc))
         return False
     except (
         errors.MessageDeleteForbiddenError,
@@ -274,24 +346,35 @@ async def batch_delete(
                 results = await client.delete_messages(entity, batch, revoke=True)
                 deleted += _pts_count(results)
                 break
-            except errors.FloodWaitError as exc:
+            except FLOOD_ERRORS as exc:
+                # v3.2.2 (B-01): ALL flood siblings. Previously only
+                # errors.FloodWaitError was caught, so a
+                # FloodPremiumWaitError (or SlowModeWaitError / ...)
+                # fell through to the generic `except Exception` below,
+                # which triggered the one-by-one fallback — that re-issued
+                # the SAME flood error once per message (up to 100 extra
+                # API calls, each one more likely to be flood-limited) and
+                # finally reported 0 deleted. With the whole family caught
+                # here, the batch is slept through and retried exactly like
+                # a plain FloodWaitError.
                 attempt += 1
                 if attempt > _MAX_BATCH_FW_RETRIES:
                     # v3.0.9: previously gave up silently after exactly one
                     # retry regardless of the new wait time — a second
                     # consecutive FloodWait on the same batch would drop
                     # its deletions with no further attempt. Now retries
-                    # up to a cap, honoring each new exc.seconds.
+                    # up to a cap, honoring each new wait.
                     log.error(
                         "batch_delete: FloodWait retry cap (%d) exceeded — "
                         "skipping remaining batch.", _MAX_BATCH_FW_RETRIES,
                     )
                     break
+                wait = flood_seconds(exc)
                 log.warning(
                     "batch_delete: FloodWait %ds (attempt %d/%d) — waiting…",
-                    exc.seconds, attempt, _MAX_BATCH_FW_RETRIES,
+                    wait, attempt, _MAX_BATCH_FW_RETRIES,
                 )
-                await asyncio.sleep(exc.seconds)
+                await asyncio.sleep(wait)
             except Exception as exc:
                 log.error("batch_delete: batch failed (%s) — one-by-one fallback.", exc)
                 for mid in batch:
@@ -436,17 +519,6 @@ def is_file(media) -> bool:
     return False
 
 
-def is_non_file_media(media) -> bool:
-    """
-    Return ``True`` for photo, video, sticker, or audio (not a file attachment).
-
-    Useful for distinguishing inline media from file attachments.
-    """
-    if not media:
-        return False
-    return is_photo(media) or is_video(media) or is_sticker(media) or is_audio(media)
-
-
 # ── Link detection ────────────────────────────────────────────────────────────
 
 def _non_empty_str(value) -> str | None:
@@ -503,27 +575,6 @@ def get_inline_button_url(button) -> str | None:
 def is_url_button(button) -> bool:
     """Return ``True`` if *button* is a plain inline-keyboard URL button (not login / Web-App)."""
     return get_inline_button_url(button) is not None
-
-
-def iter_inline_url_buttons(reply_markup):
-    """Yield ``(text, url)`` for every URL button in *reply_markup*.
-
-    Accepts a ``ReplyInlineMarkup`` (either Telethon generation) or anything
-    with a ``.rows`` list of rows with ``.buttons``. Non-URL buttons are
-    skipped.
-    """
-    rows = getattr(reply_markup, "rows", None) or []
-    for row in rows:
-        buttons = getattr(row, "buttons", None) or []
-        for button in buttons:
-            url = get_inline_button_url(button)
-            if url:
-                yield (getattr(button, "text", "") or "", url)
-
-
-def get_url_buttons(reply_markup) -> list:
-    """Return a list of ``(text, url)`` tuples for URL buttons in *markup*."""
-    return list(iter_inline_url_buttons(reply_markup))
 
 
 def is_link(msg) -> bool:
@@ -597,6 +648,29 @@ def is_link(msg) -> bool:
 
 
 # ── Message classification ────────────────────────────────────────────────────
+
+#: The single canonical list of message types ``classify_message()`` can
+#: return, in classification-priority order.
+#:
+#: v3.2.2 (B-14): this list was previously duplicated in FIVE places —
+#: ``auto_clearer.py``'s ``_TYPES`` / ``_SINGLE_TYPES`` / ``type_order``,
+#: ``clearer.py``'s ``TYPE_FILTERS["all"]`` / breakdown loop, and
+#: ``info_handler.py``'s ``_TYPE_LABELS`` — each a hand-maintained copy that
+#: had to be updated separately whenever a type was added to
+#: ``classify_message()``. A new type would silently be missing from
+#: ``clear all`` and from the auto-clear type list. Every module now derives
+#: its list from this one.
+MESSAGE_TYPES: tuple[str, ...] = ("file", "vid", "pic", "link", "txt", "other")
+
+#: The subset of :data:`MESSAGE_TYPES` that counts as "real media" — the
+#: ``media`` composite filter. ``link`` is deliberately NOT included: a
+#: WebPage preview is metadata, not an attachment.
+MEDIA_TYPES: frozenset[str] = frozenset({"pic", "vid", "file"})
+
+#: The types a user can select as a filter target: every real type plus the
+#: ``media`` composite.
+FILTER_TYPES: frozenset[str] = frozenset(MESSAGE_TYPES) | {"media"}
+
 
 def classify_message(msg) -> str:
     """
@@ -724,59 +798,6 @@ def get_file_size(size_bytes: int | None) -> str:
     return f"{val} {units[idx]}"
 
 
-async def get_media_info(media) -> str:
-    """
-    Build a multi-line string describing the metadata of *media*.
-
-    Returns an empty string if *media* carries no useful metadata.
-
-    Example:
-        >>> info = await get_media_info(msg.media)
-        >>> print(info)
-        ID: 1234567890
-        Size: 1.5 MB
-        Filename: document.pdf
-    """
-    lines: list[str] = []
-    if isinstance(media, MessageMediaDocument) and media.document:
-        doc = media.document
-        lines.append(f"ID: {doc.id}")
-        lines.append(f"Size: {get_file_size(doc.size)}")
-        for attr in doc.attributes:
-            if isinstance(attr, DocumentAttributeFilename):
-                lines.append(f"Filename: {attr.file_name}")
-            elif isinstance(attr, DocumentAttributeVideo):
-                lines.append(f"Duration: {attr.duration}s")
-                lines.append(f"Dimensions: {attr.w}×{attr.h}")
-                if attr.supports_streaming:
-                    lines.append("Streaming: Yes")
-            elif isinstance(attr, DocumentAttributeSticker):
-                lines.append(f"Sticker emoji: {attr.alt}")
-            elif isinstance(attr, DocumentAttributeAudio):
-                kind = "Voice" if attr.voice else "Audio"
-                lines.append(f"Type: {kind}")
-                if attr.duration:
-                    lines.append(f"Duration: {attr.duration}s")
-    elif isinstance(media, MessageMediaPhoto):
-        lines.append("Type: Photo")
-    return "\n".join(lines)
-
-
-# ── URL detection ─────────────────────────────────────────────────────────────
-
-def contains_any_link(text: str | None) -> bool:
-    """
-    Return ``True`` if *text* contains at least one HTTP/HTTPS URL.
-
-    Example:
-        >>> contains_any_link("Check out https://example.com")
-        True
-        >>> contains_any_link("No links here")
-        False
-    """
-    return bool(text and _URL_RE.search(text))
-
-
 # ── JSON settings persistence ────────────────────────────────────────────────
 #
 # Extracted in version 3.0.1 from four independent, near-identical
@@ -803,12 +824,25 @@ def read_json_file(path: Path) -> tuple[dict | None, Exception | None]:
         (None, None)   — file does not exist. This is the expected,
                          silent first-run case — callers should proceed
                          with their own defaults, not log anything.
-        (None, exc)    — file exists but could not be read or parsed.
-                         Callers should log *exc* and fall back to
-                         defaults, since this indicates real corruption
-                         rather than an expected missing-file state.
+        (None, exc)    — file exists but could not be read or parsed, or
+                         did not contain a JSON *object*. Callers should
+                         log *exc* and fall back to defaults, since this
+                         indicates real corruption rather than an
+                         expected missing-file state.
 
     Never raises.
+
+    v3.2.2 (B-04): a file whose contents are valid JSON but NOT an object
+    (``[]``, ``"text"``, ``42``, ``true``, ``null``) used to be returned as
+    ``data`` unchanged, because only *parse* errors were caught. Every
+    caller then did ``data.get(...)`` / ``data.items()`` on it and got an
+    ``AttributeError``. In ``core/loader.py`` that AttributeError escaped
+    ``AccountLoader.load_all()`` -> ``CompositionRoot.start_account()`` ->
+    ``asyncio.gather()`` in ``app/application.py`` and took the WHOLE
+    process down — one account's malformed ``enabled_modules.json`` killed
+    every other, healthy account. The same crash class existed in all five
+    per-module settings readers. Shape is now validated here, once, so a
+    non-object payload is reported as the corruption it is.
 
     Example:
         >>> data, err = read_json_file(settings_path)
@@ -820,9 +854,20 @@ def read_json_file(path: Path) -> tuple[dict | None, Exception | None]:
     if not path.exists():
         return None, None
     try:
-        return json.loads(path.read_text(encoding="utf-8")), None
-    except (json.JSONDecodeError, OSError) as exc:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
         return None, exc
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return None, exc
+    if not isinstance(data, dict):
+        # Valid JSON, wrong shape. Report it as corruption rather than
+        # handing the caller a value it will crash on.
+        return None, ValueError(
+            f"Expected a JSON object, got {type(data).__name__}"
+        )
+    return data, None
 
 
 def write_json_file_atomic(
@@ -1013,11 +1058,18 @@ async def get_profile_photos_safe(client, entity, limit: int = 1) -> list:
     ``client.download_media(photo)`` would pull bytes locally — this helper
     never does that.
 
-    ``FloodWaitError`` is deliberately re-raised (not swallowed) so callers
+    Any flood error is deliberately re-raised (not swallowed) so callers
     can surface a "please wait N seconds" message, matching the FloodWait
     convention used everywhere else in this codebase. Any other exception is
     logged and treated as "no photos available" — a fetch failure should
     degrade to text-only output, not crash the calling command.
+
+    v3.2.2 (B-01): the re-raise now covers the WHOLE flood family
+    (``FLOOD_ERRORS``), not just ``errors.FloodWaitError``. A
+    ``FloodPremiumWaitError`` used to be swallowed here and reported as
+    "no photos available", so the whois command silently produced a
+    text-only result during a rate limit instead of telling the user to
+    wait.
 
     Args:
         client: Active ``TelegramClient``.
@@ -1035,7 +1087,7 @@ async def get_profile_photos_safe(client, entity, limit: int = 1) -> list:
     try:
         photos = await client.get_profile_photos(entity, limit=limit)
         return list(photos) if photos else []
-    except errors.FloodWaitError:
+    except FLOOD_ERRORS:
         raise
     except Exception as exc:
         log.debug("get_profile_photos_safe failed for %s: %s", entity, exc)
@@ -1115,8 +1167,9 @@ async def resolve_entity_by_id(client, raw_id: int):
 
     Raises:
         EntityResolutionError: if no resolution strategy succeeds.
-        errors.FloodWaitError: re-raised as-is (never swallowed) so
-            callers can surface a "please wait N seconds" message.
+        errors.FloodError: re-raised as-is (never swallowed) so callers
+            can surface a "please wait N seconds" message. v3.2.2 (B-01):
+            the whole flood family is re-raised, not just FloodWaitError.
     """
     attempts_detail: list[str] = []
 
@@ -1146,7 +1199,7 @@ async def resolve_entity_by_id(client, raw_id: int):
                 ))
                 if result and getattr(result, "chats", None):
                     return result.chats[0]
-            except errors.FloodWaitError:
+            except FLOOD_ERRORS:
                 raise
             except Exception as exc:
                 attempts_detail.append(f"channel({channel_id}): {exc}")
@@ -1156,7 +1209,7 @@ async def resolve_entity_by_id(client, raw_id: int):
             result = await client(GetChatsRequest(id=[magnitude]))
             if result and getattr(result, "chats", None):
                 return result.chats[0]
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             raise
         except Exception as exc:
             attempts_detail.append(f"chat({magnitude}): {exc}")
@@ -1169,7 +1222,7 @@ async def resolve_entity_by_id(client, raw_id: int):
             ))
             if result:
                 return result[0]
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             raise
         except Exception as exc:
             attempts_detail.append(f"user({raw_id}): {exc}")
@@ -1180,7 +1233,7 @@ async def resolve_entity_by_id(client, raw_id: int):
     # don't specifically special-case. ──
     try:
         return await client.get_entity(raw_id)
-    except errors.FloodWaitError:
+    except FLOOD_ERRORS:
         raise
     except Exception as exc:
         attempts_detail.append(f"get_entity({raw_id}): {exc}")

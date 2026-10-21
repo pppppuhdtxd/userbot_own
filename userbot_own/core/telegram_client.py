@@ -180,28 +180,16 @@ class AccountClient:
         return self.build()
 
 
-# ── Helper: build a one-shot client ──────────────────────────────────────────
-
-def build_temp_client(cfg: AccountConfig) -> TelegramClient:
-    """
-    Build a throwaway TelegramClient for one-off operations
-    (e.g. admin ID resolution at startup).
-
-    The caller is responsible for connecting, using, and disconnecting
-    this client. It does NOT affect the main AccountClient instance.
-
-    Returns:
-        A fresh TelegramClient with direct connection settings.
-    """
-    kwargs = _build_connection_kwargs(cfg)
-    return TelegramClient(**kwargs)
+# v3.2.2 (B-22): `build_temp_client()` was removed. It had ZERO call sites
+# anywhere in the project — its docstring's "e.g. admin ID resolution at
+# startup" described a feature that no longer exists (the admin system was
+# removed long before the DI refactor).
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
 __all__ = [
     "AccountClient",
-    "build_temp_client",
     # Tuning constants (exported for inspection/override)
     "FLOOD_SLEEP_THRESHOLD",
     "REQUEST_RETRIES",

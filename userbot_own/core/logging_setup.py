@@ -353,9 +353,21 @@ def add_account_handler(
     Add a per-account log file handler.
 
     Each account gets its own rotating log file.
+
+    v3.2.2 (B-24): a handler that already exists for this account index is
+    now REPLACED rather than silently kept. The old code returned early on
+    an already-registered index, which meant an account whose log path
+    changed (or which was removed and re-added) kept writing to its OLD
+    log file — the new path was never opened, and the old sink stayed
+    registered forever. `remove_account_handler()` existed for exactly this
+    but had ZERO call sites, so the old sink was never actually released.
+    The replacement closes the stale sink before adding the new one, which
+    also means `remove_account_handler()` now has a real caller.
     """
     if account_index in _account_handlers:
-        return
+        # Release the previous sink for this account before installing the
+        # new one — otherwise the old file keeps being written to.
+        remove_account_handler(account_index)
 
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)

@@ -614,17 +614,39 @@ class ReactionCommands(Module):
 
         if cmd == "reactions":
             await self._cmd_list(event)
-        elif cmd == "reaction" and len(parts) > 1:
-            subcmd = parts[1].split(maxsplit=1)
-            if subcmd[0].lower() == "add" and len(subcmd) > 1:
-                await self._cmd_add(event, subcmd[1])
-            elif subcmd[0].lower() == "remove" and len(subcmd) > 1:
-                await self._cmd_remove(event, subcmd[1].strip())
-            elif subcmd[0].lower() == "clear":
-                await self._cmd_clear(event)
+        elif cmd == "reaction":
+            # v3.2.2 (B-20): a bare `reaction` (no sub-command) used to fall
+            # through EVERY branch below and produce NO output at all — a
+            # silent no-op for a command the user had just typed. It now
+            # shows the usage, like every other malformed invocation in this
+            # project does.
+            if len(parts) > 1:
+                subcmd = parts[1].split(maxsplit=1)
+                if subcmd[0].lower() == "add" and len(subcmd) > 1:
+                    await self._cmd_add(event, subcmd[1])
+                elif subcmd[0].lower() == "remove" and len(subcmd) > 1:
+                    await self._cmd_remove(event, subcmd[1].strip())
+                elif subcmd[0].lower() == "clear":
+                    await self._cmd_clear(event)
+                else:
+                    await self._cmd_usage(event)
+            else:
+                await self._cmd_usage(event)
         elif cmd == ".reaction_scope":
             arg = parts[1].strip() if len(parts) > 1 else ""
             await self._cmd_scope(event, arg)
+
+    async def _cmd_usage(self, event) -> None:
+        """Show the reaction-command usage (a bare or malformed `reaction`)."""
+        await self._safe_edit(
+            event,
+            "❌ **استفاده:**\n"
+            "• `reactions` | لیست reaction های فعال\n"
+            "• `reaction add <emoji> <command>` | افزودن mapping\n"
+            "• `reaction remove <emoji>` | حذف یک mapping\n"
+            "• `reaction clear` | حذف همه mapping ها\n"
+            "• `.reaction_scope` | نمایش/تغییر محدوده فعال\n"
+        )
 
     async def _cmd_list(self, event) -> None:
         # v3.1.9: liveness footer shown regardless of which branch runs

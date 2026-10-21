@@ -25,8 +25,8 @@ imported — and therefore only ever appears in `self._loaded`, `help`,
 modules are never imported, so there is no per-event "is this
 enabled?" check anywhere on the hot path; the gate is entirely a
 load-time decision. Both roots feed the *same* `self._loaded` dict, so
-every existing consumer of `list_modules()` / `get_module()` /
-`get_help_texts()` (help_handler.py, system.py's `.modules`/`.stats`)
+every existing consumer of `list_modules()` / `get_module()`
+(help_handler.py, system.py's `.modules`/`.stats`)
 needed zero changes for this. See `enable_extra_module()` /
 `disable_extra_module()` for the runtime toggle path, and
 `_on_enabled_file_changed()` for what happens when the JSON file is
@@ -75,6 +75,12 @@ log = get_logger(__name__)
 #: they're added here too, and all three checks now reference this single
 #: set instead of three independent hardcoded comparisons.
 _INFRASTRUCTURE_STEMS: frozenset[str] = frozenset({"base", "router", "bridge"})
+
+#: File-watcher debounce: the window within which a repeated event for the
+#: same path is ignored, and the maximum number of remembered paths before
+#: the stale ones are pruned (v3.2.2 — B-28).
+_DEBOUNCE_WINDOW = 1.5
+_DEBOUNCE_MAX_ENTRIES = 256
 
 
 class AccountLoader:
@@ -126,8 +132,8 @@ class AccountLoader:
 
         # stem → (Module instance, Python module object). Populated from
         # BOTH modules_dir and extra_modules_dir — deliberately one dict,
-        # not two, so every existing reader (list_modules(), get_module(),
-        # get_help_texts()) keeps working unchanged regardless of which
+        # not two, so every existing reader (list_modules(), get_module())
+        # keeps working unchanged regardless of which
         # root a given stem came from.
         self._loaded: dict[str, tuple[Module, ModuleType]] = {}
         self._log:    logging.Logger = get_logger(f"loader.account{context.cfg.index}")
@@ -408,27 +414,10 @@ class AccountLoader:
         """
         return self._client
 
-    def unload_module(self, stem: str) -> bool:
-        """
-        Unload a single plugin by its file stem without reloading it.
-
-        Calls ``teardown()`` on the module instance and removes it from the
-        loaded set, but does NOT re-import or re-call ``setup()`` — unlike
-        ``reload_module()``, which unloads and immediately reloads. Use this
-        when a module should simply stop running (e.g. as part of removing
-        an account entirely), not when it should be refreshed from disk.
-
-        Args:
-            stem: The module file stem to unload.
-
-        Returns:
-            ``True`` if the module was loaded and is now unloaded,
-            ``False`` if it was not loaded to begin with.
-        """
-        if stem not in self._loaded:
-            return False
-        self._do_unload(stem)
-        return True
+    # v3.2.2 (B-23): `unload_module()` was removed. It had ZERO call sites
+    # in the project. Its "unload one module without reloading it" role is
+    # now covered by `reload_module()`'s new deleted-file path (B-05),
+    # which unloads a module whose file is gone.
 
     # ── Extra-module control (v3.1.0) ───────────────────────────────────────
     #
@@ -500,18 +489,10 @@ class AccountLoader:
         self._save_enabled_extra()
         return True, f"'{stem}' disabled."
 
-    def unload_all(self) -> None:
-        """
-        Unload every currently loaded plugin.
-
-        Calls ``teardown()`` on each module instance and clears the loaded
-        set entirely. Intended for full cleanup before shutdown or before
-        removing an account, where every module's handlers must be torn
-        down and nothing should be reloaded afterward.
-        """
-        for stem in list(self._loaded.keys()):
-            self._do_unload(stem)
-        self._log.info("All plugins unloaded.")
+    # v3.2.2 (B-23): `unload_all()` was removed. It had ZERO call sites —
+    # `load_all()` already unloads every plugin before loading them again,
+    # and shutdown tears the client down wholesale, so nothing ever needed
+    # a standalone "unload everything" call.
 
     def load_all(self, client: TelegramClient) -> None:
         """
@@ -591,7 +572,20 @@ class AccountLoader:
         """
         resolved = self._resolve_path(stem)
         if resolved is None:
-            self._log.error("Module file not found: %s.py", stem)
+            # v3.2.2 (B-05): the file is gone (deleted on disk). The
+            # module must be UNLOADED, not left loaded. The watchdog's
+            # `on_deleted` handler calls this, and the old code only
+            # logged "Module file not found" and returned False — so
+            # deleting a module file left it loaded, its handlers still
+            # registered on the client, its old code still running, and
+            # it still listed in `help` / `.modules` / `.stats` until the
+            # next full restart. The create/modify paths did reload
+            # correctly, so this was an inconsistency between paths.
+            if stem in self._loaded:
+                self._do_unload(stem)
+                self._log.info("Module file %s.py was removed — unloaded.", stem)
+            else:
+                self._log.error("Module file not found: %s.py", stem)
             return False
         path, is_extra = resolved
         if is_extra and stem not in self._enabled_extra:
@@ -603,30 +597,10 @@ class AccountLoader:
         self._do_unload(stem)
         return self._do_load(stem, path)
 
-    def reload_all(self) -> dict[str, bool]:
-        """
-        Reload all plugins — both currently loaded and any new ``.py`` files
-        that appeared on disk since the last load (core modules
-        unconditionally; extra modules only if already enabled).
-
-        Returns:
-            A dict mapping each stem to ``True`` (loaded) / ``False`` (failed).
-        """
-        existing = set(self._loaded.keys())
-        on_disk = {
-            p.stem
-            for p in self.modules_dir.glob("*.py")
-            if not p.stem.startswith("_") and p.stem not in _INFRASTRUCTURE_STEMS
-        }
-        if self.extra_modules_dir is not None:
-            on_disk |= {
-                p.stem
-                for p in self.extra_modules_dir.glob("*.py")
-                if not p.stem.startswith("_")
-                and p.stem not in _INFRASTRUCTURE_STEMS
-                and p.stem in self._enabled_extra
-            }
-        return {stem: self.reload_module(stem) for stem in sorted(existing | on_disk)}
+    # v3.2.2 (B-23): `reload_all()` was removed. It had ZERO call sites —
+    # hot-reload is per-file (the watchdog calls `reload_module()` for the
+    # single changed stem), and a full restart of every module was never
+    # triggered from anywhere.
 
     def reattach(self, new_client: TelegramClient) -> None:
         """
@@ -707,9 +681,10 @@ class AccountLoader:
         """Return all currently loaded ``Module`` instances."""
         return [inst for inst, _ in self._loaded.values()]
 
-    def get_help_texts(self) -> list[str]:
-        """Return all non-empty help texts from loaded modules."""
-        return [inst.help_text for inst, _ in self._loaded.values() if inst.help_text]
+    # v3.2.2 (B-23): `get_help_texts()` was removed. It had ZERO call sites —
+    # help_handler.py builds its own listing straight from the module
+    # instances (v3.0.13 moved category/desc onto the module itself and
+    # made the loader's own helper unnecessary).
 
     # ── External file watches ─────────────────────────────────────────────
 
@@ -791,9 +766,20 @@ class AccountLoader:
                 now = time.monotonic()
                 key = str(path)
                 # Debounce — ignore events within 1.5 s of the last one
-                if now - self._last.get(key, 0.0) < 1.5:
+                if now - self._last.get(key, 0.0) < _DEBOUNCE_WINDOW:
                     return
                 self._last[key] = now
+                # v3.2.2 (B-28): the debounce map used to grow without
+                # bound — one entry per distinct path ever touched, kept
+                # for the lifetime of the process. On a long-running
+                # Termux deployment that is a slow leak. Entries older
+                # than the debounce window can never suppress anything
+                # again, so they are simply forgotten.
+                if len(self._last) > _DEBOUNCE_MAX_ENTRIES:
+                    cutoff = now - _DEBOUNCE_WINDOW
+                    self._last = {
+                        k: v for k, v in self._last.items() if v > cutoff
+                    }
 
                 if (
                     path.suffix == ".py"

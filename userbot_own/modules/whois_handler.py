@@ -71,7 +71,7 @@ from __future__ import annotations
 
 import time
 
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, events
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetFullChatRequest
 from telethon.tl.functions.users import GetFullUserRequest
@@ -84,7 +84,9 @@ from telethon.tl.types import (
 
 from userbot_own.core.context import ModuleContext
 from userbot_own.helpers.utils import (
+    FLOOD_ERRORS,
     EntityResolutionError,
+    flood_seconds,
     format_user_flags,
     format_user_status,
     get_profile_photos_safe,
@@ -190,9 +192,9 @@ class WhoisHandler(Module):
             info_text, entity = await self._whois_current_chat(client, event.chat_id)
             await self._finalize(event, client, info_text, entity)
 
-        except errors.FloodWaitError as exc:
-            wait_msg = f"⏳ درخواست بیش از حد — لطفاً {exc.seconds} ثانیه صبر کنید."
-            self._log_warning("Whois FloodWait %ds.", exc.seconds)
+        except FLOOD_ERRORS as exc:
+            wait_msg = f"⏳ درخواست بیش از حد — لطفاً {flood_seconds(exc)} ثانیه صبر کنید."
+            self._log_warning("Whois FloodWait %ds.", flood_seconds(exc))
             await self._safe_edit(event, wait_msg)
         except Exception as exc:
             self._log_error("Whois error: %s", exc)
@@ -236,7 +238,7 @@ class WhoisHandler(Module):
                 "Numeric ID resolution failed for %s: %s", identifier, exc.detail
             )
             return exc.user_message, None
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             raise
         except Exception as exc:
             return f"❌ **یافت نشد:** `{identifier}`\n\nخطا: `{exc}`", None
@@ -323,15 +325,37 @@ class WhoisHandler(Module):
         entity object even exists — covers the common case of the exact
         same numeric identifier being looked up twice in a row. Checks
         both User and Channel key shapes since we don't yet know the type.
+
+        v3.2.2 (B-09): the "-100-stripped" form the docstring promised was
+        never actually probed. The old code only checked ``raw_id`` and
+        ``abs(raw_id)`` — and ``abs(-1001234567890)`` is ``1001234567890``,
+        NOT the internal channel id ``1234567890``. So the public ``-100…``
+        form — the exact form ``whois`` PRINTS for a channel
+        (``public_id = int(f"-100{channel.id}")``) and the form the README
+        tells users they can paste back — never hit the cache and re-issued
+        the full GetFull*Request + profile-photo round trip every time.
+        ``resolve_entity_by_id()`` already strips the prefix correctly; the
+        cache probe now does the same.
         """
+        # Candidate ids this raw value could correspond to:
+        #   raw_id                 — the internal form (e.g. 1234567890)
+        #   -100-stripped          — the public form   (e.g. -1001234567890)
+        #   abs() of either        — the magnitude fallback
+        candidates: list[int] = []
+        for value in (raw_id, abs(raw_id)):
+            if value not in candidates:
+                candidates.append(value)
+        # The public "-100…" form: strip the prefix to get the internal id.
+        if raw_id <= -100:
+            stripped = int(str(raw_id)[4:]) if str(raw_id)[4:] else 0
+            if stripped and stripped not in candidates:
+                candidates.append(stripped)
+
         for prefix in ("User", "Channel", "Chat"):
-            hit = self._get_cached(f"{prefix}:{raw_id}")
-            if hit is not None:
-                return hit
-            # Also check the -100-stripped / magnitude form for channels.
-            hit = self._get_cached(f"{prefix}:{abs(raw_id)}")
-            if hit is not None:
-                return hit
+            for candidate in candidates:
+                hit = self._get_cached(f"{prefix}:{candidate}")
+                if hit is not None:
+                    return hit
         return None
 
     def _store_cache(self, cache_key: str, info_text: str, entity) -> None:
@@ -394,7 +418,7 @@ class WhoisHandler(Module):
             try:
                 photos = await get_profile_photos_safe(client, entity, limit=1)
                 photo = photos[0] if photos else None
-            except errors.FloodWaitError:
+            except FLOOD_ERRORS:
                 raise
             except Exception as exc:
                 self._log_debug("get_profile_photos_safe failed for %s: %s", entity, exc)
@@ -406,7 +430,7 @@ class WhoisHandler(Module):
                 await event.delete()
                 await client.send_file(chat, file=photo, caption=info_text)
                 return
-            except errors.FloodWaitError:
+            except FLOOD_ERRORS:
                 raise
             except Exception as exc:
                 # The placeholder may already be deleted at this point; if
@@ -500,7 +524,7 @@ class WhoisHandler(Module):
             if getattr(full, "contact", False):
                 lines.append("• **مخاطب:** ✅ در لیست مخاطبین شما")
 
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             raise
         except Exception as exc:
             self._log_debug("GetFullUserRequest failed for %d: %s", user.id, exc)
@@ -633,7 +657,7 @@ class WhoisHandler(Module):
                         lines.append(f"• **چت مرتبط:** @{linked_username} ({linked_title})")
                     else:
                         lines.append(f"• **چت مرتبط:** `{linked_title}` (ID: `{linked_chat_id}`)")
-                except errors.FloodWaitError:
+                except FLOOD_ERRORS:
                     # v3.0.9 fix: this used to be swallowed by the bare
                     # except below, unlike every other FloodWait in this
                     # module, which is deliberately re-raised so the
@@ -650,7 +674,7 @@ class WhoisHandler(Module):
                 if invite_link:
                     lines.append(f"• **لینک دعوت:** `{invite_link}`")
 
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             raise
         except Exception as exc:
             self._log_debug("GetFullChannelRequest failed for %d: %s", channel.id, exc)
@@ -731,7 +755,7 @@ class WhoisHandler(Module):
                 if invite_link:
                     lines.append(f"• **لینک دعوت:** `{invite_link}`")
 
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             raise
         except Exception as exc:
             self._log_debug("GetFullChatRequest failed for %d: %s", chat.id, exc)

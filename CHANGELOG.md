@@ -5,6 +5,322 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.2.2] — 2026-10-21
+
+**Source:** AI — exhaustive seven-phase bug hunt across the whole codebase
+(41 files, ~17k lines), ordered by the project owner after 3.2.1. Every
+candidate finding was **reproduced in a live Python/Telethon 1.45.0
+harness before being fixed** — none of the four headline bugs below is
+theoretical.
+
+**Headline:** the `errors.FloodError` sibling fix that 3.2.0 applied to
+`join_left.py` was never applied to the shared delete path every clearing
+module goes through; a per-bot setting could permanently shadow a global
+one; the entity extractor returned links in the wrong order and silently
+dropped scheme-less invite links; and one malformed settings file could
+take the whole bot — every account — down.
+
+**Findings:** 40 (4 critical · 7 high · 9 medium · 8 low · 12 dead-code/docs).
+
+---
+
+### 🔴 Critical
+
+- **B-01 — The flood-sibling fix was never applied outside `join_left.py`.**
+  Telethon's flood family is a set of **siblings** under `errors.FloodError`,
+  not a chain: `FloodWaitError`, `FloodPremiumWaitError`,
+  `FloodTestPhoneWaitError` and `SlowModeWaitError` all derive from
+  `FloodError` directly, and none subclasses another. 3.2.0 taught
+  `join_left.py` to catch `errors.FloodError` — but **20 other catch sites
+  across the project still caught only `errors.FloodWaitError`**, including
+  `helpers/utils.py`'s own `safe_delete()` / `batch_delete()`, which every
+  clearing module goes through.
+
+  *Reproduced:* a bulk delete whose server response raised
+  `FloodPremiumWaitError` fell through `except errors.FloodWaitError`
+  into the generic `except Exception`, which triggered the one-by-one
+  fallback — that re-issued the **same** flood error once per message (up
+  to 100 extra API calls, each one more likely to be flood-limited) and
+  finally reported **"0 deleted"**. The identical error raised as a plain
+  `FloodWaitError` was correctly slept through and retried. Same request,
+  opposite behaviour, decided purely by which sibling the server picked.
+
+  `join_left.py`'s private `_flood_seconds()` is now promoted to
+  `helpers/utils.py` as `flood_seconds()` (with a `FLOOD_ERRORS` tuple
+  alongside it), and **every** flood catch site in the project now catches
+  the whole family and reads the wait through it. The affected sites:
+  `helpers/utils.py` (`safe_delete`, `batch_delete`,
+  `get_profile_photos_safe`, all four `resolve_entity_by_id` strategies),
+  `modules/clearer.py`, `modules/info_handler.py`, `modules/whois_handler.py`
+  (8 sites), `modules/join_left.py`, `core/reconnector.py`, and
+  `account_management/cli.py`. Verified: the same reproduction now costs
+  **2** API calls instead of 6, and the batch is retried as a single call.
+
+  This also fixes a *reconnection* bug: `core/reconnector.py` treated a
+  `FloodPremiumWaitError` as a generic "unexpected verification error" and
+  escalated straight into a client rebuild, where it now waits out the
+  rate limit.
+
+- **B-02 — A per-bot setting permanently shadowed the global one.**
+  `auto_clearer.py` and `auto_forwarder.py` each stored a per-bot entry
+  that was a **full snapshot of every type**, created on the bot's first
+  per-bot command. The effective settings were
+  `self._bots.get(bot_id, self._global)` — a bot entry *replaced* the
+  global wholesale. So one per-bot command (`autoclear pic on 1`) silently
+  disabled **every globally enabled type** for that bot, permanently, and
+  the status command made it invisible: the global block said "ON" and the
+  per-bot block listed only what was ON, so both looked correct.
+
+  *Reproduced:* global `txt` ON + a per-bot `pic` command → that bot's
+  `txt` was OFF while the UI showed the global as ON.
+
+  **New model (both modules):** a per-bot entry stores **only the types the
+  user explicitly overrode**, and the effective settings are merged at
+  read time:
+
+  ```python
+  effective = {**self._global, **self._bots.get(bot_id, {})}
+  ```
+
+  An override that is set back to the global's value is **removed** rather
+  than stored, and a bot whose override set becomes empty is removed from
+  the registry entirely. A global change also prunes any bot override that
+  has become redundant.
+
+  *Verified:* global "clear photos" still applies to a bot that only
+  overrode "text"; a scope difference (`scope 1` vs `scope 3`) is correctly
+  kept as a real override; an override matching the global is dropped; the
+  last override removed deletes the bot's entry. Files written by 3.2.1 and
+  earlier are migrated on load: a stored value that **differs** from the
+  global is kept as an override, and a type the user never touched now
+  inherits the global instead of being frozen at "off".
+
+  Both status commands now show the **merged** reality and mark genuine
+  overrides with `✏️`, so a global rule that a bot is overriding is
+  visible rather than hidden.
+
+- **B-03 — The entity extractor returned links in the wrong order and
+  dropped scheme-less invite links.**
+  `extract_telegram_entities()` ran **five independent regex passes**,
+  each appending to one list — so the result was grouped *by pattern*, not
+  by position. The v3.1.8 "I4" fix claimed *"links now appear in exactly
+  the order they were found in the message"*, but the invite-link pass ran
+  after the username pass and the numeric pass ran last of all.
+
+  *Reproduced:* `"https://t.me/+AbCdEfGhIjKl then https://t.me/someuser"`
+  returned `[('username','someuser'), ('invite_link', …)]` — swapped. A
+  numeric ID and an invite link both jumped to the end of the list,
+  silently changing the order the user asked to join in.
+
+  Two further defects in the same function: the invite-link and
+  private-channel patterns **required** an `https?://` scheme, so
+  `t.me/+AbCdEfGhIjKl` and `t.me/joinchat/AbCdEfGhIjKl` (the form
+  Telegram's own "Copy Link" button produces in some clients) matched
+  **nothing at all** — the user got "ℹ️ هیچ لینک، یوزرنیم یا ID تلگرامی
+  یافت نشد."; and `t.me/c/<id>/<msg>` was classified as a bare numeric ID
+  instead of a private-channel link, sending it down a different join path.
+
+  The function is now **one combined left-to-right scan** over a single
+  alternation pattern, so the ordering is positional by construction, and
+  the scheme is optional in every form. All four documented forms
+  (`t.me/username`, `t.me/+hash`, `t.me/joinchat/hash`,
+  `t.me/c/<id>/<msg>`) now parse, with or without the scheme, and in the
+  order they appear.
+
+- **B-04 — One malformed settings file could kill the whole bot.**
+  `read_json_file()` caught only *parse* errors, so a file whose contents
+  were valid JSON but not an object (`[]`, `"text"`, `42`) was returned as
+  `data` unchanged. Every caller then did `data.get(...)` on it and got an
+  `AttributeError`.
+
+  *Reproduced:* a single account's `enabled_modules.json` containing `[]`
+  raised out of `AccountLoader.load_all()` → `start_account()` →
+  `asyncio.gather()` in `app/application.py` → `main()` re-raised → **the
+  process exited, taking every other healthy account with it**. The same
+  crash class existed in all five per-module settings readers, where it
+  instead killed a module's `setup()` (silently disabling `join`/`left`/
+  `list`/`folder` entirely, or resetting the reaction scope).
+
+  `read_json_file()` now validates the shape once and reports a non-object
+  payload as the corruption it is. All six sites are fixed by that one
+  change. Verified: a corrupt `enabled_modules.json` now logs
+  `"Expected a JSON object, got list"`, the account starts with no extra
+  modules, and **both accounts survive**.
+
+### 🟠 High
+
+- **B-05 — Deleting a module file left a zombie module running.**
+  `reload_module()` logged `"Module file not found"` and returned `False`
+  when the file was gone — it never unloaded the module. The watchdog's
+  `on_deleted` handler calls exactly this, so deleting a module file left
+  it loaded, its handlers still registered on the client, its old code
+  still running, and it still listed in `help` / `.modules` / `.stats`
+  until the next full restart. The create/modify paths reloaded correctly,
+  so this was an inconsistency *between* paths. The file is now unloaded
+  when it disappears.
+- **B-06 — The same crash in the enabled-file watcher.** A non-object
+  `enabled_modules.json` raised inside `_on_enabled_file_changed()`;
+  the watchdog callback caught it, but the change was silently dropped and
+  the on-disk state and the running state diverged permanently. Fixed by
+  B-04.
+- **B-07 — Internal debug values were rendered in the user-facing chat
+  message.** Every `clear` run printed `_(debug: private=…, from_user_filter=…)_`
+  in the group. The v3.1.8 "G7" instrumentation was designed for the log
+  (the log line was always there); the chat copy put implementation detail
+  in front of every user in every group. The values are now **log-only**.
+- **B-08 — The `exclude_archived` reconcile was skipped on failed
+  batches.** The reconcile lived inside `if post_results:`, so a `join`
+  batch in which *every* entity failed (all links invalid, all
+  flood-waited) never ran it — leaving the user's folders unprotected with
+  no report. It now runs on every batch, joined or not. (Related: the
+  summary's folder counts are now reported whether or not any chat was
+  joined.)
+- **B-09 — The public `-100…` ID form never hit the whois cache.**
+  `whois` *prints* the public form for channels
+  (`public_id = int(f"-100{channel.id}")`) and the README tells users they
+  can paste it back — but `_get_cached_by_raw_id()` only probed `raw_id`
+  and `abs(raw_id)`, and `abs(-1001234567890)` is `1001234567890`, **not**
+  the internal id `1234567890`. The `-100` prefix was never stripped, so
+  every `whois -100…` re-issued the full `GetFull*Request` + photo
+  round-trip, defeating the stated FloodWait mitigation. The probe now
+  strips the prefix exactly as `resolve_entity_by_id()` already did.
+- **B-10 — The auto-clearer self-delete guard was defeated by clock skew.**
+  The guard skipped auto-deleting the `autoclear` command message only if
+  it was **less than 5 seconds old**, comparing the message's *server*
+  timestamp against the *local* clock. On a machine more than 5 s ahead of
+  Telegram's the guard silently lapsed — and since `_on_outgoing` is
+  registered *before* `_on_command` (Telethon dispatches in registration
+  order), the delete attempt happens first, so the command message really
+  could vanish before the user saw the confirmation. The age check is
+  gone; the command text alone is distinctive enough.
+- **B-11 — `auto_forwarder.py` kept a private copy of `is_audio()`.**
+  A byte-for-byte re-implementation of the shared
+  `helpers.utils.is_audio()`, sitting next to an import of the shared
+  `is_photo` in the same file — the exact "two copies of a media
+  predicate drift apart" shape this project has been bitten by before. It
+  is now a thin delegation.
+
+### 🟡 Medium
+
+- **B-12 — `autofor all` did not cover link messages.** A message with a
+  WebPage preview is neither a photo nor a document, so `_content_type()`
+  returned `None` and it was **never forwarded** — while `all` advertises
+  itself as covering every type except caption. `classify_message()`
+  classifies the very same message as `link`, so the two disagreed.
+  `link` is now a real type, handled on the same immediate path as `txt`.
+- **B-13 — Two different definitions of "file".** `auto_forwarder`'s
+  `_content_type()` returned `"file"` for *any* document with no
+  sticker/video/audio attribute, including a document with **no filename**
+  at all — which the shared `is_file()` does not consider a file. A
+  filename-less document was classified `file` there but `other` by
+  `classify_message()`. The shared helper is now the single authority.
+- **B-14 — The message-type list was duplicated in five places.**
+  `auto_clearer.py` (`_TYPES`, `_SINGLE_TYPES`, `type_order`),
+  `clearer.py` (`TYPE_FILTERS["all"]`, the breakdown loop) and
+  `info_handler.py` (`_TYPE_LABELS`) each held a hand-maintained copy. A
+  new type added to `classify_message()` would have been silently missing
+  from `clear all`. The canonical list now lives in `helpers.utils` as
+  `MESSAGE_TYPES` / `MEDIA_TYPES` / `FILTER_TYPES`, and every module
+  derives from it.
+- **B-15 — `_SINGLE_TYPES` was dead code** (defined with a v3.1.7
+  comment, referenced nowhere). Removed.
+- **B-16 — A sixth copy of the type list**, in `clearer.py`'s breakdown
+  loop. Now derived from `MESSAGE_TYPES`.
+- **B-17 — A third precedence rule in the auto-clearer sweep.** The
+  "clear old messages in all bots" path read the per-bot setting with
+  `self._bots.get(ent.id, {}).get(ftype, self._global[ftype])` — a rule
+  that differed from `_effective()`. It now uses the same merged view as
+  the live filter, so there is exactly one precedence rule.
+- **B-18 — `joined_entities` was dead.** It was appended to in three
+  places and never read — the v3.2.0 refactor replaced its use with
+  `post_results` and left the list behind. Removed.
+- **B-19 — Every reaction-triggered `left` wrote a bogus ERROR line.**
+  `MockEvent.message.id` is the deliberate placeholder `0` (a real id
+  would make the reacted-to message immune to its own reaction-triggered
+  clear), so the post-leave cleanup tried to delete message id 0 —
+  rejected by Telegram, logged as "permission denied" every single time.
+  The call is now skipped when there is no real command message.
+- **B-20 — A bare `reaction` command did nothing at all.** It fell
+  through every branch of the dispatcher and produced **no output** — a
+  silent no-op for a command the user had just typed. It now shows the
+  usage, like every other malformed invocation in the project.
+
+### 🔵 Low
+
+- **B-21 — `core/events.py` was an orphan.** The v3.0.11 CHANGELOG and
+  `reconnector.py`'s own docstring both state the `EventBus` was
+  *removed* — but the 117-line file was never deleted and nothing imported
+  it. Removed.
+- **B-22 — `build_temp_client()` had zero call sites.** Its docstring's
+  *"e.g. admin ID resolution at startup"* described a feature that no
+  longer exists. Removed.
+- **B-23 — Four dead loader methods.** `unload_module()`, `unload_all()`,
+  `reload_all()` and `get_help_texts()` had no callers anywhere.
+  `get_help_texts()` was still referenced in the loader's own docstring as
+  though it were live. Removed.
+- **B-24 — Per-account log sinks were never released.**
+  `remove_account_handler()` had zero call sites, and
+  `add_account_handler()` returned early for an already-registered index —
+  so an account whose log path changed kept writing to its **old** file,
+  and the old sink stayed registered forever. The new handler now
+  replaces the old one, which gives `remove_account_handler()` a real
+  caller.
+- **B-25 — `watcher.py` stored an `_accounts_dir` it never read.**
+  Removed.
+- **B-26 — `reconnector.py` wrote a `_last_state` it never read.** The
+  detected state is already logged directly. Removed.
+- **B-27 — Four dead helpers in `helpers/utils.py`.**
+  `is_non_file_media()`, `get_url_buttons()`, `iter_inline_url_buttons()`
+  and `get_media_info()` had no callers (all four were exported in
+  `__all__` and advertised in the module docstring). Removed.
+- **B-28 — The watcher debounce map grew without bound.** One entry per
+  distinct path ever touched, kept for the lifetime of the process — a
+  slow leak on a long-running Termux deployment. Stale entries are now
+  pruned.
+
+### 📄 Documentation
+
+- **D-01 / D-02 — The README pointed at a class attribute that no longer
+  exists.** *"toggle via the module's `ENABLE_FOR_*` class attributes"* and
+  *"`ENABLE_FOR_BOTS = True`"* were written before v3.0.8 replaced them
+  with the runtime `.reaction_scope` command. Both now describe the
+  command that actually exists.
+- **D-03 — The Auto-Clearer type list in the README was missing
+  `other`** — the only way to clear stickers, voice messages and polls, and
+  the one the module's own help text points at. Now listed, with a note
+  that it is off by default.
+- **D-04 — The `FAST_RECONNECT_*` variables were documented only in the
+  FAQ.** The Configuration section is meant to be the canonical list of
+  every environment variable, so they are now in the main table too.
+- **D-05 — `jdatetime` was an unused dependency.** It was listed as
+  *"Jalali/Persian date support (used in modules)"* — and imported by
+  nothing in the project. Removed from `requirements.txt` (and therefore
+  from the One-Click install).
+
+### 🧹 New shared helpers
+
+- `helpers.utils.flood_seconds(exc)` — the wait in seconds for **any**
+  flood sibling, never less than 1. Promoted from `join_left.py`'s
+  private `_flood_seconds()` so every module shares one implementation.
+- `helpers.utils.FLOOD_ERRORS` — the tuple of all four flood exception
+  classes, for `except FLOOD_ERRORS:`.
+- `helpers.utils.MESSAGE_TYPES` / `MEDIA_TYPES` / `FILTER_TYPES` — the
+  single canonical message-type lists every module now derives from.
+
+### ✅ Not changed (deliberately)
+
+- `history_limit=2000`, the `from_user="me"` group-only filter, atomic
+  settings writes, and the Composition-Root/DI architecture are all
+  untouched — verified after every change.
+- The `exclude_archived` folder design, the 4-layer anti-FloodWait join
+  strategy, the copy-then-commit folder writes, and the dynamic help
+  system are unchanged.
+- The `join`/`left`/`list`/`folder`/`autoleave` command surface is
+  unchanged — only the *order* the links are processed in, and the set of
+  link *forms* that are recognised, were corrected.
+
+---
+
 ## [3.2.1] — 2026-10-04
 
 **Source:** AI — silent-failure investigation of the `help` command, ordered by

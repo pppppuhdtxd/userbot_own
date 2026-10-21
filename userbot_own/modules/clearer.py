@@ -79,22 +79,34 @@ from __future__ import annotations
 
 import time
 
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, events
 from telethon.tl.types import User
 
 from userbot_own.core.context import ModuleContext
-from userbot_own.helpers.utils import batch_delete, classify_message
+from userbot_own.helpers.utils import (
+    FILTER_TYPES,
+    FLOOD_ERRORS,
+    MEDIA_TYPES,
+    MESSAGE_TYPES,
+    batch_delete,
+    classify_message,
+    flood_seconds,
+)
 from userbot_own.modules.base import Module
 
 # ── Valid command arguments ──────────────────────────────────────────────────
 
 #: Any argument not in this set causes the command to be silently ignored.
-VALID_ARGS: frozenset[str] = frozenset({
-    # Type filters
-    "all", "media", "pic", "vid", "file", "txt", "link",
-    # Scope filters
-    "self", "bot",
-})
+#:
+#: v3.2.2 (B-14): the type names come from the canonical FILTER_TYPES list
+#: in helpers.utils, so a new message type added to classify_message() is
+#: automatically selectable here.
+VALID_ARGS: frozenset[str] = frozenset(
+    set(FILTER_TYPES) | {
+        # Scope filters
+        "self", "bot",
+    }
+)
 
 
 # ── Type filters ─────────────────────────────────────────────────────────────
@@ -102,6 +114,12 @@ VALID_ARGS: frozenset[str] = frozenset({
 #: Maps command argument → set of classified types to delete.
 #: `clear` (no argument) is equivalent to `clear txt link`.
 #: `clear media` = pic + vid + file (does NOT include `link`).
+#:
+#: v3.2.2 (B-14): the "media" and "all" composites are now derived from the
+#: canonical type lists in helpers.utils instead of being hand-written
+#: copies. The old literals were a fifth and sixth place a message type had
+#: to be added to whenever classify_message() learned a new one — a new type
+#: would have silently been missing from `clear all`.
 TYPE_FILTERS: dict[str, set[str]] = {
     # Default: text + link messages (most common cleanup use-case)
     "default": {"txt", "link"},
@@ -114,8 +132,8 @@ TYPE_FILTERS: dict[str, set[str]] = {
     "file":  {"file"},
 
     # Composite filters
-    "media": {"pic", "vid", "file"},  # Real media only — no `link`
-    "all":   {"file", "vid", "pic", "link", "txt", "other"},
+    "media": set(MEDIA_TYPES),   # Real media only — no `link`
+    "all":   set(MESSAGE_TYPES),
 }
 
 
@@ -210,7 +228,7 @@ class Clearer(Module):
         self._active_clears.add(event.chat_id)
         try:
             await self._run_clear(client, event, target_types, scope)
-        except errors.FloodWaitError as exc:
+        except FLOOD_ERRORS as exc:
             # v3.0.11: previously _run_clear swallowed this internally and
             # reported partial scan results as if they were complete. Now
             # it re-raises past here, matching whois_handler.py's pattern,
@@ -220,7 +238,7 @@ class Clearer(Module):
                 f"⏳ درخواست بیش از حد — لطفاً {exc.seconds} ثانیه صبر کنید.\n"
                 f"اسکن متوقف شد؛ ممکن است پیام‌هایی بررسی نشده باشند."
             )
-            self._log_warning("Clear FloodWait %ds.", exc.seconds)
+            self._log_warning("Clear FloodWait %ds.", flood_seconds(exc))
             await self._safe_edit(event, wait_msg)
         finally:
             self._active_clears.discard(event.chat_id)
@@ -264,17 +282,22 @@ class Clearer(Module):
 
         # v3.1.8 (G7): Observability instrumentation. Logs the exact
         # classification values that decide filtering behavior at the
-        # start of every scan, and surfaces them in the scan-start status
-        # message itself. This is purely diagnostic — it does not change
+        # start of every scan. This is purely diagnostic — it does not change
         # any filtering logic. If deletion is ever unexpectedly limited
         # again (e.g. a reaction-triggered `clear` in a bot chat), these
-        # values — visible directly in the chat and in the logs — make
-        # the cause immediately apparent instead of requiring guesswork:
-        # is_private=False when it should be True would point straight at
-        # a chat-type misclassification; use_from_user=True in a chat that
-        # should allow full deletion would point straight at the scope
-        # logic; both being correct would point elsewhere entirely (e.g.
-        # an emoji mapped to a more restrictive scope than expected).
+        # values make the cause immediately apparent instead of requiring
+        # guesswork: is_private=False when it should be True would point
+        # straight at a chat-type misclassification; use_from_user=True in a
+        # chat that should allow full deletion would point straight at the
+        # scope logic; both being correct would point elsewhere entirely
+        # (e.g. an emoji mapped to a more restrictive scope than expected).
+        #
+        # v3.2.2 (B-07): these values used to be rendered into the
+        # scan-start status message as well ("debug: private=…,
+        # from_user_filter=…"), which put internal implementation detail in
+        # front of every user in every group where `clear` ran. They are
+        # LOG-ONLY now — the diagnostic value is identical (the log line was
+        # always there), and the chat message is clean again.
         self._log_debug(
             "[Account%d] _run_clear start: chat_id=%s, is_private=%s, "
             "use_from_user=%s, scope=%s, history_limit=%d",
@@ -290,8 +313,7 @@ class Clearer(Module):
                 f"🔍 **در حال اسکن...**\n"
                 f"• نوع: {type_label}\n"
                 f"• محدوده: {scope_label}\n"
-                f"• حداکثر: `{history_limit}` پیام\n"
-                f"• _(debug: private={is_private}, from_user_filter={use_from_user})_"
+                f"• حداکثر: `{history_limit}` پیام"
             )
         except Exception as exc:
             self._log_error("Failed to create status message: %s", exc)
@@ -342,7 +364,7 @@ class Clearer(Module):
                 to_delete.append(msg.id)
                 matched_by_type[msg_type] = matched_by_type.get(msg_type, 0) + 1
 
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             # v3.0.11 fix: this used to be caught by the broad `except
             # Exception` below and silently swallowed, so a FloodWait
             # partway through a scan produced a result reported as
@@ -403,8 +425,10 @@ class Clearer(Module):
         failed_count = len(to_delete) - deleted_count
 
         # Build type breakdown
+        # v3.2.2 (B-16): iterate the canonical MESSAGE_TYPES list instead of
+        # a hand-written copy of it (a sixth duplicate of the same list).
         breakdown_lines = []
-        for t in ("file", "vid", "pic", "link", "txt", "other"):
+        for t in MESSAGE_TYPES:
             count = matched_by_type.get(t, 0)
             if count:
                 breakdown_lines.append(f"  • `{t}`: {count}")
@@ -618,7 +642,7 @@ help_extra = (
     "• آرگومان‌های نامعتبر باعث نادیده گرفته شدن کامل دستور می‌شوند\n"
     "• حداکثر ۲۰۰۰ پیام اسکن می‌شود\n"
     "• اگر اسکن دقیقاً به همین محدودیت برسد، در گزارش یادآوری نمایش داده می‌شود\n"
-    "• پیام شروع اسکن اکنون وضعیت private/from_user_filter را هم نشان می‌دهد (دیباگ)\n"
+    "• وضعیت private/from_user_filter در لاگ (دیباگ) ثبت می‌شود، نه در پیام چت\n"
     "• اگر برای reaction های مختلف، scope متفاوتی تنظیم کرده‌اید (مثلاً یکی\n"
     "  `clear all` و دیگری `clear self`)، این رفتار عمدی است نه باگ —\n"
     "  فایل `reactions.json` خودتان را بررسی کنید\n"

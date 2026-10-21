@@ -201,6 +201,7 @@ from tenacity import (
 )
 
 from userbot_own.core.logging_setup import get_logger
+from userbot_own.helpers.utils import flood_seconds
 
 if TYPE_CHECKING:
     from telethon import TelegramClient
@@ -410,7 +411,10 @@ class AccountReconnector:
         self._loader = loader
         self._cfg = account_client.cfg
         self._running = False
-        self._last_state = NetworkState.UNKNOWN
+        # v3.2.2 (B-26): the `_last_state` attribute was written on every
+        # recovery cycle and never read by anything. The detected state is
+        # already logged directly ("Network state detected: %s"), which is
+        # where a diagnostic reader actually looks. Removed.
         self._consecutive_failures = 0
 
         # v3.1.10: consecutive reconnects that found the account unauthorized;
@@ -694,14 +698,20 @@ class AccountReconnector:
             )
             self._consecutive_failures += 1
 
-        except (errors.FloodWaitError, OSError, ConnectionError) as exc:
+        except (errors.FloodError, OSError, ConnectionError) as exc:
             self._log.warning("Connection verification failed: %s", exc)
             self._consecutive_failures += 1
 
-            # Special handling for FloodWait
-            if isinstance(exc, errors.FloodWaitError):
-                self._log.warning("FloodWait %ss — waiting.", exc.seconds)
-                await asyncio.sleep(exc.seconds + 5)
+            # Special handling for FloodWait.
+            # v3.2.2 (B-01): the whole flood family, not just FloodWaitError.
+            # A FloodPremiumWaitError / SlowModeWaitError used to fall into
+            # the generic `except Exception` below, which logged it as an
+            # "Unexpected verification error" and treated a rate limit as a
+            # connection fault — escalating straight into a client rebuild.
+            if isinstance(exc, errors.FloodError):
+                wait = flood_seconds(exc)
+                self._log.warning("FloodWait %ss — waiting.", wait)
+                await asyncio.sleep(wait + 5)
                 return
 
         except Exception as exc:
@@ -767,7 +777,6 @@ class AccountReconnector:
 
             # Detect network state
             state = await detect_network_state()
-            self._last_state = state
 
             self._log.info("Network state detected: %s", state.name)
 

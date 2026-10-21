@@ -85,7 +85,10 @@ class AccountJsonHandler(FileSystemEventHandler):
 
     def __init__(self, accounts_dir: Path, account_registry: AccountRegistry) -> None:
         super().__init__()
-        self._accounts_dir = accounts_dir
+        # v3.2.2 (B-25): `self._accounts_dir` was assigned here and never
+        # read — the handler derives the account index from the event path
+        # itself. The parameter is kept (it is part of the public
+        # constructor signature) but no longer stored.
         self._account_registry = account_registry
 
     def on_modified(self, event) -> None:

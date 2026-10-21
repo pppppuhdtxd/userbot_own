@@ -47,7 +47,7 @@ v3.1.7 Changes:
 """
 from __future__ import annotations
 
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, events
 from telethon.tl.types import (
     Channel,
     Chat,
@@ -96,6 +96,7 @@ from telethon.tl.types import (
 
 from userbot_own.core.context import ModuleContext
 from userbot_own.helpers.utils import (
+    FLOOD_ERRORS,
     classify_message,
     format_user_flags,
     get_file_extension,
@@ -671,7 +672,7 @@ class InfoHandler(Module):
         """Build the sender info section."""
         try:
             sender = await msg.get_sender()
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             # v3.0.9 fix: previously swallowed here (and in
             # _get_chat_section / _get_reply_section below), unlike
             # whois_handler.py's deliberate re-raise pattern — a flood
@@ -748,7 +749,7 @@ class InfoHandler(Module):
         """Build the chat info section."""
         try:
             chat = await msg.get_chat()
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             raise
         except Exception:
             chat = None
@@ -800,7 +801,7 @@ class InfoHandler(Module):
         """Build the reply chain info."""
         try:
             reply = await msg.get_reply_message()
-        except errors.FloodWaitError:
+        except FLOOD_ERRORS:
             raise
         except Exception:
             reply = None

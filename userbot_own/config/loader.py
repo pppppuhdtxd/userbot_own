@@ -89,7 +89,7 @@ def discover_accounts(paths: Paths) -> list[AccountConfig]:
             continue
 
         # Optional (v3.1.3+). Empty string means "no string session" —
-        # AccountClient/build_temp_client fall back to the file-based
+        # AccountClient falls back to the file-based
         # session at session_path exactly as they always have.
         session_string: str = str(raw.get("session_string", "")).strip()
 

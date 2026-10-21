@@ -23,9 +23,6 @@ python-dotenv>=1.0.0
 # File-system event watching (hot-reload modules)
 watchdog>=4.0.0
 
-# Jalali/Persian date support (used in modules)
-jdatetime>=4.1.0
-
 # ── Resilience & Retry ───────────────────────────────────────
 
 # Smart retry with exponential backoff for network failures

@@ -33,22 +33,40 @@ from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeSticker,
     DocumentAttributeVideo,
+    MessageMediaWebPage,
     User,
 )
 
 from userbot_own.core.context import ModuleContext
-from userbot_own.helpers.utils import is_photo, read_json_file, safe_delete, write_json_file_atomic
+from userbot_own.helpers.utils import (
+    is_audio,
+    is_file,
+    is_photo,
+    read_json_file,
+    safe_delete,
+    write_json_file_atomic,
+)
 from userbot_own.modules.base import Module
 
 # ── تنظیمات پیش‌فرض ───────────────────────────────────────────────────────────
 
 _DEFAULT: dict[str, bool] = {
     "txt":     False,  # پیام‌های متنی محض
+    "link":    False,  # پیام‌های لینک (WebPage preview)
     "pic":     False,  # عکس
     "vid":     False,  # ویدیو / گیف
     "file":    False,  # فایل
     "caption": False,  # caption پیام اصلی
 }
+
+#: The content types `autofor all` toggles. `caption` is deliberately not
+#: one of them — it is a modifier (send the original caption too), not a
+#: content type, and `all` never touches it.
+#:
+#: v3.2.2 (B-12): "link" was added. It was missing entirely, so a link
+#: message (WebPage preview) was never forwarded even with `autofor all`
+#: on — while `all` advertises itself as covering every type.
+_ALL_CONTENT_TYPES: tuple[str, ...] = ("txt", "link", "pic", "vid", "file")
 
 #: حداکثر آیتم در هر album (محدودیت تلگرام)
 _ALBUM_MAX   = 10
@@ -64,9 +82,29 @@ def _content_type(msg) -> str | None:
 
     برگشتی: 'txt' | 'pic' | 'vid' | 'file' | None
     None یعنی نباید فوروارد بشه (sticker یا پیام خالی)
+
+    v3.2.2 (B-13): the final `return "file"` used to fire for ANY document
+    that carried no sticker/video/audio attribute — including a document
+    with no filename at all, which the shared `is_file()` helper does NOT
+    consider a file (it requires a DocumentAttributeFilename). The two
+    definitions of "file" disagreed, so a document with no filename was
+    classified `file` here but `other` by classify_message(). The shared
+    helper is now the single authority, exactly as `is_photo` already was.
+
+    v3.2.2 (B-12): a message carrying a WebPage preview (a link) used to
+    return None here — it is neither a photo nor a document — so it was
+    NEVER forwarded, even with `autofor all` on, which claims to cover
+    "every type except caption". classify_message() classifies the very
+    same message as `link`, so the two disagreed. It is now returned as
+    "link" and forwarded like a text message (the text, including the URL,
+    is sent back to the bot).
     """
     if msg.media is None:
         return "txt" if msg.message else None
+
+    if isinstance(msg.media, MessageMediaWebPage):
+        # A link message: forwarded as text (the caption + URL).
+        return "link" if msg.message else None
 
     if is_photo(msg.media):
         return "pic"
@@ -79,19 +117,23 @@ def _content_type(msg) -> str | None:
                 return "vid"
             if isinstance(attr, DocumentAttributeAudio):
                 return "file"
-        return "file"
+        # v3.2.2 (B-13): use the shared is_file() — a document without a
+        # filename is not a "file" (it lands in `other`).
+        return "file" if is_file(msg.media) else None
 
     return None
 
 
 def _is_audio(msg) -> bool:
-    """بررسی می‌کند که آیا media پیام audio است (نه video/sticker)."""
-    if not (hasattr(msg.media, "document") and msg.media.document):
-        return False
-    for attr in msg.media.document.attributes:
-        if isinstance(attr, DocumentAttributeAudio):
-            return True
-    return False
+    """بررسی می‌کند که آیا media پیام audio است (نه video/sticker).
+
+    v3.2.2 (B-11): this was a byte-for-byte re-implementation of the shared
+    `helpers.utils.is_audio()` helper, living right next to an import of the
+    shared `is_photo` in the same file — the exact "two copies of a media
+    predicate drift apart" shape the project has been bitten by before. It
+    is now a thin delegation to the shared helper.
+    """
+    return is_audio(msg.media)
 
 
 # ── Module ────────────────────────────────────────────────────────────────────
@@ -155,16 +197,32 @@ class AutoForwarder(Module):
                     self._global[k] = bool(g[k])
 
             # Load bot-specific settings
+            #
+            # v3.2.2 (B-02): per-bot entries are stored as OVERRIDES ONLY —
+            # just the types the user explicitly set for that bot — instead
+            # of a full snapshot of every type. Files written by 3.2.1 and
+            # earlier stored a full snapshot, which is indistinguishable
+            # from "the user set all of these" and therefore permanently
+            # shadowed the global settings. The migration keeps a type as
+            # an override only if it actually DIFFERS from the global value;
+            # a type the user never touched falls back to the global, which
+            # is exactly what the user meant.
             for bid_str, bset in data.get("bots", {}).items():
                 try:
                     bid = int(bid_str)
-                    entry = _DEFAULT.copy()
-                    for k in _DEFAULT:
-                        if k in bset:
-                            entry[k] = bool(bset[k])
-                    self._bots[bid] = entry
                 except (ValueError, TypeError):
-                    pass
+                    continue
+                if not isinstance(bset, dict):
+                    continue
+                entry: dict[str, bool] = {}
+                for k in _DEFAULT:
+                    if k not in bset:
+                        continue
+                    value = bool(bset[k])
+                    if value != self._global[k]:
+                        entry[k] = value
+                if entry:
+                    self._bots[bid] = entry
 
             self._log_info("[Account%d] AutoForwarder settings loaded.", self.cfg.index)
         except Exception as exc:
@@ -183,16 +241,82 @@ class AutoForwarder(Module):
     # ── ابزارهای کمکی ────────────────────────────────────────────
 
     def _effective(self, bot_id: int) -> dict[str, bool]:
-        return self._bots.get(bot_id, self._global)
+        """
+        Return the effective settings for *bot_id*: the global settings with
+        this bot's explicit overrides layered on top.
+
+        v3.2.2 (B-02): this is the merge the old design was missing.
+        Previously it returned ``self._bots.get(bot_id, self._global)`` — a
+        bot entry REPLACED the global wholesale. Because a bot entry used to
+        be a full snapshot of every type, one per-bot command (say
+        ``autofor pic on``) silently disabled every globally enabled type
+        for that bot, permanently, and nothing in the status output showed
+        it.
+
+        The merge is now: ``{**self._global, **self._bots.get(bot_id, {})}``
+        — the global applies unless the bot explicitly overrides that type.
+        """
+        overrides = self._bots.get(bot_id)
+        if not overrides:
+            return self._global
+        return {**self._global, **overrides}
+
+    def _set_bot_override(self, bot_id: int, ftype: str, value: bool) -> None:
+        """
+        Set (or clear) one type's override for a bot.
+
+        v3.2.2 (B-02): when the new value equals the global value for that
+        type, the override is REMOVED rather than stored — so a bot's
+        override set can never grow a redundant entry that shadows a later
+        global change. If the bot ends up with no overrides at all, its
+        entry is removed entirely.
+        """
+        overrides = dict(self._bots.get(bot_id, {}))
+        if value == self._global[ftype]:
+            overrides.pop(ftype, None)
+        else:
+            overrides[ftype] = value
+        if overrides:
+            self._bots[bot_id] = overrides
+        else:
+            self._bots.pop(bot_id, None)
 
     def _differs_from_global(self, bot_id: int) -> bool:
-        if bot_id not in self._bots:
+        """
+        True if this bot has at least one override that differs from the
+        global value for that type.
+
+        v3.2.2 (B-02): under override-only storage, "differs from the global"
+        no longer means "the whole bot dict != the global dict" — the bot
+        dict holds only the overridden types, so the comparison has to be
+        made per type. An override that equals the global is not an
+        override at all.
+        """
+        overrides = self._bots.get(bot_id)
+        if not overrides:
             return False
-        return self._bots[bot_id] != self._global
+        return any(overrides.get(k) != self._global.get(k) for k in overrides)
 
     def _cleanup_if_same(self, bot_id: int) -> None:
-        if bot_id in self._bots and not self._differs_from_global(bot_id):
-            del self._bots[bot_id]
+        """
+        Drop a bot's overrides that no longer differ from the global, and
+        remove the bot's entry entirely if nothing is left.
+
+        v3.2.2 (B-02): called after a global change. An override that now
+        matches the global is redundant — the global applies anyway — so
+        keeping it would only risk shadowing a LATER global change.
+        """
+        overrides = self._bots.get(bot_id)
+        if not overrides:
+            self._bots.pop(bot_id, None)
+            return
+        remaining = {
+            k: v for k, v in overrides.items() if v != self._global.get(k)
+        }
+        if remaining:
+            self._bots[bot_id] = remaining
+        else:
+            self._bots.pop(bot_id, None)
 
     # ── منطق فوروارد ──────────────────────────────────────────────
 
@@ -219,20 +343,24 @@ class AutoForwarder(Module):
 
         settings = self._effective(sender.id)
 
-        # ── txt: فوروارد فوری به همان بات ── ────────────────────────
-        if ctype == "txt":
-            if not settings.get("txt", False):
+        # ── txt / link: فوروارد فوری به همان بات ── ──────────────────
+        #
+        # v3.2.2 (B-12): "link" is handled on the same immediate path as
+        # "txt" — a WebPage-preview message is sent back to the bot as text
+        # (its caption plus the URL), exactly like a plain text message.
+        if ctype in ("txt", "link"):
+            if not settings.get(ctype, False):
                 return
             try:
                 await event.client.send_message(event.chat_id, msg.message)
                 await safe_delete(event.client, event.chat_id, msg.id)
                 self._log_debug(
-                    "[Account%d] txt forwarded to bot %d.",
-                    self.cfg.index, sender.id,
+                    "[Account%d] %s forwarded to bot %d.",
+                    self.cfg.index, ctype, sender.id,
                 )
             except Exception as exc:
                 self._log_error(
-                    "[Account%d] txt forward error: %s", self.cfg.index, exc
+                    "[Account%d] %s forward error: %s", self.cfg.index, ctype, exc
                 )
             return
 
@@ -414,7 +542,7 @@ class AutoForwarder(Module):
             await event.edit(
                 "❌ فرمت نادرست.\n"
                 "استفاده: `autofor <type> <on/off>`\n"
-                "type: `txt` | `pic` | `vid` | `file` | `caption` | `all`"
+                "type: `txt` | `link` | `pic` | `vid` | `file` | `caption` | `all`"
             )
             return
 
@@ -424,7 +552,7 @@ class AutoForwarder(Module):
         if ftype not in _DEFAULT and ftype != "all":
             await event.edit(
                 f"❌ نوع نامعتبر: `{ftype}`\n"
-                "مقادیر مجاز: `txt`, `pic`, `vid`, `file`, `caption`, `all`"
+                "مقادیر مجاز: `txt`, `link`, `pic`, `vid`, `file`, `caption`, `all`"
             )
             return
         if action not in ("on", "off"):
@@ -439,13 +567,18 @@ class AutoForwarder(Module):
         # ── Saved Messages → تنظیم کلی ───────────────────────────
         if is_saved:
             if ftype == "all":
-                for k in ("txt", "pic", "vid", "file"):
+                for k in _ALL_CONTENT_TYPES:
                     self._global[k] = state
                 label = "همه انواع (به جز caption)"
             else:
                 self._global[ftype] = state
                 label = f"`{ftype}`"
 
+            # v3.2.2 (B-02): a global change must not leave a bot's override
+            # set pointing at a stale value. Any bot override that now
+            # equals the global is no longer an override at all, so it is
+            # dropped — otherwise the bot would keep shadowing the global
+            # for a type the user never meant to differentiate.
             for bid in list(self._bots):
                 self._cleanup_if_same(bid)
             self._save()
@@ -470,27 +603,31 @@ class AutoForwarder(Module):
             bid      = chat.id
             bot_name = f"@{chat.username}" if chat.username else str(bid)
 
-            if bid not in self._bots:
-                self._bots[bid] = self._effective(bid).copy()
-
+            # v3.2.2 (B-02): store an OVERRIDE for the affected type(s)
+            # only — never a full snapshot of the global. _set_bot_override()
+            # drops an override that matches the global and removes the
+            # bot's entry once it holds no overrides at all.
             if ftype == "all":
-                for k in ("txt", "pic", "vid", "file"):
-                    self._bots[bid][k] = state
+                for k in _ALL_CONTENT_TYPES:
+                    self._set_bot_override(bid, k, state)
                 label = "همه انواع (به جز caption)"
             else:
-                self._bots[bid][ftype] = state
+                self._set_bot_override(bid, ftype, state)
                 label = f"`{ftype}`"
 
-            self._cleanup_if_same(bid)
             self._save()
 
+            # The effective value for this bot is the merged one — it is
+            # what actually governs the live forward filter.
             effective = self._effective(bid)
+            overrides = self._bots.get(bid, {})
             status_lines = [
                 f"✅ Auto-forward {label} برای {bot_name} **{'فعال' if state else 'غیرفعال'}** شد.\n",
-                f"**وضعیت {bot_name}:**",
+                f"**وضعیت {bot_name} (ادغام‌شده با کلی):**",
             ]
             for k, v in effective.items():
-                status_lines.append(f"  • `{k}`: {'✅ ON' if v else '❌ OFF'}")
+                mark = "✏️ " if k in overrides else ""
+                status_lines.append(f"  • {mark}`{k}`: {'✅ ON' if v else '❌ OFF'}")
             await event.edit("\n".join(status_lines), parse_mode="Markdown")
             self._log_info(
                 "[Account%d] Bot-specific autofor for %d: %s → %s.",
@@ -512,22 +649,39 @@ class AutoForwarder(Module):
         for k, v in self._global.items():
             lines.append(f"  • `{k}`: {'✅ ON' if v else '❌ OFF'}")
 
-        diff_bots = {bid: s for bid, s in self._bots.items() if s != self._global}
+        # v3.2.2 (B-02): the per-bot block now shows the MERGED effective
+        # settings — what actually governs the live filter for that bot —
+        # and marks which types are the bot's own OVERRIDE of the global.
+        #
+        # Before this fix, a bot entry was a full snapshot, so this block
+        # listed only the types that DIFFERED from the global. Every type
+        # the bot inherited from the global was invisible — and every type
+        # the bot's snapshot had silently turned OFF (thereby shadowing a
+        # globally-enabled rule) was invisible too. The user saw "everything
+        # follows the global" while a global rule was in fact being
+        # overridden. The merged view is shown now, with an explicit marker
+        # on genuine overrides.
+        diff_bots = {
+            bid: s for bid, s in self._bots.items()
+            if any(self._effective(bid).get(k) for k in s)
+        }
         if diff_bots:
-            lines.append("\n**تنظیمات متفاوت برای بات‌ها:**")
-            for bid, bset in diff_bots.items():
+            lines.append("\n**تنظیمات بات‌ها (ادغام‌شده با کلی):**")
+            for bid, overrides in diff_bots.items():
                 try:
                     ent  = await client.get_entity(bid)
                     name = f"@{ent.username}" if ent.username else str(bid)
                 except Exception:
                     name = str(bid)
+                effective = self._effective(bid)
                 lines.append(f"\n**{name}:**")
-                for k, v in bset.items():
-                    if v != self._global.get(k):
-                        lines.append(
-                            f"  • `{k}`: {'✅ ON' if v else '❌ OFF'}   "
-                            f"(کلی: {'✅' if self._global.get(k) else '❌'})"
-                        )
+                for k, v in effective.items():
+                    mark = "✏️ " if k in overrides else ""
+                    lines.append(
+                        f"  • {mark}`{k}`: {'✅ ON' if v else '❌ OFF'}   "
+                        f"(کلی: {'✅' if self._global.get(k) else '❌'})"
+                    )
+            lines.append("\n_✏️ = تنظیم مخصوص این بات (override)_")
         else:
             lines.append("\n_همه بات‌ها از تنظیمات کلی پیروی می‌کنند._")
 
@@ -556,6 +710,7 @@ help_extra = (
     "• `forward status` | نمایش وضعیت فعلی (فقط در Saved Messages)\n\n"
     "انواع پیام (type):\n"
     "• `txt` | پیام‌های متنی محض (فوروارد فوری)\n"
+    "• `link` | پیام‌های لینک (WebPage preview) — فوروارد فوری\n"
     "• `pic` | عکس‌ها\n"
     "• `vid` | ویدیوها و GIF\n"
     "• `file` | فایل‌های ضمیمه (شامل audio)\n"
@@ -566,6 +721,7 @@ help_extra = (
     "• در چت یک ربات | تنظیم مخصوص همان ربات\n\n"
     "منطق فوروارد:\n"
     "• `txt` | بلافاصله به همان ربات فوروارد می‌شود و پیام اصلی حذف می‌شود\n"
+    "• `link` | همان رفتار `txt` — لینک به‌همراه کپشن به همان ربات ارسال می‌شود\n"
     "• `pic` / `vid` / `file` | در قالب album گروه‌بندی می‌شوند (حداکثر ۱۰ تایی)\n"
     "• `caption` | اگر on باشد، caption پیام اصلی هم ارسال می‌شود\n"
     "• `sticker` | هیچ‌وقت فوروارد نمی‌شود (حتی اگر فعال باشد)\n"

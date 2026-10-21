@@ -113,7 +113,7 @@ v3.2.0 Changes:
     (_call_with_flood_retry); _post_join_actions returns a PostJoinResult;
     _record_join() (one shared path for all join outcomes) queues incomplete chats
     for an end-of-batch retry sweep and the 6-hour cycle; the summary reports real
-    counts instead of len(joined_entities). Mute is load-bearing: an unmuted
+    counts instead of a raw joined-count. Mute is load-bearing: an unmuted
     archived chat is moved back to the main list by Telegram on its next message.
 
   Fix N4 — Pattern 1.2 (sibling exceptions):
@@ -366,6 +366,9 @@ from telethon.tl.types import messages as tl_messages
 from userbot_own.core.context import ModuleContext
 from userbot_own.core.logging_setup import get_logger
 from userbot_own.helpers.utils import (
+    flood_seconds as _flood_seconds,
+)
+from userbot_own.helpers.utils import (
     get_inline_button_url,
     leave_dialog,
     read_json_file,
@@ -457,23 +460,14 @@ _AUTO_LEAVE_INTERVAL = 6 * 3600
 
 
 # ── v3.2.0: FloodWait helper + result types ───────────────────────────────────
-
-def _flood_seconds(exc: BaseException) -> int:
-    """
-    Seconds Telegram asks us to wait, for ANY member of Telethon's flood family.
-
-    errors.FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError and
-    SlowModeWaitError are SIBLINGS under errors.FloodError — none is a subclass
-    of another — so `except errors.FloodWaitError` silently misses the other
-    three (Pattern 1.2). Callers now catch errors.FloodError and read the wait
-    through this helper; the bare FloodError base class carries no `.seconds`,
-    hence the defensive getattr. Always returns at least 1.
-    """
-    try:
-        seconds = int(getattr(exc, "seconds", 0) or 0)
-    except (TypeError, ValueError):
-        seconds = 0
-    return max(1, seconds)
+#
+# v3.2.2 (B-01): the flood-wait helper that used to live here as
+# `_flood_seconds()` was promoted to helpers/utils.py as `flood_seconds()`,
+# because the same "catch only FloodWaitError, miss the three siblings" bug
+# was still live in 20 other places across the project — including the shared
+# delete path every clearing module goes through. One implementation, one
+# import, no drift. The local alias below keeps the ~25 existing call sites
+# in this file untouched and readable.
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,64 +537,112 @@ class EnsureResult:
 
 # ── Entity extraction ─────────────────────────────────────────────────────────
 
+#: One combined pattern for every Telegram identifier form, so a single
+#: left-to-right scan produces the entities in the order they appear in the
+#: text.
+#:
+#: v3.2.2 (B-03): this used to be FIVE independent regex passes, each
+#: appending to one list — so the result was grouped BY PATTERN, not by
+#: position. The v3.1.8 "I4" fix claimed "links now appear in exactly the
+#: order they were found in the message", but the invite-link pass ran
+#: after the username pass and the numeric pass ran last of all, so:
+#:
+#:   "https://t.me/+AbCdEfGhIjKl then https://t.me/someuser"
+#:     -> [('username','someuser'), ('invite_link','https://t.me/+AbCdEfGhIjKl')]
+#:
+#: — the two were swapped relative to the text. A single alternation
+#: pattern fixes the ordering by construction: the scanner walks the text
+#: once, left to right, and each match is emitted at its own position.
+#:
+#: The scheme is now OPTIONAL in every form, so `t.me/+AbCdEfGhIjKl` and
+#: `t.me/joinchat/AbCdEfGhIjKl` (the form Telegram's own "Copy Link"
+#: button produces in some clients) are recognised, and `t.me/c/<id>/<msg>`
+#: is recognised as a private-channel link instead of falling through to
+#: the generic numeric-id pass.
+_TG_HOST = r'(?:www\.)?(?:t\.me|telegram\.me|telegram\.org)'
+_SCHEME = r'(?:https?://)?'
+
+#: The combined alternation. Group names:
+#:   ``priv``   — t.me/c/<channel id>/<message id>   (private channel)
+#:   ``invite`` — t.me/+<hash> or t.me/joinchat/<hash>
+#:   ``user``   — @<name> or t.me/<name>
+#:   ``num``    — a bare 9-14 digit id
+_ENTITY_RE = re.compile(
+    r'(?P<priv>' + _SCHEME + _TG_HOST + r'/c/(?P<priv_id>\d{10,15})/\d+)'
+    r'|(?P<invite>' + _SCHEME + _TG_HOST + r'/(?:joinchat/|\+)(?P<invite_hash>[a-zA-Z0-9_-]{10,64}))'
+    r'|(?P<user>@(?P<user_at>[a-zA-Z0-9_]{5,32})(?![a-zA-Z0-9_/])'
+    r'|' + _SCHEME + _TG_HOST + r'/(?P<user_path>[a-zA-Z0-9_]{5,32})(?![a-zA-Z0-9_/]))'
+    r'|(?P<num>\b\d{9,14}\b)',
+    re.IGNORECASE,
+)
+
+#: Usernames that are really t.me *paths*, not usernames.
+_RESERVED_PATH_NAMES: frozenset[str] = frozenset({
+    'joinchat', 'c', 'proxy', 's', 'addstickers',
+})
+
+
 def extract_telegram_entities(text: str | None) -> list[tuple[str, str | int]]:
     """
     Extract Telegram chat identifiers from free-form text.
 
     Returns list of (type, value) tuples where type is one of:
     'channel_id', 'username', 'invite_link', 'numeric_id'
+
+    v3.2.2 (B-03): the entities are returned in the order they appear in the
+    text. The previous implementation ran five independent regex passes,
+    each appending to the same list, which grouped the result by PATTERN
+    instead of by POSITION — a link that appeared before another could end
+    up after it, silently changing the order the user asked to join in.
+    A single left-to-right scan over one combined pattern fixes that by
+    construction. The scheme is also optional in every form now, so
+    `t.me/+Hash` and `t.me/c/<id>/<msg>` are recognised.
+
+    Bot usernames (ending in "bot") are still skipped: bots cannot be
+    joined, only started with /start.
     """
     if not text:
         return []
 
     entities: list[tuple[str, str | int]] = []
+    seen: set[tuple[str, str | int]] = set()
 
-    # Private channel links: t.me/c/1234567890/123
-    # Track which numeric spans came from here so the generic numeric_id
-    # pass below doesn't also re-extract the same digits as a second,
-    # duplicate entity for the same chat (v3.0.9 fix — see numeric_id loop).
-    channel_id_values: set[int] = set()
-    for m in re.finditer(
-        r'https?://(?:www\.)?(?:t\.me|telegram\.me|telegram\.org)/c/(\d{10,15})/\d+',
-        text, re.IGNORECASE,
-    ):
-        value = int(m.group(1))
-        entities.append(('channel_id', value))
-        channel_id_values.add(value)
+    def _add(kind: str, value: str | int) -> None:
+        key = (kind, value)
+        if key in seen:
+            return
+        seen.add(key)
+        entities.append(key)
 
-    # Usernames: @name or t.me/name
-    for m in re.finditer(
-        r'(?:@|(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.org)/)'
-        r'([a-zA-Z0-9_]{5,32})(?![a-zA-Z0-9_/])',
-        text, re.IGNORECASE,
-    ):
-        username = m.group(1)
-        if username.lower() in ('joinchat', 'c', 'proxy', 's', 'addstickers'):
-            continue
-        # N1: Intentionally skip bot usernames (ending in 'bot').
-        # Bots cannot be "joined" — they must be started with /start.
-        # Including them would cause a ChannelPrivateError or similar failure.
-        if not username.lower().endswith('bot'):
-            entities.append(('username', username))
+    for m in _ENTITY_RE.finditer(text):
+        if m.group("priv"):
+            # Private channel link: t.me/c/1234567890/123
+            _add('channel_id', int(m.group('priv_id')))
 
-    # Invite links: t.me/+xxx or t.me/joinchat/xxx
-    for m in re.finditer(
-        r'(https?://(?:www\.)?(?:t\.me|telegram\.me|telegram\.org)/(?:joinchat/|\+))'
-        r'([a-zA-Z0-9_-]{10,64})',
-        text, re.IGNORECASE,
-    ):
-        entities.append(('invite_link', m.group(1) + m.group(2)))
+        elif m.group("invite"):
+            # Invite link: t.me/+Hash or t.me/joinchat/Hash
+            _add('invite_link', m.group('invite'))
 
-    # Numeric IDs — skip any digit run already captured above as a
-    # channel_id (v3.0.9 fix: a t.me/c/<id>/<msg> link's ID is embedded in
-    # the URL as a plain digit run too, so this generic pass used to
-    # re-extract it a second time as a distinct ('numeric_id', ...) entity,
-    # causing the join loop to process the same chat twice).
-    for m in re.finditer(r'\b(\d{9,14})\b', text):
-        value = int(m.group(1))
-        if value in channel_id_values:
-            continue
-        entities.append(('numeric_id', value))
+        elif m.group("user"):
+            # Username: @name or t.me/name
+            username = m.group('user_at') or m.group('user_path')
+            if not username:
+                continue
+            lowered = username.lower()
+            if lowered in _RESERVED_PATH_NAMES:
+                continue
+            # N1: Intentionally skip bot usernames (ending in 'bot').
+            # Bots cannot be "joined" — they must be started with /start.
+            # Including them would cause a ChannelPrivateError or similar failure.
+            if lowered.endswith('bot'):
+                continue
+            _add('username', username)
+
+        elif m.group("num"):
+            # Bare numeric id. A t.me/c/<id>/<msg> link is matched by the
+            # "priv" branch above, so the same id is never emitted twice
+            # (v3.0.9 fix).
+            _add('numeric_id', int(m.group('num')))
 
     return entities
 
@@ -2676,7 +2718,10 @@ class JoinLeft(Module):
             return
 
         results: list[str]    = []
-        joined_entities: list = []
+        # v3.2.2 (B-18): the old `joined_entities` list was appended to in
+        # three places but never read — the v3.2.0 refactor replaced its use
+        # with `post_results` (which carries the real per-chat outcome) and
+        # left the list behind. Removed; `post_results` is the only record.
         post_results: list[tuple[object, PostJoinResult]] = []   # v3.2.0: (entity, outcome)
 
         start_time    = time.monotonic()
@@ -2835,7 +2880,6 @@ class JoinLeft(Module):
                             results.append(f"ℹ️ [{title}] — قبلاً عضو بود (جوین موفق)")
                             success_count += 1
                             join_times.append(time.monotonic() - attempt_start)
-                            joined_entities.append(joined_entity)
                             post_results.append((joined_entity, await self._record_join(client, joined_entity)))
                         else:
                             results.append(f"ℹ️ [{identifier}] — قبلاً عضو بود (جوین موفق)")
@@ -3076,8 +3120,7 @@ class JoinLeft(Module):
                                 success_count += 1
                                 join_times.append(time.monotonic() - attempt_start)
                                 if joined_entity:
-                                    joined_entities.append(joined_entity)
-                                    post_results.append((joined_entity, await self._record_join(client, joined_entity)))
+                                            post_results.append((joined_entity, await self._record_join(client, joined_entity)))
                                 break
 
                     # ── Record success ─────────────────────────────────────────
@@ -3092,7 +3135,6 @@ class JoinLeft(Module):
                             "invite_direct":        "🔑",
                         }.get(effective_type, "✅")
 
-                        joined_entities.append(joined_entity)
                         if already_member:
                             # v3.1.10: same wording as the invite-hash, Layer-1 and last-chance
                             # paths for the same situation (was a plain "✅", which read as a
@@ -3238,23 +3280,34 @@ class JoinLeft(Module):
 
         # ═══════════════════════════════════════════════════════════════════════
         # v3.2.0 POST-LOOP: retry sweep → exclude_archived reconcile (BEFORE the summary,
-        # so the summary states real outcomes; it used to report len(joined_entities)
+        # so the summary states real outcomes; it used to report a raw joined-count
         # as "added to folder" without looking at a single result — Pattern 1.6)
         # ═══════════════════════════════════════════════════════════════════════
         folder_note = ""
+
+        # v3.2.2 (B-08): the exclude_archived reconcile used to run ONLY
+        # inside `if post_results:` — i.e. only when at least one chat had
+        # been joined. A `join` batch in which every entity failed (all
+        # links invalid, all flood-waited, all already-member-without-entity)
+        # produced post_results == [] and therefore SKIPPED the reconcile
+        # entirely, leaving the user's folders unprotected with no report.
+        # The reconcile is cheap (it only writes folders that are missing
+        # the flag) and is exactly what protects archived chats, so it now
+        # runs on every batch, joined or not.
+        try:
+            await processing_msg.edit(
+                f"🧹 در حال نهایی‌سازی (mute / فولدر / archive)...\n"
+                f"_تا کنون: {success_count} موفق / {fail_count} ناموفق_",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
         if post_results:
-            try:
-                await processing_msg.edit(
-                    f"🧹 در حال نهایی‌سازی (mute / فولدر / archive)...\n"
-                    f"_تا کنون: {success_count} موفق / {fail_count} ناموفق_",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
-
             await self._retry_missing_actions(client, reason="join batch")
-            ensure_res = await self._reconcile_folders(client, reason="join batch")
+        ensure_res = await self._reconcile_folders(client, reason="join batch")
 
+        if post_results:
             unresolved = [e for e, _ in post_results if getattr(e, "id", None) in self._pending_actions]
             fully_done = len(post_results) - len(unresolved)
             folder_note = f"\n📁 `{fully_done}`/`{len(post_results)}` چت کامل پردازش شد (mute + فولدر + archive)."
@@ -3265,11 +3318,11 @@ class JoinLeft(Module):
                     f"\n⚠️ `{len(unresolved)}` چت ناقص ماند ({'، '.join(missing_all)}) — "
                     f"بعداً خودکار دوباره تلاش می‌شود (جزئیات در لاگ)."
                 )
-            if ensure_res.changed:
-                folder_note += f"\n🗂 فولدرها: `{ensure_res.updated}` به‌روزرسانی شد (exclude_archived)"
-                if ensure_res.problems:
-                    folder_note += f" | ⚠️ `{ensure_res.problems}` ناموفق/معوق (جزئیات در لاگ)"
-                folder_note += "."
+        if ensure_res.changed:
+            folder_note += f"\n🗂 فولدرها: `{ensure_res.updated}` به‌روزرسانی شد (exclude_archived)"
+            if ensure_res.problems:
+                folder_note += f" | ⚠️ `{ensure_res.problems}` ناموفق/معوق (جزئیات در لاگ)"
+            folder_note += "."
 
         summary = (
             f"--- **نتایج جوین** ({join_mode}) ---\n"
@@ -3460,7 +3513,18 @@ class JoinLeft(Module):
         self._track_delete_task(processing_msg, _AUTO_DELETE_DELAY)
 
         if any_successful_left:
-            await safe_delete(client, event.chat_id, event.message.id)
+            # v3.2.2 (B-19): a reaction-triggered `left` arrives through
+            # MockEvent, whose `message.id` is the deliberate placeholder 0
+            # (see modules/bridge.py — a real id would make the reacted-to
+            # message immune to its own reaction-triggered clear). Deleting
+            # message id 0 is rejected by Telegram, so every reaction-
+            # triggered `left` wrote a bogus ERROR line to the account log
+            # ("safe_delete: permission denied — The specified message ID is
+            # invalid"). There is no command message to delete in that case
+            # anyway, so the call is simply skipped.
+            command_msg_id = getattr(event.message, "id", 0) or 0
+            if command_msg_id > 0:
+                await safe_delete(client, event.chat_id, command_msg_id)
             if event.is_reply and reply_msg and reply_msg.out:
                 try:
                     await client.edit_message(reply_msg, ".")

@@ -72,7 +72,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.2.5`
+**Current version:** `3.2.6`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -260,9 +260,10 @@ userbot_own/
     │   ├── single/                   ← one logical module per .py file
     │   │   └── (your_plugin.py + your_plugin_info.py)
     │   ├── packages/                 ← one logical module per folder
-    │   │   └── example_module/       ← template / smoke-test module, ships disabled
+    │   │   └── bot_link_starter/     ← start the bot links in a Quote & Reply
     │   │       ├── __init__.py
     │   │       ├── info.py
+    │   │       ├── links.py
     │   │       └── handlers.py
     │   └── __init__.py
     │
@@ -771,7 +772,7 @@ entry works for both.
   `data/settings/account{N}/enabled_modules.json`:
   ```json
   {
-    "enabled": ["example_module"]
+    "enabled": ["bot_link_starter"]
   }
   ```
   Absence from the list means disabled — you don't need to pre-list every
@@ -793,25 +794,102 @@ entry works for both.
 
 ### Trying it out
 
-The repo ships with one example module, `modules_extra/example_module/`,
-disabled by default, that does nothing but respond to `پینگ اضافی` (typed in
-Saved Messages) with a pong — enough to verify the whole system end-to-end
+The repo ships with one extra module, `modules_extra/packages/bot_link_starter/`,
+disabled by default (see [its section](#bot_link_starter--start-the-bot-links-in-a-quote--reply)
+below for what it does). It is enough to verify the whole system end-to-end
 on a real account:
 
 ```
-.extra                          →  shows example_module as ❌ disabled
-help example_module             →  "غیرفعال است. برای فعال‌سازی: .extra enable example_module"
-.extra enable example_module    →  ✅ enabled
-پینگ اضافی                       →  🏓 pong
-help                             →  example_module now appears
-.extra disable example_module   →  ✅ disabled — پینگ اضافی stops responding
+.extra                              →  shows bot_link_starter as ❌ disabled
+help bot_link_starter               →  "غیرفعال است. برای فعال‌سازی: .extra enable bot_link_starter"
+.extra enable bot_link_starter      →  ✅ enabled
+help                                →  bot_link_starter now appears
+.extra disable bot_link_starter     →  ✅ disabled
 ```
 
-Delete `example_module.py` (or replace it with something real) once you've
-confirmed this works. Writing an actual extra module afterward is identical
-to [writing a core one](#writing-a-new-module) below — just save it under
+Writing a new extra module is identical to
+[writing a core one](#writing-a-new-module) below — just save it under
 `modules_extra/` instead of `modules/`, and remember it won't do anything
 until you `.extra enable` it.
+
+### `bot_link_starter` — start the bot links in a Quote & Reply
+
+Ships **disabled** too. It finds the Telegram bot links inside the
+**quoted part** of a message and starts each bot in turn, so the files or
+media those links offer get delivered.
+
+How to use it:
+
+1. Open a message that contains one or more bot links.
+2. Select the part with the links and choose **Quote & Reply**.
+3. Send `start`.
+
+```
+saved message:  "here: https://t.me/MyBot?start=ref123 and https://t.me/OtherBot?start=abc"
+     └─ quote this part ─┘
+then send:      start
+```
+
+The module then sends, in order and three seconds apart:
+
+```
+/start ref123   →  @MyBot
+/start abc      →  @OtherBot
+```
+
+and writes the result back on the `start` message.
+
+What it recognises:
+
+| Form | Example |
+| --- | --- |
+| A plain link | `https://t.me/MyBot?start=ref123` |
+| A link behind text (Telegram's "create link") | text that opens the bot when clicked |
+| A link without a scheme | `t.me/MyBot?start=ref123` |
+| Telegram's in-app scheme | `tg://resolve?domain=MyBot&start=ref123` |
+| `?start=` in any case | `t.me/MyBot?Start=ref123` |
+
+What it deliberately ignores: invite links (`t.me/joinchat/…`, `t.me/+…`),
+channel post links (`t.me/channel/123`), private channel links
+(`t.me/c/…`) and non-Telegram links — `/start` means nothing to any of
+them. A bare `t.me/name` is resolved first: if it turns out to be a
+**channel** rather than a bot, it is refused, so the module can never
+post `/start` into a channel.
+
+The command does not have to be sent in the same chat as the message it
+quotes. Replying in Saved Messages to a post forwarded from a channel
+works: the reply header names the channel, and the module reads the
+message from there.
+
+Only the **quoted** part is read; the rest of the message is never looked
+at. The one exception is a quote that carries no text at all — replying
+with the quote gesture over a whole message sends `quote=True` with no
+`quote_text`. There is nothing to read in that case, so the full message
+being replied to is used instead, and the summary says which source was
+used. A quote that *does* carry text is never widened behind your back.
+
+Every link is started separately, **including several links to the same
+bot**. The `?start=` value is what identifies the item — a file-hosting
+bot returns a different file for each payload — so `Bot?start=111` and
+`Bot?start=222` are two different requests. Only an exact repeat of the
+same bot and the same payload is collapsed.
+
+A bot that cannot be resolved, is rate-limited, or never answers is
+reported in the summary, and the remaining links still go through. The
+three outcomes are reported separately, because "the bot said nothing"
+and "we could not send" mean very different things:
+
+| Outcome | Meaning |
+| --- | --- |
+| ✅ answered | the bot replied |
+| ⚠️ silent | the `/start` was delivered, no reply within the timeout |
+| ❌ failed | the start could not be delivered (unresolvable, flood wait) |
+
+Enable it with:
+
+```
+.extra enable bot_link_starter
+```
 
 ---
 

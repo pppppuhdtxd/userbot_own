@@ -5,6 +5,222 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.2.6] — 2026-10-22
+
+**Source:** AI — the project owner's request for a new extra module that
+starts the bot links found in a Quote & Reply, one after another, and
+then four rounds of fixes until it actually worked on real messages.
+
+**Headline:** a new optional plugin, `bot_link_starter`. It finds the
+Telegram bot links the user pointed at with Quote & Reply and sends each
+bot its `/start` command in order, so the files or media the links offer
+are delivered.
+
+**Ships disabled**, like every extra module: it does nothing until
+`.extra enable bot_link_starter` is run.
+
+> This entry covers the whole life of the module, and it is long on
+> purpose. The module was written, then failed on real messages four
+> times in a row before it worked. The failures are recorded rather than
+> hidden, because each one was a different misunderstanding of how
+> Telegram delivers a quote — and only by writing them all down does the
+> final shape make sense:
+>
+> 1. **`quote_entities` are never stored.** Verified against the live
+>    API: a message sent with them comes back with `quote_entities =
+>    None`. The quoted text alone was never going to be enough.
+> 2. **The links are not in the text.** On the reported messages the
+>    body contains no URL at all — every link exists only as a
+>    `MessageEntityTextUrl` on the original message.
+> 3. **Clients rewrite the quote.** ` ` becomes a space, runs
+>    collapse, ends are trimmed — so an exact search for the quoted text
+>    in the original fails on real messages that look identical on
+>    screen.
+> 4. **The message is in another chat.** The decisive one, found only by
+>    replaying the project owner's own failed commands off the live
+>    account: the reply header pointed at a **channel** message, and
+>    `get_reply_message()` searches only the current chat — so it
+>    returned `None`. Every previous fix was correct but unreachable,
+>    because the module never got the message at all.
+
+---
+
+### Added
+
+- **`modules_extra/packages/bot_link_starter/`** — a new extra module,
+  laid out like every other module in the project:
+  `` `links.py` `` (finding and parsing the links), `` `handlers.py` ``
+  (the command and the start loop), `` `info.py` `` (help texts and
+  metadata) and `` `__init__.py` `` (the ``create_module`` factory).
+
+- **Both link forms are recognised:**
+  - a plain link — ``https://t.me/MyBot?start=ref123``
+  - a link behind text — Telegram's "create link", which is a
+    ``MessageEntityTextUrl``: the visible text is arbitrary and the
+    real target is in ``.url``.
+  - and a link pasted without a scheme (``t.me/MyBot?start=…``).
+
+  A plain detected link (``MessageEntityUrl``) carries no ``.url`` of its
+  own — it has to be sliced out of the text using the entity's offsets,
+  which are counted in **UTF-16 code units**, so an emoji before a link
+  shifts them. Both details are handled.
+
+- **The links are started in order, three seconds apart** (``delay``), and
+  the payload is sent with ``parse_mode=None`` so it arrives at the bot
+  exactly as it appeared in the link.
+
+- **The result is written back on the `start` message** — a per-bot
+  summary with three distinct outcomes, because they mean different
+  things and used to be indistinguishable:
+
+  | Outcome | Meaning |
+  | --- | --- |
+  | ✅ answered | the bot replied |
+  | ⚠️ silent | the `/start` was delivered, no reply within the timeout |
+  | ❌ failed | the start could not be delivered (unresolvable, flood wait) |
+
+  One failure does not stop the rest of the batch.
+
+- **Only Telegram bot links are processed.** Invite links
+  (``t.me/joinchat/…``, ``t.me/+…``), private channel links
+  (``t.me/c/…``, ``t.me/channel/123``) and non-Telegram links are
+  ignored — ``/start`` means nothing to any of them.
+
+### Fixed
+
+- **The replied message was looked for in the wrong chat — the decisive
+  bug.** `event.get_reply_message()` searches only the **current** chat.
+  A quote can point elsewhere: a command sent in Saved Messages that
+  replies to a post forwarded from a channel carries
+  `reply_to_peer_id = PeerChannel(<id>)`, so the lookup ran against
+  Saved Messages, found nothing, and returned `None` — while the message
+  was perfectly readable at the peer the header names.
+
+  Replaying the owner's own failed commands off the live account showed
+  exactly this: `reply_to_msg_id = 17254`, `reply_to_peer_id =
+  PeerChannel(1692480730)`, `get_reply_message() -> None`.
+
+  The module now falls back to `reply_to_peer_id`: it resolves the peer
+  and fetches the message there. Verified live — the previously failing
+  commands now start 1, 8, 8 and 1 links, and a real `/start` reached
+  the bot, which answered.
+
+- **A bare `t.me/name` could post `/start` into a channel.** The
+  username in such a link may belong to a bot, a user, or a **channel**,
+  and only a bot can be started. The module now checks the resolved
+  entity and refuses anything that is a broadcast channel, so a link in
+  a message can never post text into a channel the account owns.
+
+- **`tg://` links were ignored entirely.** `tg://resolve?domain=Bot&start=x`
+  has no host and no path, so the parser never saw a Telegram URL. These
+  are now unwrapped onto their `https://t.me/...` form.
+
+- **A differently-cased `?start=` key lost the payload.**
+  `?Start=abc` was read as "no payload" and sent a bare `/start`. The
+  key is now matched case-insensitively, as Telegram's own clients do.
+
+- **A quote whose links are hidden behind text found nothing at all.**
+  This was the defect that made the module appear completely broken.
+  A "create link" stores its target **only** in the entity; the visible
+  words are ordinary text — on the reported message the text contains no
+  URL at all, every link exists only as a `MessageEntityTextUrl`. `info`
+  shows those links perfectly because it reads the **original message**.
+
+  Verified against the live API: **Telegram does not store
+  `quote_entities` at all.** A message sent with `quote_entities` comes
+  back with `quote_entities = None` and `quote_offset = None`. So the
+  quote never had the targets to begin with, and reading the quote alone
+  could never work.
+
+  The module now reads the original message's entities, matched to the
+  quote in three ways, each tried only if the previous one finds nothing:
+
+  1. the quoted text located **verbatim** in the message;
+  2. the quoted text located after **normalising whitespace** — clients
+     rewrite `\xa0` to spaces, collapse runs and trim the ends, so a real
+     quote does not match the original character for character;
+  3. the quoted lines matched **by their visible text** against what each
+     entity covers ("Chapter 557" names the entity whose text is
+     "Chapter 557").
+
+  Quoting two lines out of thirty still starts only those two. The
+  selection is never widened to the whole message: an entity the quote
+  does not name is never started.
+
+- **Channel post links were mistaken for bots.** `t.me/somechannel/123`
+  passed the username check (the first path segment *is* a valid
+  username) and the module tried to send `/start` to a channel. A second
+  path segment now means "a post in a channel", not a bot, and is
+  skipped. On the reported message this alone removed three bogus
+  attempts.
+
+- **A whole-message quote always reported "no links found".** Telegram
+  sends `quote=True` with **no** `quote_text` when the reply quotes the
+  entire message rather than a selection. Reading `quote_text` alone got
+  `None` and found nothing in a message full of links. That case now
+  reads the message being replied to, and the report says so.
+
+- **Links to the same bot were collapsed into one.** Deduplication was
+  by username, so four different `?start=` values for one file-hosting
+  bot became a single start — more than half the batch silently
+  discarded. The payload is what identifies the item, so deduplication
+  is now on `(username, payload)`: an exact repeat still collapses, a
+  different payload does not.
+
+- **A bot's silence was reported as a failure.** The first implementation
+  polled `iter_messages` every half second and treated "no new message
+  within 15 s" as failure, even though the `/start` had been delivered.
+  Large files routinely take longer than that. Replies are now detected
+  as events: an `incoming=True` handler resolves a future the moment the
+  bot answers, so a start costs **one API call instead of one every
+  500 ms**, and the timeout is a pure timer (`30 s`) that costs nothing
+  while it waits.
+
+- **A fast bot's reply could be missed.** The wait slot was registered
+  after `send_message` returned, leaving a window in which a bot could
+  answer before anything was listening. The future is now created
+  **before** the send, and cleaned up in a `finally` so a later message
+  from the same bot can never resolve a future nobody is waiting on.
+
+- **The same link could be reported twice** when an emoji appeared
+  before it: the entity offsets are counted in UTF-16 units while the
+  raw-text scan works in characters, so the two sources disagreed about
+  where the link was. Both are now converted to the same unit before
+  they are compared. Likewise, a link found both as an entity and in the
+  raw text is merged by position, with the entity's version winning — it
+  carries the exact characters Telegram saw.
+
+### Removed
+
+- **`modules_extra/packages/example_module/`** — the template /
+  smoke-test module. `bot_link_starter` is now a real extra module and
+  serves the same purpose, so the example was redundant. Every reference
+  to it in the README and in `module_manager`'s help text was updated.
+
+### Notes
+
+- The module ships **disabled**. Enable it with
+  `` .extra enable bot_link_starter ``, and disable it again with
+  `` .extra disable bot_link_starter ``.
+- ``delay`` (3 s between starts) and ``timeout`` (30 s to wait for a
+  bot's answer) are attributes on the module instance, so they can be
+  adjusted without touching the logic.
+- The report header always names the source the links were read from
+  (the quote / the quoted range of the original / the whole message),
+  so a widened or redirected read is never silent.
+- `parse_bot_link` was swept over **29 link forms** — scheme variants,
+  `www.`, the legacy host, encoded and `+`-joined payloads, duplicate
+  and empty payloads, invites, private-channel and post links, proxy,
+  sticker and share links, `tg://`, and mixed case. All 29 behave
+  correctly.
+- The full quote path was swept over every contiguous 1–5 line
+  selection of 10 real channel messages (129 selections carrying bot
+  links): every one produced the right number of starts.
+- Channel-post links (`t.me/channel/123`) are still skipped — `/start`
+  means nothing to them.
+
+---
+
 ## [3.2.5] — 2026-10-21
 
 **Source:** AI — the project owner's request to convert the six remaining

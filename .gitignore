@@ -51,8 +51,9 @@ desktop.ini
 *.sqlite
 *.sqlite3
 *.db
+
 # ===============================
-# فایل های اضافی
+# فایل‌های اضافی
 # ===============================
 update_github.bat
 userbot_own.zip

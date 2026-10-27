@@ -20,7 +20,13 @@ import sys
 from pathlib import Path
 
 from userbot_own.config.env import env_int, env_str, load_dotenv
-from userbot_own.config.models import AccountConfig, Paths, Settings
+from userbot_own.config.models import (
+    AccountConfig,
+    ConnectionSettings,
+    Paths,
+    Settings,
+)
+from userbot_own.helpers.utils import write_json_file_atomic
 
 
 def load_settings(env_file: Path | None = None) -> Settings:
@@ -116,4 +122,103 @@ def discover_accounts(paths: Paths) -> list[AccountConfig]:
     return accounts
 
 
-__all__ = ["load_settings", "discover_accounts"]
+# ── Connection settings (v3.2.7) ───────────────────────────────────────────────
+
+#: File (under paths.data) holding the single system-wide connection config.
+#: Written by save_connection_settings(); read by load_connection_settings().
+CONNECTION_FILE: str = "connection.json"
+
+
+def load_connection_settings(paths: Paths) -> ConnectionSettings:
+    """
+    Load the system-wide connection settings from `data/connection.json`.
+
+    Every failure mode — missing file, unreadable file, invalid JSON,
+    missing/invalid fields — degrades to `ConnectionSettings.direct_default()`
+    (the exact pre-3.2.7 behavior). A hand-mangled settings file can never
+    leave the bot unable to connect; worst case it falls back to what 3.2.6
+    did. Nothing here prints, raises, or exits.
+
+    v3.2.7 file schema (all keys optional; unknown keys ignored):
+
+        {
+          "mode": "direct" | "socks5" | "cf",
+          "socks5": {"host": str, "port": int, "username": str, "password": str},
+          "cf":    {"worker_domain": str}
+        }
+    """
+    file = paths.data / CONNECTION_FILE
+
+    try:
+        raw: dict = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ConnectionSettings.direct_default()
+
+    if not isinstance(raw, dict):
+        return ConnectionSettings.direct_default()
+
+    mode = str(raw.get("mode", "direct")).strip().lower()
+    if mode not in ("direct", "socks5", "cf"):
+        return ConnectionSettings.direct_default()
+
+    socks = raw.get("socks5") or {}
+    if not isinstance(socks, dict):
+        socks = {}
+
+    cf = raw.get("cf") or {}
+    if not isinstance(cf, dict):
+        cf = {}
+
+    try:
+        socks_port = int(socks.get("port", 1080))
+    except (ValueError, TypeError):
+        socks_port = 1080
+    if not (1 <= socks_port <= 65535):
+        socks_port = 1080
+
+    return ConnectionSettings(
+        mode=mode,
+        socks_host=str(socks.get("host", "")).strip(),
+        socks_port=socks_port,
+        socks_user=str(socks.get("username", "")).strip(),
+        socks_pass=str(socks.get("password", "")),
+        cf_worker_domain=str(cf.get("worker_domain", "")).strip().lower(),
+    )
+
+
+def save_connection_settings(paths: Paths, settings: ConnectionSettings) -> Exception | None:
+    """
+    Atomically write *settings* to `data/connection.json`.
+
+    Uses the same write_json_file_atomic() pattern as every other settings
+    file in this project: a crash mid-write can never corrupt the real file,
+    only the sibling temp file. Returns the exception on failure (or None on
+    success) — the caller decides how loudly to report it; the settings
+    menu (settings.py, Phase 5) will surface it in Persian.
+    """
+    data = {
+        "mode": settings.mode,
+        "socks5": {
+            "host": settings.socks_host,
+            "port": settings.socks_port,
+            "username": settings.socks_user,
+            "password": settings.socks_pass,
+        },
+        "cf": {
+            "worker_domain": settings.cf_worker_domain,
+        },
+    }
+
+    paths.data.mkdir(parents=True, exist_ok=True)
+    return write_json_file_atomic(
+        paths.data / CONNECTION_FILE, data, indent=2, tmp_suffix=".json.tmp"
+    )
+
+
+__all__ = [
+    "load_settings",
+    "discover_accounts",
+    "load_connection_settings",
+    "save_connection_settings",
+    "CONNECTION_FILE",
+]

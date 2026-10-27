@@ -144,6 +144,85 @@ class Settings:
     fast_reconnect_probe_interval:   float = 3.0
 
 
+# ── ConnectionSettings (v3.2.7) ────────────────────────────────────────────────
+
+#: Valid values for ConnectionSettings.mode.
+#:   "direct" — plain MTProto to Telegram IPs (the pre-3.2.7 behavior, default)
+#:   "socks5" — route the MTProto stream through a SOCKS5 proxy
+#:   "cf"     — Cloudflare route: MTProto-over-WebSocket through
+#:              *.web.telegram.org (Telegram's own web endpoints, which sit
+#:              behind Cloudflare), optionally via a personal Cloudflare
+#:              Worker when even the web domains are blocked.
+CONNECTION_MODES: tuple[str, ...] = ("direct", "socks5", "cf")
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionSettings:
+    """
+    Global (system-wide) connection settings — v3.2.7.
+
+    Deliberately NOT per-account: the whole process (the running bot for
+    every account AND the short-lived login/verify clients built by
+    account_management/cli.py) shares one connection configuration, per
+    the owner's explicit design decision.
+
+    Loaded from `data/connection.json` by config/loader.py's
+    load_connection_settings(). Missing file / missing fields / invalid
+    values all degrade to the pre-3.2.7 direct-connection behavior — a
+    broken or hand-mangled settings file can never make the bot unable
+    to connect at all; worst case it falls back to what 3.2.6 did.
+
+    Attributes:
+        mode:        "direct" | "socks5" | "cf" (see CONNECTION_MODES).
+        socks_host:  SOCKS5 proxy hostname/IP (socks5 mode only).
+        socks_port:  SOCKS5 proxy port (socks5 mode only).
+        socks_user:  Optional SOCKS5 username; "" = no auth.
+        socks_pass:  Optional SOCKS5 password; "" = no auth.
+        cf_worker_domain: Optional personal Cloudflare Worker domain
+                     (cf mode only). Empty string = no worker — connect
+                     directly to Telegram's own `*.web.telegram.org`
+                     endpoints (zero-configuration CF route). When set,
+                     the same WebSocket transport targets
+                     `wss://<domain>/<dc-host>/apiws` instead, and the
+                     worker relays to Telegram.
+    """
+    mode: str = "direct"
+    socks_host: str = ""
+    socks_port: int = 1080
+    socks_user: str = ""
+    socks_pass: str = ""
+    cf_worker_domain: str = ""
+
+    @classmethod
+    def direct_default(cls) -> ConnectionSettings:
+        """The exact pre-3.2.7 behavior, used whenever anything is missing."""
+        return cls(mode="direct")
+
+    def is_socks5(self) -> bool:
+        """True when the mode selects SOCKS5 with a usable host."""
+        return self.mode == "socks5" and bool(self.socks_host)
+
+    def is_cf(self) -> bool:
+        """True when the mode selects the Cloudflare route."""
+        return self.mode == "cf"
+
+    def describe(self) -> str:
+        """One-line human summary for logs and the settings menu."""
+        if self.is_cf():
+            target = self.cf_worker_domain or "web.telegram.org (built-in)"
+            return f"Cloudflare route via {target}"
+        if self.is_socks5():
+            return f"SOCKS5 proxy {self.socks_host}:{self.socks_port}"
+        return "Direct connection"
+
+    def __post_init__(self) -> None:
+        if self.mode not in CONNECTION_MODES:
+            raise ValueError(
+                f"Unknown connection mode {self.mode!r} "
+                f"(expected one of {CONNECTION_MODES})"
+            )
+
+
 # ── AccountConfig ─────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
@@ -186,4 +265,4 @@ class AccountConfig:
     session_string: str = ""
 
 
-__all__ = ["Paths", "Settings", "AccountConfig"]
+__all__ = ["Paths", "Settings", "AccountConfig", "ConnectionSettings", "CONNECTION_MODES"]

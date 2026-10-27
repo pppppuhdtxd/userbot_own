@@ -5,6 +5,92 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.2.7] — 2026-10-27
+
+**Source:** AI — the project owner's request for a zero-friction way to run
+the bot on filtered networks ("cf proxy"), followed by a root-cause
+investigation of why a reachable Worker did not imply a working Telegram
+connection, and closed by an end-of-version menu overhaul.
+
+**Headline:** the bot can now reach Telegram through Cloudflare — no VPN, no
+special knowledge, no extra tools. The connection mode is a single
+**system-wide** setting with three routes (direct / SOCKS5 / CF), and the
+Settings menu is a single-keypress menu with a matching subcommand surface.
+
+> Why this exists: on the owner's network, direct MTProto TCP to Telegram's
+> DC IPs is blocked, and Telegram's official web endpoints
+> (`*.web.telegram.org`) are blocked too. Cloudflare itself is reachable.
+> The fix is the same technique Telegram's own web client uses: MTProto
+> (obfuscated2 + Abridged framing) inside binary WebSocket frames over TLS.
+> Two CF routes ship:
+>
+> - **without a Worker** — dial `wss://<dc>.web.telegram.org/apiws`
+>   directly (works wherever the web client works);
+> - **with a personal relay Worker** (`cloudflare/tg-relay-worker.js`) —
+>   dial `wss://<your-worker>/<dc-host>/apiws` and let the Worker relay
+>   the bytes, for networks where the official endpoints are blocked too.
+>   **Verified live on the owner's account and network.**
+
+---
+
+### Added
+
+- **CF connection mode** — `ConnectionSettings` gains `cf` mode plus a
+  `cf_worker_domain` field; the Worker hostname is the only thing the
+  user ever types. `data/connection.json` holds the whole system-wide
+  setting:
+  `{"mode": "cf", "socks5": {...}, "cf": {"worker_domain": "…"}}`.
+  A missing/invalid file still degrades to **direct** — startup can
+  never break because of settings.
+- **`core/connection_ws.py`** — MTProto-over-WebSocket transport for
+  Telethon (`make_ws_connection_class`), plus `WsStream`: a minimal
+  `asyncio` TLS+WS client whose framing the transport class drives.
+- **`core/connection_selector.py`** — the single place that turns the
+  saved mode into Telethon client kwargs (direct tuple / SOCKS5 tuple /
+  custom connection class), used by the bot **and** `add_account.py`'s
+  login clients, so login and runtime can never disagree.
+- **`cloudflare/tg-relay-worker.js`** — the personal relay Worker
+  (deploy instructions in README; **no token, no hidden path** — by the
+  owner's explicit decision it stays a plain public WebSocket relay).
+- **Settings menu rewrite (end-of-3.2.7)** — `settings.py` is now a
+  run.bat-style single-keypress menu:
+  `1` show · `2` direct · `3` SOCKS5 · `4` CF without Worker ·
+  `5` CF with Worker · `6` test · `7` exit. The same actions are
+  subcommands (`show`, `set-direct`, `set-socks5`, `set-cf-no-worker`,
+  `set-cf-worker [domain]`, `test`), so run.bat's new numeric sub-menu
+  and the Termux `userbot settings <command>` shortcut drive it with
+  zero JSON handling in shell code. `test` performs a real TLS + WS
+  handshake on the exact route the bot would dial (not a bare TCP ping).
+- **run.bat option [3]** is now a two-level sub-menu: Connection
+  settings (show / change mode / test / back), with the four modes
+  one level deeper in their own menu (direct / SOCKS5 / CF without /
+  with Worker). Every action returns to the Connection settings
+  menu, so several settings can be checked in a row. The main menu
+  title also shows the current version, read live from the `VERSION`
+  file — future releases display automatically.
+- **Launcher (Termux/Linux)** — single-keypress main menu; `userbot
+  settings` passes subcommands through.
+
+### Fixed
+
+- **The Worker-domain trap.** The previous settings menu re-used the
+  current Worker domain as the default answer, so pressing Enter always
+  re-saved it: the "without Worker" CF route was unreachable and a saved
+  domain could never be cleared. Without-Worker and with-Worker are now
+  separate explicit options, and an empty hostname input **cancels**
+  instead of silently keeping the old value.
+
+### Notes
+
+- The CF routes need no new Python dependencies — the WS transport is
+  plain `asyncio`.
+- Everything is English-only in the console UI, per the owner's standing
+  request (RTL rendering issues in the Windows console).
+- Not deployable from this repo: the Worker itself is deployed from the
+  Cloudflare dashboard (README § Deploying the personal relay Worker).
+
+---
+
 ## [3.2.6] — 2026-10-22
 
 **Source:** AI — the project owner's request for a new extra module that

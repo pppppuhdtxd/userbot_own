@@ -255,15 +255,18 @@ LAUNCHER_DEST="${BIN_DIR}/${LAUNCHER_NAME}"
 if [ -f "${INSTALL_DIR}/main.py" ]; then
   MAIN_PY="${INSTALL_DIR}/main.py"
   ADD_ACCOUNT_PY="${INSTALL_DIR}/add_account.py"
+  SETTINGS_PY="${INSTALL_DIR}/settings.py"
   RUN_DIR="${INSTALL_DIR}"
 elif [ -f "${INSTALL_DIR}/userbot/main.py" ]; then
   MAIN_PY="${INSTALL_DIR}/userbot/main.py"
   ADD_ACCOUNT_PY="${INSTALL_DIR}/userbot/add_account.py"
+  SETTINGS_PY="${INSTALL_DIR}/userbot/settings.py"
   RUN_DIR="${INSTALL_DIR}/userbot"
 else
   # Fallback — write paths anyway; user will see a clear error at runtime
   MAIN_PY="${INSTALL_DIR}/main.py"
   ADD_ACCOUNT_PY="${INSTALL_DIR}/add_account.py"
+  SETTINGS_PY="${INSTALL_DIR}/settings.py"
   RUN_DIR="${INSTALL_DIR}"
 fi
 
@@ -276,6 +279,7 @@ INSTALL_DIR="${INSTALL_DIR}"
 VENV_PY="\${INSTALL_DIR}/.venv/bin/python"
 MAIN_PY="${MAIN_PY}"
 ADD_ACCOUNT_PY="${ADD_ACCOUNT_PY}"
+SETTINGS_PY="${SETTINGS_PY}"
 RUN_DIR="${RUN_DIR}"
 VERSION_FILE="\${INSTALL_DIR}/VERSION"
 
@@ -308,6 +312,17 @@ case "\${1:-}" in
     cd "\$RUN_DIR"
     exec "\$VENV_PY" "\$ADD_ACCOUNT_PY"
     ;;
+  settings)
+    # Connection settings (v3.2.7): system-wide direct / SOCKS5 / CF mode.
+    # Extra args pass through, so `userbot settings show` / set-direct /
+    # set-socks5 / set-cf-no-worker / set-cf-worker / test all work.
+    cd "\$RUN_DIR"
+    if [ "\$#" -ge 2 ]; then
+      shift
+      exec "\$VENV_PY" "\$SETTINGS_PY" "\$@"
+    fi
+    exec "\$VENV_PY" "\$SETTINGS_PY"
+    ;;
   update)
     # Fast path: run the lightweight updater already on disk (git sync +
     # deps + cache clear), NOT the full installer. Falls back to the full
@@ -328,30 +343,33 @@ case "\${1:-}" in
     exit 0
     ;;
   "")
-    # Interactive menu
+    # Interactive menu — single keypress, no Enter needed.
     printf "\n\${B}=== userbot_own — v%s ===\${R}\n" "\$(current_version)"
     printf "1) Run bot\n"
     printf "2) Manage accounts\n"
-    printf "3) Update\n"
-    printf "4) Quit\n"
-    printf "Select an option: "
-    read -r choice
+    printf "3) Connection settings (direct / SOCKS5 / CF)\n"
+    printf "4) Update\n"
+    printf "5) Quit\n"
+    printf "Your choice [1-5]: "
+    read -r -n 1 choice
+    printf "\n"
     case "\$choice" in
       1) cd "\$RUN_DIR" && exec "\$VENV_PY" "\$MAIN_PY" ;;
       2) cd "\$RUN_DIR" && exec "\$VENV_PY" "\$ADD_ACCOUNT_PY" ;;
-      3)
+      3) cd "\$RUN_DIR" && exec "\$VENV_PY" "\$SETTINGS_PY" ;;
+      4)
         if [ -f "\${INSTALL_DIR}/update.sh" ]; then
           exec bash "\${INSTALL_DIR}/update.sh"
         else
           exec bash -c 'curl -fsSL https://raw.githubusercontent.com/pppppuhdtxd/userbot_own/main/install.sh | bash'
         fi
         ;;
-      4) exit 0 ;;
+      5) exit 0 ;;
       *) printf "Invalid option.\n"; exit 1 ;;
     esac
     ;;
   *)
-    printf "Usage: userbot [run|add|update|reinstall|version]\n"
+    printf "Usage: userbot [run|add|settings [command]|update|reinstall|version]\n"
     exit 1
     ;;
 esac

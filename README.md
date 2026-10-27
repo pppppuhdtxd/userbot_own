@@ -27,16 +27,21 @@ userbot
 You'll get an interactive menu:
 
 ```
-=== userbot_own ===
+=== userbot_own — v3.2.7 ===
 1) Run bot
 2) Manage accounts
-3) Update
-4) Quit
-Select an option:
+3) Connection settings (direct / SOCKS5 / CF)
+4) Update
+5) Quit
+Your choice [1-5]:        ← single keypress, no Enter needed
 ```
 
 - **Run bot** — starts `main.py`.
 - **Manage accounts** — runs `add_account.py` to add/configure a Telegram account.
+- **Connection settings** — runs `settings.py`, the interactive manager for
+  the system-wide connection mode (direct / SOCKS5 / Cloudflare, each of
+  them one keypress — see below). See
+  [Connection modes](#connection-modes) for the full picture.
 - **Update** — pulls the latest code and refreshes dependencies. This is
   always safe to run: it **never touches your `accounts/`, `.env`, or
   `data/` folders** — only the codebase and installed packages.
@@ -47,6 +52,7 @@ You can also skip the menu with direct shortcuts:
 ```bash
 userbot run      # start the bot directly
 userbot add      # jump straight to account management
+userbot settings # connection settings (direct / SOCKS5 / CF)
 userbot update   # update directly
 ```
 
@@ -72,7 +78,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.2.6`
+**Current version:** `3.2.7`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -96,6 +102,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history.
 - [Architecture Overview](#architecture-overview)
 - [Message Classification System](#message-classification-system)
 - [Account Setup](#account-setup)
+- [Connection modes](#connection-modes-v327)
 - [Configuration](#configuration)
 - [Available Commands](#available-commands)
 - [Hot-Reload System](#hot-reload-system)
@@ -112,7 +119,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history.
 | --- | --- |
 | **Multi-account** | Run any number of Telegram accounts simultaneously, all equal (no admin/owner tiering) |
 | **Hot-reload** | Add, remove, or edit module files while the bot is running — no restart |
-| **Direct connection** | No proxy layer to configure or fail; for restricted networks, use a system-level VPN (WireGuard, OpenVPN, V2Ray) |
+| **Connection modes** | System-wide connection setting — direct (default), SOCKS5 proxy, or Cloudflare (CF proxy) — no VPN or special tools needed; managed from the Settings menu |
 | **Message classification** | Unified priority system (`file > vid > pic > link > txt > other`) across all modules |
 | **Category-based help** | RTL-friendly help output with 7 logical categories, plus per-module detail via `help <module>` |
 | **Reaction commands** | Execute commands by reacting to messages with emojis — push-based (zero polling), works on bots, users, groups, and channels per-type toggle |
@@ -171,6 +178,8 @@ userbot_own/
 ├── pyproject.toml                 ← ruff configuration + project metadata
 ├── main.py                        ← thin launcher → userbot_own.app.application.main()
 ├── add_account.py                 ← thin launcher → userbot_own.account_management.cli.main()
+├── settings.py                    ← thin launcher → userbot_own.settings_menu.cli.main() (v3.2.7)
+├── run.bat                        ← Windows control menu (run / accounts / settings / exit)
 │
 └── userbot_own/
     ├── __init__.py                ← exposes __version__ (reads VERSION)
@@ -189,7 +198,9 @@ userbot_own/
     │   ├── exceptions.py            ← structured exception hierarchy
     │   ├── context.py                ← ModuleContext (constructor-injection payload)
     │   ├── registry.py               ← AccountRegistry, AccountLoaderRegistry
-    │   ├── telegram_client.py        ← TelegramClient factory (direct connection)
+    │   ├── telegram_client.py        ← TelegramClient factory (system-wide connection mode)
+    │   ├── connection_selector.py    ← mode → Telethon kwargs (direct / SOCKS5 / CF)
+    │   ├── connection_ws.py          ← MTProto-over-WebSocket transport (CF mode)
     │   ├── loader.py                 ← per-account plugin loader + hot-reload
     │   ├── logging_setup.py          ← centralized structured logging
     │   ├── reconnector.py            ← per-account reconnect loop
@@ -270,6 +281,9 @@ userbot_own/
     ├── account_management/
     │   └── cli.py                    ← interactive `python add_account.py` menu
     │
+    ├── settings_menu/
+    │   └── cli.py                    ← interactive `python settings.py` menu (connection mode)
+    │
     ├── accounts/
     │   ├── 1/
     │   │   ├── account.json          ← credentials (api_id, api_hash, phone)
@@ -278,6 +292,7 @@ userbot_own/
     │
     └── data/
         ├── logs/                     ← rotating log files
+        ├── connection.json           ← system-wide connection mode (v3.2.7)
         └── settings/                 ← per-account runtime settings
             ├── account1/
             │   ├── join_left.json
@@ -287,6 +302,10 @@ userbot_own/
             │   └── enabled_modules.json  ← which modules_extra/ files are on (v3.1.0)
             └── account2/ …
 ```
+
+> The v3.2.7 connection layer also ships a Cloudflare Worker script outside
+> the package, at [`cloudflare/tg-relay-worker.js`](cloudflare/tg-relay-worker.js)
+> in the repo root — see [Connection modes](#connection-modes-v327).
 
 ---
 
@@ -384,9 +403,78 @@ minutes, instead of retrying every few seconds. Re-login with
 `python add_account.py`; restart the bot to bring the account back at once,
 otherwise it is picked up at the next check.
 
-There is no proxy layer — connections are always direct. If your network
-blocks Telegram, use a system-level VPN (WireGuard, OpenVPN, V2Ray); the bot
-has no visibility into or control over that layer.
+### Connection modes (v3.2.7)
+
+The bot's connection to Telegram is a **system-wide** setting — one mode for
+the whole process: every account of the running bot *and* the login/verify
+clients of `add_account.py` alike. It is never per-account. Three modes are
+available, managed by the Settings menu (`settings.py`; on Windows run.bat
+option **[3]**, on Termux/Linux `userbot settings` or menu option **3**).
+Every option in the menu is a **single keypress** that saves immediately —
+no Enter, no confirmation screens:
+
+```
+1  Show current settings
+2  Direct connection
+3  SOCKS5 proxy                       (prompts for host/port/etc.)
+4  Cloudflare — without Worker        (official endpoints)
+5  Cloudflare — with Worker           (prompts for the Worker's hostname)
+6  Test connection
+7  Exit
+```
+
+1. **Direct** *(the default)* — pre-3.2.7 behavior exactly: a plain MTProto
+   TCP connection to Telegram's DC IPs. No proxy layer to configure or fail.
+2. **SOCKS5** — Telethon's native proxy tuple through your own SOCKS5 server.
+3. **CF proxy (Cloudflare)** — MTProto over WebSocket through Cloudflare:
+   no VPN needed. Options **4** and **5** are its two sub-routes as explicit
+   choices: **4** connects to Telegram's own official web endpoints
+   (`*.web.telegram.org`), which are served over Cloudflare and therefore
+   behave like any normal HTTPS site on filtered networks — zero
+   configuration. **5** points it at your **personal relay Worker** instead
+   (see below). Switching between them is one keypress in either direction,
+   and entering an empty hostname in option 5 cancels without changing
+   anything.
+
+Everything lives in one file, `data/connection.json`, and applies to all of
+the above consumers. If that file is missing or invalid, the bot silently
+falls back to **direct** — so a fresh install or a corrupted settings file
+can never break startup. The active mode is printed on every startup as a
+`Connection mode: ...` log line.
+
+> The setting takes effect the **next time the bot (or add_account.py)
+> starts** — the running process is never reconfigured mid-flight.
+
+#### Deploying the personal relay Worker (optional, CF mode)
+
+Only needed if your network also blocks `*.web.telegram.org`. The Worker is
+a tiny Cloudflare function that relays WebSocket traffic to Telegram's MTProto
+endpoint — the same technique Telegram's own web client uses.
+
+1. On [dash.cloudflare.com](https://dash.cloudflare.com), open
+   **Workers & Pages → Create application → Worker**, name it (e.g.
+   `userbot-relay`), and deploy any placeholder to get past the wizard.
+2. Open the created Worker → **Edit code**, paste the entire contents of
+   [`cloudflare/tg-relay-worker.js`](cloudflare/tg-relay-worker.js) from this
+   repository, and **Deploy**.
+3. Copy the Worker's URL (`https://userbot-relay.<your-subdomain>.workers.dev`).
+4. In the Settings menu, pick **Cloudflare — with Worker** (in run.bat:
+   Connection settings → Change connection mode; in the interactive
+   `settings.py` menu: option 5) and enter the hostname
+   (`userbot-relay.<your-subdomain>.workers.dev`).
+
+Prefer the command line? The same steps work without the menu:
+
+```bash
+python settings.py set-cf-worker userbot-relay.your-subdomain.workers.dev
+python settings.py test        # verify the route answers the WS handshake
+```
+
+(On Termux/Linux: `userbot settings set-cf-worker …` — the launcher passes
+the subcommand through.)
+
+No API keys, no secret tokens — the Worker relays WebSocket bytes only, and
+Cloudflare's free tier is far more than the bot needs.
 
 ### Registries
 
@@ -1119,9 +1207,12 @@ A: Yes. Replace `source .venv/bin/activate` with `.venv\Scripts\activate`.
 
 **Q: Does this support proxies?**
 
-A: No — direct connection only. If your network blocks Telegram, use a
-system-level VPN (WireGuard, OpenVPN, V2Ray) on Termux or Windows; the bot
-has no proxy layer of its own to configure.
+A: Yes, as of v3.2.7 — one system-wide setting (direct / SOCKS5 / Cloudflare),
+managed from the Settings menu (run.bat option [3] on Windows,
+`userbot settings` on Termux/Linux; every menu option is a single
+keypress). See [Connection modes](#connection-modes-v327). Direct remains
+the default, and the bot falls back to it whenever `data/connection.json`
+is missing or invalid.
 
 ---
 

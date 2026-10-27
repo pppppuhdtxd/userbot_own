@@ -500,10 +500,21 @@ def _build_client(cfg: dict, account_dir: Path):
     is required for this to work. Otherwise, fall back to the file-based
     session at accounts/N/session.session, exactly as before.
 
+    v3.2.7: honors the system-wide connection mode (data/connection.json)
+    exactly like the long-lived bot clients do — adding an account must
+    work through the same route the bot itself uses (the owner's explicit
+    requirement: the connection setting is system-wide, no exceptions,
+    including the login/verify flow). Direct mode reproduces the
+    pre-3.2.7 constructor call byte-for-byte.
+
     Raises ImportError if telethon is not installed (caller handles it).
     """
     from telethon import TelegramClient
     from telethon.network.connection import ConnectionTcpAbridged
+
+    from userbot_own.config.loader import load_connection_settings
+    from userbot_own.config.models import Paths
+    from userbot_own.core.connection_selector import connection_mode_kwargs
 
     session_string = str(cfg.get("session_string", "")).strip()
     if session_string:
@@ -512,17 +523,28 @@ def _build_client(cfg: dict, account_dir: Path):
     else:
         session = str(account_dir / "session")
 
-    return TelegramClient(
-        session,
-        cfg["api_id"],
-        cfg["api_hash"],
+    conn = load_connection_settings(Paths.from_base(BASE_DIR))
+
+    kwargs = {
         # v3.1.10 note: the long-lived bot client (core/telegram_client.py)
         # uses ConnectionTcpFull (checksummed); this short-lived login/verify
         # client uses the lighter Abridged transport. Both are standard MTProto
         # transports the server accepts. The audit found no documented reason
         # for the difference and left it alone rather than unify: changing how
         # the login flow connects cannot be verified without a live account.
-        connection=ConnectionTcpAbridged,
+        "connection": ConnectionTcpAbridged,
+    }
+    # v3.2.7: mode selection overrides the default Abridged transport and
+    # may add a "proxy" kwarg (socks5). cf mode is Phase 3/4 — until it
+    # lands, connection_mode_kwargs() raises a clear RuntimeError if the
+    # user has somehow selected cf in connection.json by hand.
+    kwargs.update(connection_mode_kwargs(conn, default_connection=ConnectionTcpAbridged))
+
+    return TelegramClient(
+        session,
+        cfg["api_id"],
+        cfg["api_hash"],
+        **kwargs,
     )
 
 

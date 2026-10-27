@@ -1,11 +1,17 @@
 """
 userbot_own/core/telegram_client.py  (was core/client.py)
 ════════════════════════════════════════════════════════════════
-TelegramClient Factory — Direct Connection Only
+TelegramClient Factory
 
-Builds TelegramClient instances for each account using direct connection
-to Telegram servers. No proxy support — for bypassing restrictions,
-use system-level VPN (WireGuard, OpenVPN, V2Ray) on Termux or Windows.
+Builds TelegramClient instances for each account. v3.2.7 adds the
+system-wide connection-mode selection: "direct" (default, the exact
+pre-3.2.7 behavior), "socks5" (native Telethon proxy), and "cf"
+(MTProto over WebSocket via Telegram's Cloudflare-fronted web
+endpoints / a personal CF Worker). The mode is one system-wide
+ConnectionSettings shared by every account and by the login/verify
+clients in account_management/cli.py — never per-account. Selection
+lives in core/connection_selector.py; this file only passes the
+chosen transport through to Telethon.
 
 Client tuning (applied to all accounts):
 • flood_sleep_threshold=0.5 — proactive pre-FloodWait delays
@@ -18,11 +24,12 @@ Client tuning (applied to all accounts):
 Optimized for Termux (Android) and Windows environments.
 
 Public API:
-    AccountClient(cfg) → client factory wrapper
+    AccountClient(cfg, conn) → client factory wrapper
         .build()        → TelegramClient (first build)
         .rebuild()      → TelegramClient (rebuild after disconnect)
         .client         → current TelegramClient instance
         .cfg            → AccountConfig
+        .conn           → ConnectionSettings
 
 NOTE: the original core/client.py re-implemented its own VERSION file
 reader (`_read_version()`) with a fallback ("1.9.1") that had already
@@ -38,7 +45,8 @@ from telethon.network.connection import ConnectionTcpFull
 from telethon.sessions import StringSession
 
 from userbot_own import __version__ as _BOT_VERSION
-from userbot_own.config.models import AccountConfig
+from userbot_own.config.models import AccountConfig, ConnectionSettings
+from userbot_own.core.connection_selector import connection_mode_kwargs
 from userbot_own.core.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -77,12 +85,15 @@ CATCH_UP: bool = True
 
 # ── Connection info builder ──────────────────────────────────────────────────
 
-def _build_connection_kwargs(cfg: AccountConfig) -> dict:
+def _build_connection_kwargs(cfg: AccountConfig, conn: ConnectionSettings) -> dict:
     """
     Build the kwargs dict for TelegramClient constructor.
 
-    Uses direct connection (ConnectionTcpFull) with optimized settings
-    for mobile and desktop environments.
+    Transport (v3.2.7): the system-wide ConnectionSettings decides
+    direct / socks5 / cf via core/connection_selector.py's
+    connection_mode_kwargs(). In "direct" mode (the default — and the
+    fallback for every missing/inconsistent setting) the transport is
+    exactly what 3.2.6 used, ConnectionTcpFull with no proxy kwarg.
 
     Session source (v3.1.3+): if cfg.session_string is set (populated by
     account_management/cli.py, either from a fresh login or from an
@@ -96,7 +107,7 @@ def _build_connection_kwargs(cfg: AccountConfig) -> dict:
         Dict ready to be unpacked into TelegramClient(**kwargs).
     """
     session = StringSession(cfg.session_string) if cfg.session_string else cfg.session_path
-    return {
+    kwargs = {
         "session":               session,
         "api_id":                cfg.api_id,
         "api_hash":              cfg.api_hash,
@@ -105,7 +116,6 @@ def _build_connection_kwargs(cfg: AccountConfig) -> dict:
         # corrupted packet on an unreliable link is detected rather than
         # silently mis-parsed. account_management/cli.py's short-lived
         # login/verify clients use Abridged — see the comment there.
-        "connection":            ConnectionTcpFull,
         "flood_sleep_threshold": FLOOD_SLEEP_THRESHOLD,
         "request_retries":       REQUEST_RETRIES,
         "retry_delay":           RETRY_DELAY,
@@ -116,6 +126,11 @@ def _build_connection_kwargs(cfg: AccountConfig) -> dict:
         "catch_up":              CATCH_UP,
         "auto_reconnect":        False,  # Let our reconnector own reconnection
     }
+    # v3.2.7: mode selection overrides the default ConnectionTcpFull
+    # and may add a proxy kwarg (socks5). Direct mode reproduces the
+    # pre-3.2.7 dict byte-for-byte.
+    kwargs.update(connection_mode_kwargs(conn, default_connection=ConnectionTcpFull))
+    return kwargs
 
 
 # ── AccountClient wrapper ────────────────────────────────────────────────────
@@ -126,7 +141,7 @@ class AccountClient:
 
     Usage::
 
-        >>> ac = AccountClient(cfg)
+        >>> ac = AccountClient(cfg, conn)
         >>> client = ac.build()           # first build
         >>> # ... run the bot ...
         >>> client = ac.rebuild()         # after disconnect
@@ -137,26 +152,33 @@ class AccountClient:
 
     Attributes:
         cfg:    Immutable AccountConfig for this account.
+        conn:   System-wide ConnectionSettings (v3.2.7) — never per-account.
         client: Current TelegramClient instance (None before first build).
     """
 
-    def __init__(self, cfg: AccountConfig) -> None:
+    def __init__(self, cfg: AccountConfig, conn: ConnectionSettings | None = None) -> None:
         self.cfg: AccountConfig = cfg
+        # v3.2.7: None → direct (pre-3.2.7 behavior) so every existing
+        # call site and test that constructs AccountClient(cfg) keeps
+        # working unchanged; composition_root passes the real settings.
+        self.conn: ConnectionSettings = conn or ConnectionSettings.direct_default()
         self.client: TelegramClient | None = None
 
     def build(self) -> TelegramClient:
         """
-        Build a new TelegramClient for this account using direct connection.
+        Build a new TelegramClient for this account using the configured
+        connection mode (direct / socks5 / cf — see connection_selector).
 
         Returns:
             The newly created TelegramClient (also stored in self.client).
         """
-        kwargs = _build_connection_kwargs(self.cfg)
+        kwargs = _build_connection_kwargs(self.cfg, self.conn)
         self.client = TelegramClient(**kwargs)
         session_source = "string session" if self.cfg.session_string else "file session"
         log.info(
-            "[Account%d] Client built — direct connection (%s).",
+            "[Account%d] Client built — %s (%s).",
             self.cfg.index,
+            self.conn.describe(),
             session_source,
         )
         return self.client

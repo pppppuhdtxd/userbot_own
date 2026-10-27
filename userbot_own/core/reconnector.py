@@ -206,6 +206,7 @@ from userbot_own.helpers.utils import flood_seconds
 if TYPE_CHECKING:
     from telethon import TelegramClient
 
+    from userbot_own.config.models import ConnectionSettings
     from userbot_own.core.loader import AccountLoader
     from userbot_own.core.telegram_client import AccountClient
 
@@ -284,14 +285,20 @@ class NetworkState(Enum):
     UNKNOWN = auto()       # Couldn't determine
 
 
-#: Known Telegram DC IP used for both detect_network_state()'s TCP-connect
-#: step and the v3.1.1 fast-reconnect probe (_cheap_probe_online()) — kept
-#: as one constant so the two only ever test the same endpoint.
+#: Known Telegram DC IP used by the pre-3.2.7 probes — kept as the
+#: direct/socks5-mode probe target, and as the fallback whenever a
+#: connection mode is somehow missing. v3.2.7: the actual per-mode probe
+#: target is decided by core/connection_selector.probe_host_port() —
+#: a mode that dials a different endpoint must probe that endpoint,
+#: not this one, or the reconnector misclassifies reachable-as-down.
 _TELEGRAM_PROBE_HOST: str = "149.154.167.50"
 _TELEGRAM_PROBE_PORT: int = 443
 
 
-async def detect_network_state(timeout: float = 3.0) -> NetworkState:
+async def detect_network_state(
+    conn: ConnectionSettings | None = None,
+    timeout: float = 3.0,
+) -> NetworkState:
     """
     Detect current network state by testing DNS resolution + Telegram endpoint.
 
@@ -301,6 +308,11 @@ async def detect_network_state(timeout: float = 3.0) -> NetworkState:
     3. If DNS succeeds, try Telegram DC endpoint
     4. If Telegram fails → TELEGRAM_DOWN
     5. If both succeed → ONLINE
+
+    v3.2.7: *conn* (the system-wide ConnectionSettings) selects which
+    endpoint step 2 dials via connection_selector.probe_host_port().
+    None → direct mode's Telegram DC IP, the pre-3.2.7 behavior, so every
+    pre-existing call of this module-level function keeps working.
 
     Returns:
         NetworkState enum value
@@ -317,11 +329,19 @@ async def detect_network_state(timeout: float = 3.0) -> NetworkState:
     except Exception:
         return NetworkState.UNKNOWN
 
-    # Step 2: Telegram endpoint test (lightweight TCP connect)
+    # Step 2: endpoint test (lightweight TCP connect) — target depends
+    # on the connection mode (v3.2.7).
+    host, port = _probe_target(conn)
+
+    # Step 2b: probe target selection can itself fail in an unimplemented
+    # mode (cf before Phase 3) — treat that as UNKNOWN, not as an outage,
+    # so the reconnector doesn't spin on a config problem.
+    if host is None:
+        return NetworkState.UNKNOWN
+
     try:
-        # Try connecting to Telegram DC (149.154.167.50 is a known DC)
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(_TELEGRAM_PROBE_HOST, _TELEGRAM_PROBE_PORT),
+            asyncio.open_connection(host, port),
             timeout=timeout,
         )
         writer.close()
@@ -333,26 +353,55 @@ async def detect_network_state(timeout: float = 3.0) -> NetworkState:
         return NetworkState.UNKNOWN
 
 
-async def _cheap_probe_online(timeout: float = 3.0) -> bool:
+def _probe_target(conn: ConnectionSettings | None) -> tuple[str | None, int]:
+    """
+    Resolve the probe (host, port) for *conn* without ever raising.
+
+    Direct/socks5 → Telegram's DC IP (unchanged). cf → the WebSocket
+    endpoint the client actually dials (Phase 3). A mode that cannot be
+    resolved yet (unimplemented cf, or a selector RuntimeError on a
+    hand-mangled connection.json) yields (None, 0) — callers treat None
+    as "can't classify" rather than as an outage.
+    """
+    from userbot_own.core.connection_selector import probe_host_port
+
+    try:
+        return probe_host_port(conn)
+    except Exception:
+        return (None, 0)
+
+
+async def _cheap_probe_online(
+    conn: ConnectionSettings | None = None,
+    timeout: float = 3.0,
+) -> bool:
     """
     v3.1.1 — Cheap connectivity probe used only inside interruptible backoff
     waits, to detect restoration early.
 
-    Deliberately a raw TCP connect to the same Telegram DC endpoint
-    `detect_network_state()` uses for its second step — NOT a Telegram API
-    call (no MTProto handshake, no GetStateRequest), so repeating it every
-    `_PROBE_INTERVAL` seconds during an outage carries zero FloodWait risk.
-    Skips the DNS-lookup step `detect_network_state()` does, since here we
-    only need a binary online/offline signal, not which failure category —
+    Deliberately a raw TCP connect to the same endpoint `detect_network_state()`
+    uses for its second step — NOT a Telegram API call (no MTProto handshake,
+    no GetStateRequest), so repeating it every `_PROBE_INTERVAL` seconds
+    during an outage carries zero FloodWait risk. Skips the DNS-lookup step
+    `detect_network_state()` does, since here we only need a binary
+    online/offline signal, not which failure category —
     `_recover_connection()`'s next full cycle will re-classify NO_INTERNET
     vs TELEGRAM_DOWN properly once backoff exits.
+
+    v3.2.7: *conn* selects the probe target exactly as in
+    detect_network_state(); None → direct mode (pre-3.2.7 behavior).
+    An unresolvable mode returns False — during backoff that is the
+    safe answer (keep waiting), and the next full cycle surfaces why.
 
     Returns:
         True if the TCP connect succeeded, False otherwise.
     """
+    host, port = _probe_target(conn)
+    if host is None:
+        return False
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(_TELEGRAM_PROBE_HOST, _TELEGRAM_PROBE_PORT),
+            asyncio.open_connection(host, port),
             timeout=timeout,
         )
         writer.close()
@@ -406,10 +455,16 @@ class AccountReconnector:
         self,
         account_client: AccountClient,
         loader: AccountLoader,
+        conn: ConnectionSettings | None = None,
     ) -> None:
         self._ac = account_client
         self._loader = loader
         self._cfg = account_client.cfg
+        # v3.2.7: system-wide connection mode — decides which endpoint the
+        # cheap probes dial (see detect_network_state/_cheap_probe_online).
+        # None → direct: pre-3.2.7 behavior for every existing construction
+        # site; composition_root passes the real settings.
+        self._conn: ConnectionSettings | None = conn
         self._running = False
         # v3.2.2 (B-26): the `_last_state` attribute was written on every
         # recovery cycle and never read by anything. The detected state is
@@ -637,7 +692,7 @@ class AccountReconnector:
             elapsed += step
             if elapsed >= backoff_seconds:
                 return
-            if await _cheap_probe_online():
+            if await _cheap_probe_online(self._conn):
                 self._log.info(
                     "Connectivity probe succeeded during backoff — waking "
                     "early (%.1fs of %.1fs skipped).",
@@ -775,8 +830,8 @@ class AccountReconnector:
         try:
             self._log.info("Starting connection recovery...")
 
-            # Detect network state
-            state = await detect_network_state()
+            # Detect network state (v3.2.7: probes honor the connection mode)
+            state = await detect_network_state(self._conn)
 
             self._log.info("Network state detected: %s", state.name)
 

@@ -41,8 +41,12 @@ from pathlib import Path
 from loguru import logger as _loguru_core
 
 from userbot_own import __version__
-from userbot_own.config.loader import discover_accounts, load_settings
-from userbot_own.config.models import AccountConfig, Paths, Settings
+from userbot_own.config.loader import (
+    discover_accounts,
+    load_connection_settings,
+    load_settings,
+)
+from userbot_own.config.models import AccountConfig, ConnectionSettings, Paths, Settings
 from userbot_own.core import logging_setup
 from userbot_own.core.context import ModuleContext
 from userbot_own.core.loader import AccountLoader
@@ -69,6 +73,10 @@ class CompositionRoot:
 
         # Populated by bootstrap():
         self.settings: Settings | None = None
+        # v3.2.7: the single system-wide connection mode (direct/socks5/cf),
+        # loaded from data/connection.json. Missing file → direct (the exact
+        # pre-3.2.7 behavior) — see config/loader.load_connection_settings().
+        self.connection_settings: ConnectionSettings | None = None
         self.account_registry: AccountRegistry | None = None
 
         # Application-scoped singletons — constructed once, right here.
@@ -87,6 +95,12 @@ class CompositionRoot:
         global log
 
         self.settings = load_settings(env_file=self.paths.base / ".env")
+        # v3.2.7: load the system-wide connection mode right after Settings —
+        # both are read once at bootstrap; every client built afterwards
+        # (per-account AND login/verify) goes through this single instance.
+        # Loaded before paths.ensure() since data/ may not exist yet on a
+        # fresh install; load_connection_settings() treats that as "direct".
+        self.connection_settings = load_connection_settings(self.paths)
         self.account_registry = AccountRegistry(discover_accounts(self.paths))
 
         # Same call shape as the original config.ensure_dirs([acc.settings_dir
@@ -108,6 +122,12 @@ class CompositionRoot:
     def _log_startup_banner(self) -> None:
         log.info("=" * 65)
         log.info("Multi-Account Userbot_own v%s starting…", __version__)
+        # v3.2.7: always log the active connection mode — when a user is
+        # debugging "why can't it connect", the first thing to know is
+        # which route was actually taken. describe() is one human line.
+        log.info(
+            "Connection mode: %s", self.connection_settings.describe(),
+        )
         log.info("Accounts : %d", len(self.account_registry))
         for acc in self.account_registry.all():
             log.info(
@@ -196,7 +216,9 @@ class CompositionRoot:
 
         with _loguru_core.contextualize(account=acc_cfg.index):
             # Step 1: Build client
-            ac = AccountClient(acc_cfg)
+            # v3.2.7: every account's client is built with the one
+            # system-wide connection mode — never per-account.
+            ac = AccountClient(acc_cfg, self.connection_settings)
             client = ac.build()
 
             # Step 2: Load modules on the (not-yet-connected) client.
@@ -240,7 +262,13 @@ class CompositionRoot:
                     log.warning("Authorization check failed: %s", exc)
 
             # Step 5: Run reconnector + file watcher concurrently
-            reconnector = AccountReconnector(ac, loader)
+            # v3.2.7: reconnector receives the connection settings too — its
+            # cheap connectivity probes must test the endpoint the chosen
+            # mode actually dials (e.g. a CF WebSocket host), otherwise a
+            # Telegram-IP probe would misclassify a proxy-mode outage as
+            # TELEGRAM_DOWN forever in a network where Telegram IPs are
+            # blocked but the CF route works.
+            reconnector = AccountReconnector(ac, loader, self.connection_settings)
             try:
                 await asyncio.gather(
                     reconnector.run(),

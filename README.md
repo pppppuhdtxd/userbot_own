@@ -27,7 +27,7 @@ userbot
 You'll get an interactive menu:
 
 ```
-=== userbot_own — v3.2.7 ===
+=== userbot_own — v3.2.8 ===
 1) Run bot
 2) Manage accounts
 3) Connection settings (direct / SOCKS5 / CF)
@@ -78,7 +78,7 @@ Termux/Debian/Ubuntu), see the [Quick Start](#quick-start) section below.
 A professional, async, hot-reload-capable Telegram account management system
 built with Python 3.11+ and [Telethon](https://docs.telethon.dev/).
 
-**Current version:** `3.2.7`
+**Current version:** `3.2.8`
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -178,7 +178,7 @@ userbot_own/
 ├── pyproject.toml                 ← ruff configuration + project metadata
 ├── main.py                        ← thin launcher → userbot_own.app.application.main()
 ├── add_account.py                 ← thin launcher → userbot_own.account_management.cli.main()
-├── settings.py                    ← thin launcher → userbot_own.settings_menu.cli.main() (v3.2.7)
+├── settings.py                    ← thin launcher → userbot_own.settings_menu.cli.main() (v3.2.8)
 ├── run.bat                        ← Windows control menu (run / accounts / settings / exit)
 │
 └── userbot_own/
@@ -292,7 +292,7 @@ userbot_own/
     │
     └── data/
         ├── logs/                     ← rotating log files
-        ├── connection.json           ← system-wide connection mode (v3.2.7)
+        ├── connection.json           ← system-wide connection mode (v3.2.8)
         └── settings/                 ← per-account runtime settings
             ├── account1/
             │   ├── join_left.json
@@ -303,7 +303,7 @@ userbot_own/
             └── account2/ …
 ```
 
-> The v3.2.7 connection layer also ships a Cloudflare Worker script outside
+> The v3.2.8 connection layer also ships a Cloudflare Worker script outside
 > the package, at [`cloudflare/tg-relay-worker.js`](cloudflare/tg-relay-worker.js)
 > in the repo root — see [Connection modes](#connection-modes-v327).
 
@@ -403,7 +403,7 @@ minutes, instead of retrying every few seconds. Re-login with
 `python add_account.py`; restart the bot to bring the account back at once,
 otherwise it is picked up at the next check.
 
-### Connection modes (v3.2.7)
+### Connection modes (v3.2.8)
 
 The bot's connection to Telegram is a **system-wide** setting — one mode for
 the whole process: every account of the running bot *and* the login/verify
@@ -1207,7 +1207,7 @@ A: Yes. Replace `source .venv/bin/activate` with `.venv\Scripts\activate`.
 
 **Q: Does this support proxies?**
 
-A: Yes, as of v3.2.7 — one system-wide setting (direct / SOCKS5 / Cloudflare),
+A: Yes, as of v3.2.8 — one system-wide setting (direct / SOCKS5 / Cloudflare),
 managed from the Settings menu (run.bat option [3] on Windows,
 `userbot settings` on Termux/Linux; every menu option is a single
 keypress). See [Connection modes](#connection-modes-v327). Direct remains

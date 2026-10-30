@@ -47,7 +47,7 @@ _version_file = Path(__file__).parent.parent / "VERSION"
 # v3.2.7: same four hand-maintained copies bumped together again. This version
 # stays pinned at 3.2.7 until the whole CF-proxy plan is implemented and
 # verified (per the owner's instruction) — every fix lands inside it.
-_FALLBACK_VERSION = "3.2.7"
+_FALLBACK_VERSION = "3.2.8"
 
 try:
     __version__ = _version_file.read_text(encoding="utf-8").strip() or _FALLBACK_VERSION

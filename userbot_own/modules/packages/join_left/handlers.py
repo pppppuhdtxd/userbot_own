@@ -57,6 +57,8 @@ from userbot_own.helpers.utils import (
 from userbot_own.modules._infra.base import Module
 from userbot_own.modules.packages.join_left.const import (
     _ADAPTIVE_DECAY,
+    _ADAPTIVE_FAST_DECAY,
+    _ADAPTIVE_FAST_DECAY_THRESHOLD,
     _ADAPTIVE_MAX_MULT,
     _AUTO_DELETE_DELAY,
     _AUTO_LEAVE_INTERVAL,
@@ -108,6 +110,19 @@ from userbot_own.modules.packages.join_left.types import (
 
 if TYPE_CHECKING:
     pass
+
+# B-JL-01 (strengthened): errors that prove a link is invalid/expired.
+# When ANY of these is encountered during a join batch, the ENTIRE batch must
+# stop immediately — not just skip the current entity. This is the product
+# decision: one invalid link means the user's intent for *this batch* cannot
+# be safely inferred, so no further joins in the same command are attempted.
+# If the user re-sends the command, the previously-failed link is re-attempted.
+_INVALID_LINK_ERRORS: tuple[type, ...] = (
+    errors.InviteHashInvalidError,
+    errors.InviteHashExpiredError,
+    errors.UsernameNotOccupiedError,
+    errors.ChannelPrivateError,
+)
 
 # ── Module ────────────────────────────────────────────────────────────────────
 
@@ -574,13 +589,17 @@ class JoinLeft(Module):
                 invalid.append((identifier, "لینک قابل parse نیست"))
                 continue
 
-            # Cache hit → already verified recently; skip the API call
+            # Cache hit → use cached username for Layer 1 resolution, but ALWAYS
+            # validate the invite link status via CheckChatInviteRequest.
+            # The cache stores username for Layer 1 smart resolution, NOT validation status.
+            # Links can expire at any time, so we must re-validate every time.
             cached = self._invite_cache.get(invite_hash)
+            cached_username = None
             if cached is not None:
                 cached_ts = cached.get("ts", 0)
                 if (time.time() - cached_ts) < _INVITE_CACHE_TTL:
-                    remaining.append((entity_type, identifier))
-                    continue
+                    cached_username = cached.get("username")
+                    # Don't skip validation! Links can expire between cache writes.
 
             # Call CheckChatInviteRequest to validate
             #
@@ -647,6 +666,54 @@ class JoinLeft(Module):
             asyncio.create_task(self._save_invite_cache())
 
         return invalid, remaining
+
+    # ── I-JL-03: Pre-validate username and numeric_id entities ─────────────────
+
+    async def _prevalidate_entities(
+        self,
+        client: TelegramClient,
+        entities: list[tuple[str, str | int]],
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """
+        I-JL-03: Pre-validate username and numeric_id entities.
+
+        Ensures that invalid usernames or nonexistent numeric IDs are caught
+        before the main join loop, so the "whole-batch-stop" rule (B-JL-01)
+        applies consistently regardless of entity type — not just for invite links.
+
+        Returns two lists of (identifier, reason) tuples:
+        - invalid_usernames: usernames that resolve to errors
+        - invalid_numeric_ids: numeric IDs that resolve to errors
+
+        Only truly invalid (UsernameNotOccupiedError, ChannelPrivateError) are
+        flagged here; transient errors are left to the main loop.
+        """
+        invalid_usernames: list[tuple[str, str]] = []
+        invalid_numeric_ids: list[tuple[str, str]] = []
+
+        for entity_type, identifier in entities:
+            if entity_type == "username":
+                try:
+                    await client.get_input_entity(f"@{identifier}")
+                except errors.UsernameNotOccupiedError:
+                    invalid_usernames.append((str(identifier), "یوزرنیم وجود ندارد"))
+                except errors.ChannelPrivateError:
+                    invalid_usernames.append((str(identifier), "خصوصی/محدود"))
+                except Exception:
+                    # Transient or other error — let the main loop handle
+                    pass
+            elif entity_type == "numeric_id":
+                try:
+                    await client.get_entity(identifier)
+                except errors.UsernameNotOccupiedError:
+                    invalid_numeric_ids.append((str(identifier), "چت یافت نشد"))
+                except errors.ChannelPrivateError:
+                    invalid_numeric_ids.append((str(identifier), "خصوصی/محدود"))
+                except Exception:
+                    # Transient or other error — let the main loop handle
+                    pass
+
+        return invalid_usernames, invalid_numeric_ids
 
     # ── Dispatcher ────────────────────────────────────────────────────────────
 
@@ -1183,6 +1250,8 @@ class JoinLeft(Module):
 
         adaptive_mult: float = 1.0
 
+        consecutive_successes = 0  # I-JL-04: track for fast adaptive decay
+
         batch_join_count  = 0
         completed_batches = 0
 
@@ -1278,6 +1347,10 @@ class JoinLeft(Module):
                 client, all_entities
             )
 
+            # I-JL-03: pre-validate username and numeric_id entities
+            invalid_usernames, invalid_numeric_ids = await self._prevalidate_entities(client, all_entities)
+            invalid_links.extend(invalid_usernames + invalid_numeric_ids)
+
             if invalid_links:
                 # I3: Cancel the ENTIRE operation if any invite link is invalid
                 invalid_lines = "\n".join(
@@ -1294,11 +1367,26 @@ class JoinLeft(Module):
                 except Exception:
                     pass
                 self._track_delete_task(processing_msg, _AUTO_DELETE_DELAY)
-                return
+                return  # ← This is the Phase 0 abort (correct)
+            else:
+                # T-1 fix: Always show a completion message from Phase 0
+                try:
+                    await processing_msg.edit(
+                        f"✅ **بررسی اعتبار لینک‌ها کامل شد — {len(all_entities)} مورد آمادهٔ جوین.**",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
 
         # ═══════════════════════════════════════════════════════════════════════
         # MAIN LOOP
         # ═══════════════════════════════════════════════════════════════════════
+
+        # B-JL-01 (strengthened): flag to cancel the ENTIRE batch when any
+        # invalid/expired link is encountered. Product decision: one invalid
+        # link → batch stops. Using break (not return) so POST-LOOP summary
+        # and cleanup (message edit, delete tracking) still run.
+        stop_batch = False
 
         for idx, (entity_type, identifier) in enumerate(all_entities, 1):
             joined_entity  = None
@@ -1570,6 +1658,7 @@ class JoinLeft(Module):
                                 results.append(f"ℹ️ [{title or identifier}] — قبلاً عضو بود (جوین موفق)")
                                 success_count += 1
                                 join_times.append(time.monotonic() - attempt_start)
+                                consecutive_successes += 1  # I-JL-04
                                 if joined_entity:
                                             post_results.append((joined_entity, await self._record_join(client, joined_entity)))
                                 break
@@ -1598,7 +1687,12 @@ class JoinLeft(Module):
                         join_times.append(time.monotonic() - attempt_start)
 
                         if use_adaptive and adaptive_mult > 1.0:
-                            adaptive_mult = max(1.0, adaptive_mult * _ADAPTIVE_DECAY)
+                            # I-JL-04: use faster decay after sustained success
+                            if consecutive_successes >= _ADAPTIVE_FAST_DECAY_THRESHOLD:
+                                adaptive_mult = max(1.0, adaptive_mult * _ADAPTIVE_FAST_DECAY)
+                            else:
+                                adaptive_mult = max(1.0, adaptive_mult * _ADAPTIVE_DECAY)
+                            consecutive_successes += 1
 
                         # Req 1 + Req 3: immediate per-chat recording + post-processing
                         # (v3.2.0: through the shared _record_join(); outcome is kept)
@@ -1608,6 +1702,7 @@ class JoinLeft(Module):
 
                 # ── FloodWait handling (Layer 3 + Req 5 retry cap) ────────────
                 except errors.FloodError as exc:
+                    consecutive_successes = 0  # I-JL-04: reset on FloodWait
                     fw_retry_count += 1
                     flood_count    += 1
 
@@ -1628,6 +1723,11 @@ class JoinLeft(Module):
 
                 # ── Other errors ──────────────────────────────────────────────
                 except Exception as exc:
+                    # I-JL-06: Unified debug logging for all join path errors
+                    self._log_debug(
+                        "[Account%d] Join path '%s' for '%s' raised: %s: %s",
+                        self.cfg.index, effective_type, str(identifier)[:40], type(exc).__name__, exc,
+                    )
                     # Req 2: last-chance catch for any "already member" string
                     if self._is_already_member_error(exc):
                         results.append(f"ℹ️ [{identifier}] — قبلاً عضو بود (جوین موفق)")
@@ -1657,12 +1757,27 @@ class JoinLeft(Module):
                         status = "❌ یوزرنیم وجود ندارد"
                     elif isinstance(exc, errors.ChannelPrivateError):
                         status = "🔒 خصوصی/محدود"
-                    elif "FLOOD_WAIT" in err:
-                        status = f"⏳ FloodWait: {err[:40]}"
+                    elif isinstance(exc, errors.FloodError):  # B-JL-04: typed check, no string matching
+                        status = f"⏳ FloodWait"
                     else:
                         status = f"❌ خطا: {err[:40]}"
                     results.append(f"[{identifier}] — {status}")
-                    break
+                    
+                    # B-JL-01 (strengthened): stop the ENTIRE batch on any
+                    # invalid/expired link. This is a hard product requirement:
+                    # one invalid link → the entire batch is cancelled.
+                    if isinstance(exc, _INVALID_LINK_ERRORS):
+                        self._log_debug(  # H-1: downgraded from _log_warning to _log_debug to reduce terminal noise
+                            "[Account%d] Invalid/expired link '%s' — cancelling entire join batch (B-JL-01).",
+                            self.cfg.index, identifier,
+                        )
+                        stop_batch = True  # H-2: flag for for-loop break (preserves POST-LOOP)
+                    break  # exit while-loop only
+
+            # B-JL-01 (strengthened): break out of for-loop if batch was cancelled.
+            # This preserves POST-LOOP summary + result message.
+            if stop_batch:
+                break
 
             # ── Live progress update ───────────────────────────────────────────
             display_idx = idx

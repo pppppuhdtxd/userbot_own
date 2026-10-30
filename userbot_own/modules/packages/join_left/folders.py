@@ -51,6 +51,7 @@ from userbot_own.modules.packages.join_left.const import (
     _FOLDER_CACHE_TTL,
     _FOLDER_CAPACITY,
     _JOINED_FOLDER_NAME,
+    _MAX_FLOODWAIT_RETRIES,
 )
 from userbot_own.modules.packages.join_left.types import EnsureResult
 
@@ -85,8 +86,28 @@ async def _fetch_all_filters(client: TelegramClient) -> list:
     messages.DialogFilters wrapper (current layers; has .filters and
     .tags_enabled) and a bare list (older Telethon).
     """
-    result = await client(GetDialogFiltersRequest())
-    return list(getattr(result, "filters", result) or [])
+    # B-JL-03 (fix): Retry with backoff on FloodWait instead of returning empty.
+    # Returning [] corrupts the cache and causes duplicate folder creation.
+    last_exc = None
+    for attempt in range(_MAX_FLOODWAIT_RETRIES):
+        try:
+            result = await client(GetDialogFiltersRequest())
+            # Extract filters from messages.DialogFilters wrapper (current Telethon)
+            # or return as-is if it's already a list (older Telethon).
+            filters = getattr(result, "filters", result)
+            return list(filters or [])
+        except errors.FloodError as exc:
+            seconds = _flood_seconds(exc)
+            last_exc = exc
+            if attempt + 1 < _MAX_FLOODWAIT_RETRIES:
+                await asyncio.sleep(seconds + _FLOOD_PAD)
+            else:
+                log.warning(
+                    "_fetch_all_filters: FloodWait retry cap (%d) exceeded after %ds — returning empty.",
+                    _MAX_FLOODWAIT_RETRIES, seconds,
+                )
+                return []
+    return []  # Should never reach here, but satisfies type checker
 
 
 async def _get_folders(
@@ -321,12 +342,32 @@ async def _create_joined_folder(
         exclude_archived = True,
     )
 
-    await client(UpdateDialogFilterRequest(id=new_id, filter=new_folder))
-    _invalidate_folder_cache(client, cache)
-    log.debug(
-        "[Account%d] Created '%s' folder (id=%d) with %d peer(s).",
-        account_index, title_str, new_id, len(inc_peers),
-    )
+    # B-JL-02 (fix): Retry with backoff on FloodWait instead of returning None.
+    # Returning None silently drops folder creation, causing duplicate folders later.
+    for attempt in range(_MAX_FLOODWAIT_RETRIES):
+        try:
+            await client(UpdateDialogFilterRequest(id=new_id, filter=new_folder))
+            _invalidate_folder_cache(client, cache)
+            log.debug(
+                "[Account%d] Created '%s' folder (id=%d) with %d peer(s).",
+                account_index, title_str, new_id, len(inc_peers),
+            )
+            return new_id
+        except errors.FloodError as exc:
+            seconds = _flood_seconds(exc)
+            if attempt + 1 < _MAX_FLOODWAIT_RETRIES:
+                log.warning(
+                    "[Account%d] _create_joined_folder: FloodWait %ds — retrying (attempt %d/%d).",
+                    account_index, seconds, attempt + 2, _MAX_FLOODWAIT_RETRIES,
+                )
+                await asyncio.sleep(seconds + _FLOOD_PAD)
+            else:
+                log.warning(
+                    "[Account%d] _create_joined_folder: FloodWait retry cap (%d) exceeded after %ds — folder creation failed.",
+                    account_index, _MAX_FLOODWAIT_RETRIES, seconds,
+                )
+                return None
+    return None  # Should never reach here, but satisfies type checker
     return new_folder
 
 

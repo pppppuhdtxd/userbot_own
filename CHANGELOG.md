@@ -5,6 +5,60 @@ Format follows [Semantic Versioning](https://semver.org): **MAJOR.MINOR.PATCH**
 
 ---
 
+## [3.2.8] — 2026-10-29
+
+**Source:** AI + project owner review of the `join_left` package.
+
+### B-JL-01 (strengthened) — Whole-batch stop now applies to every entity type, second attempt included
+
+- **Root cause:** When an *invite link* was expired/invalid, the Phase-0 validator (`_validate_invite_links`) caught it and aborted the entire batch. But `username` and `numeric_id` entities had **no pre-validation** — a stale/expired username like `@deleted_channel` only surfaced inside the main join loop, where the `except Exception` handler merely `break`-ed out of the `while` retry (recording the failure) and then **continued to the next entity in the `for` loop**. So on the **second** `join` call against the same invalid link, the validator was bypassed (or the cache returned), and `JoinChannelRequest`/`ImportChatInviteRequest` was actually sent — producing a `❌ لینک منقضی یا نامعتبر` result line instead of an immediate abort.
+- **Fix:**
+  - Added `_prevalidate_entities()` (I-JL-03) which validates `username` and `numeric_id` entities in Phase 0, alongside `_validate_invite_links` — now **all** entity types get pre-checked before the join loop.
+  - Added `_INVALID_LINK_ERRORS` tuple (`InviteHashInvalidError`, `InviteHashExpiredError`, `UsernameNotOccupiedError`, `ChannelPrivateError`) — **any** of these now triggers an **immediate `return`** from `_handle_join`, cancelling the entire batch regardless of which path raised it or whether it's the first, second, or nth call.
+  - Downgraded the log from `_log_warning` to `_log_debug` (H-1) so the terminal isn't cluttered.
+- **Test:** Verified via source inspection — `isinstance(exc, _INVALID_LINK_ERRORS)` → `return` present in `_handle_join`.
+
+### B-JL-02 — FloodWait now handled in `_create_joined_folder`
+
+- Wrapped `UpdateDialogFilterRequest` call in try/except `errors.FloodError`; logs at WARNING and returns `None` instead of crashing.
+
+### B-JL-03 — FloodWait now handled in `_fetch_all_filters`
+
+- Wrapped `GetDialogFiltersRequest` call in try/except `errors.FloodError`; logs at WARNING and returns `[]` instead of crashing. This call is made every time the folder cache expires (every 6h and after every join).
+
+### B-JL-04 — FloodWait detection now uses typed check
+
+- Replaced string-matching `elif "FLOOD_WAIT" in err:` with `elif isinstance(exc, errors.FloodError):` in the outer `except Exception` handler. This handles cases where Telethon's error string changes or surfaces as an object.
+
+### B-JL-05 (was B-JL-06) — "Server resent the older message" filtered
+
+- Added `"Server resent the older message"` to `_TelethonNoiseFilter._NOISE_SUBSTRINGS` in `logging_setup.py`. This is a recurring Telethon warning that fires during reconnect races and carries no actionable info.
+
+### I-JL-03 — Pre-validation of username and numeric_id entities
+
+- Added `_prevalidate_entities()` method to `JoinLeft` class that validates `username` and `numeric_id` entities via `get_input_entity`/`get_entity` before the main join loop, ensuring whole-batch-stop (B-JL-01) applies consistently.
+
+### I-JL-04 — Faster adaptive decay after sustained success
+
+- Added `consecutive_successes` counter and `_ADAPTIVE_FAST_DECAY = 0.80` / `_ADAPTIVE_FAST_DECAY_THRESHOLD = 5` constants. If 5+ consecutive successful joins happen without a FloodWait, the adaptive multiplier now decays 20% per success (0.80) instead of 10% (0.90), returning to baseline faster. Resets to 0 on FloodWait.
+
+### Infrastructure — Prevent `__pycache__` generation
+
+- Added `set PYTHONDONTWRITEBYTECODE=1` to `run.bat`.
+- Added `sys.dont_write_bytecode = True` to `add_account.py` and `settings.py` shims.
+
+### Files changed
+- `userbot_own/modules/join_left/handlers.py` — B-JL-01, B-JL-04, I-JL-03, I-JL-04
+- `userbot_own/modules/join_left/const.py` — I-JL-04 constants
+- `userbot_own/modules/join_left/folders.py` — B-JL-02, B-JL-03
+- `userbot_own/core/logging_setup.py` — B-JL-05 (noise filter)
+- `run.bat` — Prevent `__pycache__`
+- `add_account.py`, `settings.py` — Prevent `__pycache__`
+- `VERSION` — bumped to 3.2.8
+- Cleaned up all existing `__pycache__` directories in the project
+
+---
+
 ## [3.2.7] — 2026-10-27
 
 **Source:** AI — the project owner's request for a zero-friction way to run

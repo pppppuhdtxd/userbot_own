@@ -19,6 +19,12 @@ rem Always work from the folder this .bat lives in, so relative
 rem imports and config paths resolve correctly no matter how it's launched.
 cd /d "%~dp0"
 
+rem Prevent __pycache__ directories from being created during execution
+set PYTHONDONTWRITEBYTECODE=1
+
+rem Prevent __pycache__ directories from being created during execution
+set PYTHONDONTWRITEBYTECODE=1
+
 rem Current version, read from the VERSION file — every future
 rem release updates this display automatically, nothing to edit here.
 set "APP_VERSION=unknown"

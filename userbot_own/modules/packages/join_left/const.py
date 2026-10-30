@@ -34,6 +34,8 @@ _SMART_DELAYS: dict[str, float] = {
 # Layer 3: adaptive FloodWait multiplier bounds
 _ADAPTIVE_MAX_MULT  = 20.0   # never exceed 20× the base smart delay
 _ADAPTIVE_DECAY     = 0.90   # per-successful-join decay factor toward 1.0
+_ADAPTIVE_FAST_DECAY = 0.80   # faster decay toward 1.0 after sustained success
+_ADAPTIVE_FAST_DECAY_THRESHOLD = 5  # consecutive successful joins needed before fast decay kicks in
 
 # Layer 4: batch / human-pattern parameters
 _BATCH_SIZE          = 4

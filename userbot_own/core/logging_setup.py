@@ -1,12 +1,12 @@
-"""
+﻿"""
 userbot_own/core/logging_setup.py  (was core/logger.py)
-════════════════════════════════════════════════════════════════
+â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 Centralized structured logging with loguru + standard logging bridge.
 
 Provides:
-- setup(log_level, log_file) — Initialize root logger with file + console
-- add_account_handler(account_index, log_file, log_level) — Per-account logging
-- get_logger(name) — Returns an AccountLogger that supports %-style formatting
+- setup(log_level, log_file) â€” Initialize root logger with file + console
+- add_account_handler(account_index, log_file, log_level) â€” Per-account logging
+- get_logger(name) â€” Returns an AccountLogger that supports %-style formatting
 
 Key features:
 - Colored console output
@@ -19,7 +19,7 @@ Key features:
 A note on why this module is NOT wired through the composition root's
 dependency injection like core/registry.py or core/events.py: loguru's
 `logger` object is itself a process-wide singleton by the library's own
-design (exactly like the stdlib `logging` module it wraps) — there is
+design (exactly like the stdlib `logging` module it wraps) â€” there is
 no second instance to inject, and no test double that would make sense
 to substitute for "the log sink configuration". The `_configured` /
 `_account_handlers` module-level state here is sink bookkeeping, not
@@ -27,14 +27,14 @@ application state, so it stays as module-level state rather than being
 forced through DI for the sake of consistency. This is a deliberate
 exception, not an oversight.
 
-────────────────────────────────────────────────────────────────
-v3.1.9 — Terminal/file level split, exact per-account filtering,
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+v3.1.9 â€” Terminal/file level split, exact per-account filtering,
 non-blocking file sinks
-────────────────────────────────────────────────────────────────
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 Three independent fixes, none requiring a new dependency:
 
 1. `setup()` previously used a single `log_level` for both the console
-   and the file sinks, and `Settings.log_level` defaults to "DEBUG" —
+   and the file sinks, and `Settings.log_level` defaults to "DEBUG" â€”
    so out of the box, every DEBUG-level call anywhere in the codebase
    was terminal-visible. `setup()` now takes an independent
    `terminal_level` (default "INFO") for the console sink; `log_level`
@@ -42,30 +42,30 @@ Three independent fixes, none requiring a new dependency:
    still captured on disk for post-incident review.
 
 2. `add_account_handler()`'s per-account filter used to accept a
-   record if `str(account_index) in record["extra"]["name"]` — a
+   record if `str(account_index) in record["extra"]["name"]` â€” a
    substring test. For accounts whose indices share a digit (e.g. `1`
    and `21`), this let one account's log lines leak into another
    account's file, undermining this project's per-account isolation
    invariant. The filter now requires BOTH `"name" in record["extra"]`
-   (i.e. the record came from `get_logger()` — this project's own
+   (i.e. the record came from `get_logger()` â€” this project's own
    code) AND `record["extra"].get("account") == account_index`
    exactly. `account` is set via `logger.contextualize(account=...)`,
    entered once per account in `composition_root.start_account()`
    (and, for extra safety, again around `AccountReconnector.run()`)
-   — see those files for where the context is actually bound; nothing
+   â€” see those files for where the context is actually bound; nothing
    in this module sets it.
 
    Hotfix note: the first cut of this filter checked `account` alone,
    dropping the `"name"` precondition entirely. That broke under real
    multi-account load: `InterceptHandler.emit()` below forwards
-   third-party stdlib logging — including Telethon's own very verbose
-   internal protocol chatter, one line per RPC call — to the bare
+   third-party stdlib logging â€” including Telethon's own very verbose
+   internal protocol chatter, one line per RPC call â€” to the bare
    loguru `logger` without ever binding `name`. Because that forwarding
    happens *inside* `logger.contextualize(account=idx)`, those records
    still picked up `account=idx` from the ambient context despite never
    going through `get_logger()`, matched the account-only filter, and
    then crashed loguru's own formatter with `KeyError: 'name'` (the
-   format string below requires `{extra[name]}`) — visible as a wall of
+   format string below requires `{extra[name]}`) â€” visible as a wall of
    "Logging error in Loguru Handler #N" tracebacks on stderr rather
    than a clean crash. Requiring `"name"` again restores the
    third-party-exclusion guarantee this project always relied on, while
@@ -77,10 +77,10 @@ Three independent fixes, none requiring a new dependency:
    background thread via an internal queue, so file I/O on
    storage-constrained/slower Android storage can never stall the
    event loop that the reconnector's 3-second probes also run on.
-   Console sinks are unaffected — they were never the bottleneck and
+   Console sinks are unaffected â€” they were never the bottleneck and
    ordering relative to the terminal is more useful preserved exactly
    as emitted.
-════════════════════════════════════════════════════════════════
+â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 """
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ from typing import Any
 
 from loguru import logger
 
-# ── Telethon Noise Filter ────────────────────────────────────────────────────
+# â”€â”€ Telethon Noise Filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class _TelethonNoiseFilter(logging.Filter):
     """
@@ -99,19 +99,19 @@ class _TelethonNoiseFilter(logging.Filter):
     network disconnect but carry no actionable information.
 
     These messages originate inside Telethon's own connection layer as it
-    races against the reconnector — they describe Telethon's *internal*
+    races against the reconnector â€” they describe Telethon's *internal*
     attempt to recover (which we've disabled via ``auto_reconnect=False``
     and ``connection_retries=0``), not anything going wrong in our code.
 
     Filtered substrings (all from ``telethon.network``):
-    • "Automatic reconnection failed"   — Telethon's own retry counter
-    • "exception in shielded future"    — asyncio shield tear-down noise
-    • "Future exception was never retrieved" — dropped asyncio.Task warning
+    â€¢ "Automatic reconnection failed"   â€” Telethon's own retry counter
+    â€¢ "exception in shielded future"    â€” asyncio shield tear-down noise
+    â€¢ "Future exception was never retrieved" â€” dropped asyncio.Task warning
 
     Intentionally NOT filtered: anything else from ``telethon.network`` at
     WARNING+, so genuinely new failure modes still surface.
 
-    Applied narrowly to the ``telethon.network`` logger only — not to
+    Applied narrowly to the ``telethon.network`` logger only â€” not to
     ``InterceptHandler`` globally, which would risk swallowing unrelated
     ERROR-level messages that happen to share a substring.
     """
@@ -120,6 +120,7 @@ class _TelethonNoiseFilter(logging.Filter):
         "Automatic reconnection failed",
         "exception in shielded future",
         "Future exception was never retrieved",
+        "Server resent the older message",  # B-JL-06: Telethon noise during reconnect races
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -127,7 +128,19 @@ class _TelethonNoiseFilter(logging.Filter):
         return not any(noise in msg for noise in self._NOISE_SUBSTRINGS)
 
 
-# ── Intercept Handler ────────────────────────────────────────────────────────
+# â”€â”€ Intercept Handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+# ── Terminal Noise Suppression (B-JL-05) ─────────────────────────────────────────
+
+# Suppress these patterns from terminal output only; still written to file logs.
+_TERMINAL_NOISE_PATTERNS: tuple[str, ...] = (
+    "Server resent the older message",
+)
+
+
+def _is_terminal_noise(message: str) -> bool:
+    """B-JL-05: Check if a message should be suppressed from terminal output."""
+    return any(pattern in message for pattern in _TERMINAL_NOISE_PATTERNS)
 
 class InterceptHandler(logging.Handler):
     """
@@ -149,7 +162,7 @@ class InterceptHandler(logging.Handler):
         # and normalise the filename so that .pyc and .py both match.
         frame = logging.currentframe()
         depth = 0
-        logging_file = logging.__file__.rstrip("co")  # strip .pyc → .py
+        logging_file = logging.__file__.rstrip("co")  # strip .pyc â†’ .py
         while frame is not None:
             filename = frame.f_code.co_filename.rstrip("co")
             if filename == logging_file:
@@ -163,7 +176,7 @@ class InterceptHandler(logging.Handler):
         )
 
 
-# ── AccountLogger: %-style compatible wrapper ────────────────────────────────
+# â”€â”€ AccountLogger: %-style compatible wrapper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class AccountLogger:
     """
@@ -208,7 +221,7 @@ class AccountLogger:
 
     def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
         # opt(depth=1) keeps the caller's frame; exception=True captures
-        # sys.exc_info() automatically — same as loguru's own .exception().
+        # sys.exc_info() automatically â€” same as loguru's own .exception().
         self._logger.opt(depth=1, exception=True).error(
             self._format(msg, args), **kwargs
         )
@@ -225,14 +238,14 @@ class AccountLogger:
         self._logger.opt(depth=1).log(level, self._format(msg, args), **kwargs)
 
 
-# ── Global state ─────────────────────────────────────────────────────────────
+# â”€â”€ Global state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # See module docstring for why this stays module-level instead of DI'd.
 
 _configured = False
 _account_handlers: dict[int, int] = {}
 
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
+# â”€â”€ Setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def setup(
     log_level: str = "DEBUG",
@@ -257,12 +270,12 @@ def setup(
         log_file: Path to the main rotating log file, or ``None`` to
             skip file logging entirely (console only).
         terminal_level: Level for the app-log console sink only
-            (v3.1.9). Defaults to "INFO" — this is what actually
+            (v3.1.9). Defaults to "INFO" â€” this is what actually
             determines what scrolls past in a live terminal; kept
             independent of ``log_level`` so raising file verbosity for
             diagnostics never floods the terminal, and vice versa.
             The third-party/intercepted-log console sink below is
-            unaffected by this parameter — it stays hardcoded to
+            unaffected by this parameter â€” it stays hardcoded to
             WARNING+ as before.
     """
     global _configured
@@ -273,20 +286,20 @@ def setup(
     # Remove default loguru handler
     logger.remove()
 
-    # ── Intercept ALL standard logging (telethon, etc.) ──
+    # â”€â”€ Intercept ALL standard logging (telethon, etc.) â”€â”€
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
 
     # Silence noisy loggers (still captured, just at higher level)
     for noisy_logger in ("telethon.network", "telethon.crypto", "asyncio"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
-    # Apply the noise filter narrowly to telethon.network — the only logger
+    # Apply the noise filter narrowly to telethon.network â€” the only logger
     # that emits the three recurring disconnect-noise substrings. Scoped here
     # rather than inside InterceptHandler so the filter is visible as explicit
     # policy and only affects the one noisy source.
     logging.getLogger("telethon.network").addFilter(_TelethonNoiseFilter())
 
-    # ── Console handler for our app logs (with 'name' binding) ──
+    # â”€â”€ Console handler for our app logs (with 'name' binding) â”€â”€
     logger.add(
         sys.stderr,
         format=(
@@ -302,7 +315,7 @@ def setup(
         filter=lambda record: "name" in record["extra"],
     )
 
-    # ── Console handler for intercepted logs (telethon, etc.) ──
+    # â”€â”€ Console handler for intercepted logs (telethon, etc.) â”€â”€
     logger.add(
         sys.stderr,
         format=(
@@ -315,10 +328,10 @@ def setup(
         colorize=True,
         backtrace=False,
         diagnose=False,
-        filter=lambda record: "name" not in record["extra"],
+        filter=lambda record: "name" not in record["extra"] and not _is_terminal_noise(record["message"]),
     )
 
-    # ── File handler (main log) ──
+    # â”€â”€ File handler (main log) â”€â”€
     if log_file:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -342,7 +355,7 @@ def setup(
     _configured = True
 
 
-# ── Per-account logging ───────────────────────────────────────────────────────
+# â”€â”€ Per-account logging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def add_account_handler(
     account_index: int,
@@ -358,7 +371,7 @@ def add_account_handler(
     now REPLACED rather than silently kept. The old code returned early on
     an already-registered index, which meant an account whose log path
     changed (or which was removed and re-added) kept writing to its OLD
-    log file — the new path was never opened, and the old sink stayed
+    log file â€” the new path was never opened, and the old sink stayed
     registered forever. `remove_account_handler()` existed for exactly this
     but had ZERO call sites, so the old sink was never actually released.
     The replacement closes the stale sink before adding the new one, which
@@ -366,7 +379,7 @@ def add_account_handler(
     """
     if account_index in _account_handlers:
         # Release the previous sink for this account before installing the
-        # new one — otherwise the old file keeps being written to.
+        # new one â€” otherwise the old file keeps being written to.
         remove_account_handler(account_index)
 
     log_path = Path(log_file)
@@ -376,15 +389,15 @@ def add_account_handler(
     # substring test (`str(_idx) in record["extra"]["name"]`) which could
     # match an unrelated account whose index happened to contain this
     # one's digit(s) as a substring (e.g. account 1 matching account 21's
-    # records) — a real cross-account log leak.
+    # records) â€” a real cross-account log leak.
     #
     # IMPORTANT (v3.1.9 hotfix): the first cut of this filter dropped the
     # `"name" in record["extra"]` precondition entirely, checking only
     # `account`. That broke in practice: `InterceptHandler.emit()` (this
-    # module, above) forwards third-party stdlib logging — including
+    # module, above) forwards third-party stdlib logging â€” including
     # Telethon's own very verbose internal protocol chatter ("Assigned
-    # msg_id=…", "Getting difference for account updates", one line per
-    # RPC call) — straight to the bare loguru `logger`, without ever
+    # msg_id=â€¦", "Getting difference for account updates", one line per
+    # RPC call) â€” straight to the bare loguru `logger`, without ever
     # binding a `name` key. Because that forwarding happens *inside*
     # `logger.contextualize(account=idx)` (entered in
     # composition_root.start_account() / AccountReconnector.run()),
@@ -392,18 +405,18 @@ def add_account_handler(
     # records' `extra` even though nothing explicitly bound it. Those
     # records then matched this filter on `account` alone, reached this
     # sink, and crashed loguru's own formatter with `KeyError: 'name'`
-    # (the format string below requires `{extra[name]}`) — loguru catches
+    # (the format string below requires `{extra[name]}`) â€” loguru catches
     # that internally and prints a wall of "Logging error in Loguru
     # Handler #N" tracebacks to stderr instead of crashing the process,
     # which is what a "Logging error in Loguru Handler" spam under real
     # multi-account load turned out to look like.
     #
     # Fixed by requiring BOTH: `name` present (so only records that went
-    # through `get_logger()` — i.e. this project's own code — are ever
+    # through `get_logger()` â€” i.e. this project's own code â€” are ever
     # candidates) AND an exact `account` match (closing the original
     # substring-leak bug without reopening this one). Third-party/
     # intercepted records are excluded from every per-account file exactly
-    # as they always were before v3.1.9 — this restores that guarantee
+    # as they always were before v3.1.9 â€” this restores that guarantee
     # rather than changing it.
     #
     # Use a default-argument capture to avoid the late-binding closure
@@ -426,7 +439,7 @@ def add_account_handler(
         compression="zip",
         encoding="utf-8",
         filter=_account_filter,
-        # v3.1.9: see the main file sink above — same non-blocking
+        # v3.1.9: see the main file sink above â€” same non-blocking
         # rationale applies per-account.
         enqueue=True,
     )
@@ -434,7 +447,7 @@ def add_account_handler(
     _account_handlers[account_index] = handler_id
 
 
-# ── Logger factory ────────────────────────────────────────────────────────────
+# â”€â”€ Logger factory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def get_logger(name: str) -> AccountLogger:
     """
@@ -449,7 +462,7 @@ def get_logger(name: str) -> AccountLogger:
     return AccountLogger(name)
 
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# â”€â”€ Utilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def remove_account_handler(account_index: int) -> None:
     """Remove the log handler for a specific account."""
@@ -458,7 +471,7 @@ def remove_account_handler(account_index: int) -> None:
         logger.remove(handler_id)
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 __all__ = [
     "setup",
@@ -469,3 +482,4 @@ __all__ = [
     "InterceptHandler",
     "_TelethonNoiseFilter",
 ]
+
